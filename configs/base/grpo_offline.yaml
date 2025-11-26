@@ -1,0 +1,20 @@
+run:
+  mode: "grpo_offline"
+
+data:
+  train_path: "data/grpo_offline/traces.jsonl"
+  eval_path: null
+
+grpo:
+  num_generations: 4
+  max_prompt_length: 1024
+  max_completion_length: 512
+  reward_fn: "my_reward_v1"
+  kl_coeff: 0.01
+  advantage_normalization: true
+
+grpo_offline:
+  dataset_path: "data/grpo_offline/traces.jsonl"
+
+wandb:
+  tags: ["grpo_offline"]

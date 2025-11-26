@@ -1,0 +1,15 @@
+run:
+  mode: "sft"
+
+data:
+  train_path: "data/sft/train.jsonl"
+  eval_path: "data/sft/eval.jsonl"
+  format: "chat"
+
+sft:
+  train_on_inputs: true
+  max_grad_norm: 1.0
+  dataset_num_proc: 4
+
+wandb:
+  tags: ["sft"]

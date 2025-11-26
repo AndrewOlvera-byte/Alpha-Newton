@@ -1,0 +1,19 @@
+run:
+  mode: "grpo_online"
+
+grpo:
+  num_generations: 4
+  max_prompt_length: 1024
+  max_completion_length: 512
+  reward_fn: "my_reward_v1"
+  kl_coeff: 0.01
+  advantage_normalization: true
+
+grpo_online:
+  env: "my_env_v1"
+  rollout_batch_size: 32
+  num_envs: 8
+  max_rollouts_per_step: 1
+
+wandb:
+  tags: ["grpo_online"]

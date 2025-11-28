@@ -1,0 +1,43 @@
+run:
+  name: "qwen3_600M_dpo_anthropic_hh"
+  mode: "dpo"
+
+model:
+  type: "hf_causal"
+  id: "outputs/qwen3_600M_sft_mixed_optimized"
+  dtype: "bfloat16"
+  gradient_checkpointing: true
+
+tokenizer:
+  type: "hf"
+  id: "outputs/qwen3_600M_sft_mixed_optimized"
+
+data:
+  type: "dpo"
+  source: "hf"
+  train_path: "Anthropic/hh-rlhf"
+  eval_path: "Anthropic/hh-rlhf"
+  max_seq_len: 2048
+  num_proc: 12
+
+training:
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4
+
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+
+  max_steps: 1000
+  save_steps: 250
+  eval_steps: 250
+  learning_rate: 5.0e-7
+  warmup_steps: 50
+  beta: 0.1
+
+  logging_steps: 10
+  logging_first_step: true
+
+wandb:
+  tags: ["qwen3-0.6b", "dpo", "anthropic-hh", "from-sft-mixed"]

@@ -1,0 +1,10 @@
+# torch provided by base image (pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime)
+transformers>=4.40.0
+datasets>=2.14.0
+trl>=0.8.0
+pyyaml>=6.0
+accelerate>=0.20.0
+wandb>=0.15.0
+peft>=0.8.0
+bitsandbytes>=0.41.0
+gradio>=4.0.0

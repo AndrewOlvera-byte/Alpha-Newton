@@ -1,0 +1,39 @@
+services:
+  alpha-newton:
+    build: .
+    image: alpha-newton:latest
+    container_name: alpha-newton
+
+    # GPU access for RTX 5070 Ti
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Mount project directory for live code changes
+    volumes:
+      - .:/workspace
+      - ./cache:/workspace/cache              # HuggingFace cache
+      - ./outputs:/workspace/outputs          # Model checkpoints
+      - ./experiments:/workspace/experiments  # Experiment configs
+      - ~/.cache/huggingface:/root/.cache/huggingface  # Share HF cache with host
+
+    # Keep container running for interactive CLI
+    stdin_open: true
+    tty: true
+
+    # Override default command to keep alive
+    command: tail -f /dev/null
+
+    # Environment variables
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - WANDB_API_KEY=${WANDB_API_KEY}  # Pass from host environment
+
+    # Port mappings (better for Windows/WSL2 than network_mode: host)
+    ports:
+      - "7860:7860"  # Gradio web UI
+      - "6006:6006"  # TensorBoard (if needed)

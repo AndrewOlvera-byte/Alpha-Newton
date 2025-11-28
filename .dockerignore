@@ -1,0 +1,40 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+
+# Cache and outputs (mounted as volumes)
+cache/
+outputs/
+experiments/
+wandb/
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Docs
+*.md
+!README.md
+
+# Docker
+Dockerfile
+docker-compose.yaml
+.dockerignore
+
+# Tests
+test_*.py

@@ -18,18 +18,19 @@ tokenizer:
   use_fast: true
 
 data:
+  source: ""
   train_path: null
   eval_path: null
-  format: "chat"
   max_seq_len: 2048
-  num_proc: 4
+  num_proc: 12
   packing: true
+  cache_dir: "cache/datasets"
 
 training:
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 8
-  learning_rate: 1e-5
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-5
   warmup_steps: 100
   max_steps: 10000
   logging_steps: 10
@@ -37,13 +38,18 @@ training:
   eval_steps: 1000
   bf16: true
   fp16: false
-  ddp_backend: "nccl"
+  #ddp_backend: "nccl"
+
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+  gradient_checkpointing: true
+
   output_dir: "outputs/${run.name}"
+  beta: 0.1
 
 wandb:
-  enabled: true
   project: "posttraining"
-  entity: "my-team"
+  entity: "andrewolvera"
   run_name: "${run.name}"
   tags: []
-  mode: "online"

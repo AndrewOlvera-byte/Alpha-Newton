@@ -1,0 +1,31 @@
+run:
+  name: "qwen3_600M_sft_with_tools"
+  mode: "sft"
+
+model:
+  type: "hf_causal"
+  id: "Qwen/Qwen3-0.6B-Base"
+  dtype: "bfloat16"
+
+tokenizer:
+  type: "hf"
+  id: "Qwen/Qwen3-0.6B-Base"
+
+data:
+  type: "sft"
+  source: "hf"
+  train_path: "glaiveai/glaive-function-calling-v2"
+  eval_path: "glaiveai/glaive-function-calling-v2"
+  max_seq_len: 2048
+
+training:
+  max_steps: 5000
+  save_steps: 500
+  eval_steps: 500
+  learning_rate: 2.0e-5
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 8
+  warmup_steps: 250
+
+wandb:
+  tags: ["qwen3-0.6b", "sft", "glaive", "function-calling", "tools"]

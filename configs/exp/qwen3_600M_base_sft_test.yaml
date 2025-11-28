@@ -1,0 +1,30 @@
+run:
+  name: "qwen3_600M_base_sft_test"
+  mode: "sft"
+
+model:
+  type: "hf_causal"
+  id: "Qwen/Qwen3-0.6B-Base"
+  dtype: "bfloat16"
+
+tokenizer:
+  type: "hf"
+  id: "Qwen/Qwen3-0.6B-Base"
+
+data:
+  type: "sft"
+  source: "hf"
+  train_path: "LDJnr/Capybara"
+  eval_path: "LDJnr/Capybara"
+  max_seq_len: 2048
+
+training:
+  max_steps: 100
+  save_steps: 50
+  eval_steps: 50
+  learning_rate: 2.0e-5
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4
+
+wandb:
+  tags: ["qwen3-0.6b", "sft", "capybara", "test-run"]

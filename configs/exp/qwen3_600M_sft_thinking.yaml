@@ -1,0 +1,53 @@
+run:
+  name: "qwen3_600M_sft_thinking"
+  mode: "sft"
+
+model:
+  type: "hf_causal"
+  # Start from your instruct model
+  id: "outputs/qwen3_600M_dpo_anthropic_hh"
+  dtype: "bfloat16"
+  gradient_checkpointing: true
+
+tokenizer:
+  type: "hf"
+  id: "outputs/qwen3_600M_dpo_anthropic_hh"
+
+data:
+  type: "sft"
+  source: "hf"
+  # Dataset with reasoning traces (you'll need to create or find this)
+  # Options:
+  # - meta-math/MetaMathQA (has reasoning steps)
+  # - openai/gsm8k (add <think> tags synthetically)
+  # - Custom dataset with <think> tags
+  train_path: "meta-math/MetaMathQA"
+  eval_path: "meta-math/MetaMathQA"
+  max_seq_len: 4096  # Longer for reasoning chains!
+  num_proc: 12
+  packing: false  # Don't pack - reasoning chains are long
+
+training:
+  # Optimized for thinking model
+  per_device_train_batch_size: 4  # Smaller due to longer sequences
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 8  # Effective batch = 32
+
+  # Data loading
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+
+  # Training parameters
+  max_steps: 5000  # Fewer steps for specialized training
+  save_steps: 500
+  eval_steps: 500
+  learning_rate: 1.0e-5  # Lower LR (continuing from DPO)
+  warmup_steps: 200
+
+  # Logging
+  logging_steps: 10
+  logging_first_step: true
+
+wandb:
+  tags: ["qwen3-0.6b", "sft", "thinking", "reasoning", "math"]

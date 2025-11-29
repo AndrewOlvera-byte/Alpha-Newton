@@ -8,3 +8,4 @@ wandb>=0.15.0
 peft>=0.8.0
 bitsandbytes>=0.41.0
 gradio>=4.0.0
+flash-attn>=2.4.0

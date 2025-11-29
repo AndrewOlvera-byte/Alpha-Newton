@@ -28,6 +28,9 @@ def build_trl_sft_trainer(model, tokenizer, dataset, training_cfg, wandb_cfg):
     training_cfg = {**training_cfg}
     training_cfg["report_to"] = ["wandb"]
 
+    # Remove DPO-specific params (beta is only for DPO)
+    training_cfg.pop("beta", None)
+
     training_args = SFTConfig(**training_cfg)
 
     trainer = SFTTrainer(

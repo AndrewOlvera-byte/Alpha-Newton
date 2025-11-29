@@ -1,6 +1,42 @@
 from src.core.registry import register
 from datasets import load_dataset, interleave_datasets
 
+
+def _pack_tokenized_dataset(dataset, max_seq_len: int):
+    """
+    Concatenate and chunk tokenized sequences into fixed-length blocks.
+    Ensures every sample is max_seq_len to better utilize the GPU.
+    """
+
+    def group_texts(examples):
+        # Flatten then chunk to max_seq_len
+        concatenated = sum(examples["input_ids"], [])
+        total_length = (len(concatenated) // max_seq_len) * max_seq_len
+        concatenated = concatenated[:total_length]
+
+        if total_length == 0:
+            return {"input_ids": [], "attention_mask": [], "labels": []}
+
+        input_ids = [
+            concatenated[i : i + max_seq_len]
+            for i in range(0, total_length, max_seq_len)
+        ]
+        attention_mask = [[1] * max_seq_len for _ in input_ids]
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": input_ids,
+        }
+
+    packed = dataset.map(
+        group_texts,
+        batched=True,
+        remove_columns=dataset.column_names,
+    )
+    return packed
+
+
 @register("data", "sft")
 def build_sft_dataset(source: str, train_path: str, eval_path: str, max_seq_len: int, num_proc: int, packing: bool, tokenizer, cache_dir: str = None):
 
@@ -43,25 +79,39 @@ def build_sft_dataset(source: str, train_path: str, eval_path: str, max_seq_len:
 
     def format_chat(sample):
         """
-        Convert various dataset formats to chat messages format.
+        Convert various dataset formats to universal OpenAI messages format,
+        then apply tokenizer's chat template.
 
         Supports:
-        1. Standard "messages" format: [{"role": "user", "content": "..."}]
-        2. Capybara "conversation" format: [{"input": "...", "output": "..."}]
+        - Standard "messages": [{"role": "user", "content": "..."}]
+        - Capybara "conversation": [{"input": "...", "output": "..."}]
+        - OpenHermes "conversations": [{"from": "human/gpt", "value": "..."}]
         """
-        # Check if already in messages format
+        messages = []
+
+        # Standard OpenAI format
         if "messages" in sample:
             messages = sample["messages"]
 
-        # Convert Capybara conversation format
+        # Capybara conversation format
         elif "conversation" in sample:
-            messages = []
             for turn in sample["conversation"]:
                 messages.append({"role": "user", "content": turn["input"]})
                 messages.append({"role": "assistant", "content": turn["output"]})
 
+        # OpenHermes-2.5 format
+        elif "conversations" in sample:
+            # Add system prompt if exists
+            if sample.get("system_prompt"):
+                messages.append({"role": "system", "content": sample["system_prompt"]})
+
+            # Convert conversations
+            for turn in sample["conversations"]:
+                role = "user" if turn["from"] in ["human", "user"] else "assistant"
+                messages.append({"role": role, "content": turn["value"]})
+
         else:
-            raise ValueError(f"Unknown dataset format. Expected 'messages' or 'conversation', got: {list(sample.keys())}")
+            raise ValueError(f"Unknown format. Expected 'messages', 'conversation', or 'conversations', got: {list(sample.keys())}")
 
         # Apply tokenizer's chat template
         text = tokenizer.apply_chat_template(
@@ -87,17 +137,28 @@ def build_sft_dataset(source: str, train_path: str, eval_path: str, max_seq_len:
     train = train.map(tokenize, batched=True, num_proc=num_proc)
     eval = eval.map(tokenize, batched=True, num_proc=num_proc)
 
+    # Remove raw text to keep only tensor-ready columns
+    keep_cols = {"input_ids", "attention_mask"}
+    train = train.remove_columns([c for c in train.column_names if c not in keep_cols])
+    eval = eval.remove_columns([c for c in eval.column_names if c not in keep_cols])
+
     # === 4. Optional packing === #
 
     if packing:
-        # Sort by sequence length for efficient packing
-        # Can't sort on list column directly, so add length column
-        def add_length(sample):
-            return {"length": len(sample["input_ids"])}
+        train = _pack_tokenized_dataset(train, max_seq_len)
+        eval = _pack_tokenized_dataset(eval, max_seq_len)
+    else:
+        # Add labels to mirror input_ids for trainer/collator
+        def add_labels(batch):
+            return {"labels": batch["input_ids"]}
 
-        train = train.map(add_length)
-        train = train.sort("length")
-        train = train.remove_columns(["length"])  # Clean up
+        train = train.map(add_labels, batched=True)
+        eval = eval.map(add_labels, batched=True)
+
+    # Ensure PyTorch format for efficient collation
+    columns = ["input_ids", "attention_mask", "labels"]
+    train = train.with_format("torch", columns=columns)
+    eval = eval.with_format("torch", columns=columns)
 
     return {"train": train, "eval": eval}
 
@@ -262,22 +323,95 @@ def build_mixed_sft_dataset(
     # === Format and tokenize === #
 
     def format_chat(sample):
-        """Handle multiple dataset formats"""
-        if "messages" in sample:
-            messages = sample["messages"]
-        elif "conversation" in sample:
-            messages = []
-            for turn in sample["conversation"]:
-                messages.append({"role": "user", "content": turn["input"]})
-                messages.append({"role": "assistant", "content": turn["output"]})
-        elif "conversations" in sample:
-            messages = sample["conversations"]
-        else:
-            raise ValueError(f"Unknown format: {list(sample.keys())}")
+        """
+        Convert various dataset formats to universal OpenAI messages format.
 
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
-        )
+        Uses smart detection to handle any dataset format without hardcoding checks.
+        """
+        messages = []
+
+        # Strategy: Try each parser in order, return first successful parse
+
+        # Parser 1: Standard OpenAI format (already correct)
+        if sample.get("messages") and isinstance(sample["messages"], list):
+            messages = sample["messages"]
+
+        # Parser 2: Glaive (system + chat text) - must check before conversations
+        elif sample.get("system") and sample.get("chat"):
+            system_text = sample["system"]
+            if system_text and "SYSTEM:" in system_text:
+                system_content = system_text.split("SYSTEM:", 1)[1].strip()
+                messages.append({"role": "system", "content": system_content})
+
+            chat_text = sample["chat"]
+            current_role = None
+            current_content = []
+
+            for line in chat_text.split("\n\n"):
+                line = line.strip()
+                if not line or line == "<|endoftext|>":
+                    continue
+
+                if line.startswith("USER:"):
+                    if current_role and current_content:
+                        messages.append({
+                            "role": current_role,
+                            "content": "\n".join(current_content).strip()
+                        })
+                    current_role = "user"
+                    current_content = [line.replace("USER:", "").strip()]
+
+                elif line.startswith("ASSISTANT:"):
+                    if current_role and current_content:
+                        messages.append({
+                            "role": current_role,
+                            "content": "\n".join(current_content).strip()
+                        })
+                    current_role = "assistant"
+                    current_content = [line.replace("ASSISTANT:", "").strip()]
+
+                else:
+                    if current_role:
+                        current_content.append(line)
+
+            if current_role and current_content:
+                messages.append({
+                    "role": current_role,
+                    "content": "\n".join(current_content).strip()
+                })
+
+        # Parser 3: OpenHermes (conversations list with from/value)
+        elif sample.get("conversations") and isinstance(sample.get("conversations"), list):
+            if sample.get("system_prompt"):
+                messages.append({"role": "system", "content": sample["system_prompt"]})
+
+            for turn in sample["conversations"]:
+                if isinstance(turn, dict) and "from" in turn and "value" in turn:
+                    role = "user" if turn["from"] in ["human", "user"] else "assistant"
+                    messages.append({"role": role, "content": turn["value"]})
+
+        # Parser 4: Capybara (conversation list with input/output)
+        elif sample.get("conversation") and isinstance(sample.get("conversation"), list):
+            for turn in sample["conversation"]:
+                if isinstance(turn, dict) and "input" in turn and "output" in turn:
+                    messages.append({"role": "user", "content": turn["input"]})
+                    messages.append({"role": "assistant", "content": turn["output"]})
+
+        # If no parser worked, skip this sample (don't crash)
+        if not messages:
+            return {"text": ""}
+
+        # Apply chat template
+        try:
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False
+            )
+        except Exception as e:
+            # Fallback: skip samples that fail chat template
+            return {"text": ""}
+
         return {"text": text}
 
     train = train.map(format_chat, num_proc=num_proc)
@@ -295,15 +429,27 @@ def build_mixed_sft_dataset(
     train = train.map(tokenize, batched=True, num_proc=num_proc)
     eval = eval.map(tokenize, batched=True, num_proc=num_proc)
 
-    # Packing
-    if packing:
-        def add_length(sample):
-            return {"length": len(sample["input_ids"])}
+    # Keep only token columns
+    keep_cols = {"input_ids", "attention_mask"}
+    train = train.remove_columns([c for c in train.column_names if c not in keep_cols])
+    eval = eval.remove_columns([c for c in eval.column_names if c not in keep_cols])
 
-        train = train.map(add_length)
-        train = train.sort("length")
-        train = train.remove_columns(["length"])
+    # Packing to fixed blocks for better GPU utilization
+    if packing:
+        train = _pack_tokenized_dataset(train, max_seq_len)
+        eval = _pack_tokenized_dataset(eval, max_seq_len)
+    else:
+        def add_labels(batch):
+            return {"labels": batch["input_ids"]}
+
+        train = train.map(add_labels, batched=True)
+        eval = eval.map(add_labels, batched=True)
 
     print(f"[Mixed Dataset] ✓ Train: {len(train):,} | Eval: {len(eval):,}\n")
+
+    # Set torch format for efficient collation
+    columns = ["input_ids", "attention_mask", "labels"]
+    train = train.with_format("torch", columns=columns)
+    eval = eval.with_format("torch", columns=columns)
 
     return {"train": train, "eval": eval}

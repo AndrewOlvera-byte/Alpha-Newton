@@ -27,6 +27,38 @@ def main(exp_name: str):
     model = build("model", **cfg.model)
     dataset = build("data", tokenizer=tokenizer, **cfg.data)
 
+    # === Optimization Verification ===
+    print("=" * 60)
+    print("[OPTIMIZATION CHECK]")
+    print("=" * 60)
+
+    # Check Flash Attention 2
+    attn_impl = getattr(model.config, "_attn_implementation", "unknown")
+    print(f"✓ Attention Implementation: {attn_impl}")
+    if attn_impl == "flash_attention_2":
+        print("  → Flash Attention 2 is ENABLED")
+    else:
+        print(f"  → WARNING: Flash Attention 2 NOT enabled (using {attn_impl})")
+
+    # Check model dtype
+    model_dtype = next(model.parameters()).dtype
+    print(f"✓ Model dtype: {model_dtype}")
+
+    # Check bf16 training
+    bf16_enabled = cfg.training.get('bf16', False)
+    print(f"✓ bf16 training: {bf16_enabled}")
+
+    # Check torch.compile
+    torch_compile = cfg.training.get('torch_compile', False)
+    print(f"✓ torch.compile: {torch_compile}")
+
+    # Check gradient checkpointing
+    grad_ckpt = cfg.model.get('gradient_checkpointing', False)
+    print(f"✓ Gradient checkpointing: {grad_ckpt}")
+
+    print("=" * 60)
+    print()
+
     trainer = build(
         "trainer",
         type="trl_sft",

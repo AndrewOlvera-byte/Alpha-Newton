@@ -10,9 +10,11 @@ def build_hf_model(id: str, revision: str, dtype: str, trust_remote_code: bool, 
         dtype=dtype,
         trust_remote_code=trust_remote_code,
         load_in_4bit=load_in_4bit,
+        attn_implementation="flash_attention_2",
     )
 
     if gradient_checkpointing:
         model.gradient_checkpointing_enable()
-
+    print(next(model.parameters()).dtype)
+    print(model.dtype if hasattr(model, "dtype") else None)
     return model

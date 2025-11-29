@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
+FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -17,7 +17,9 @@ WORKDIR /workspace
 
 # Install dependencies first for Docker layer caching
 COPY requirements.txt /workspace/requirements.txt
-RUN pip install --upgrade pip && pip install -r /workspace/requirements.txt
+RUN pip install --upgrade pip && \
+    pip install flash-attn>=2.4.0 --no-build-isolation && \
+    grep -v "flash-attn" /workspace/requirements.txt | pip install -r /dev/stdin
 
 # Copy project code
 COPY . /workspace

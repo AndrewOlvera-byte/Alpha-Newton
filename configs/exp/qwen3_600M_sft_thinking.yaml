@@ -4,50 +4,49 @@ run:
 
 model:
   type: "hf_causal"
-  # Start from your instruct model
-  id: "outputs/qwen3_600M_dpo_anthropic_hh"
+  id: "Qwen/Qwen3-0.6B-Base"
   dtype: "bfloat16"
-  gradient_checkpointing: true
+  gradient_checkpointing: false
 
 tokenizer:
   type: "hf"
-  id: "outputs/qwen3_600M_dpo_anthropic_hh"
+  id: "Qwen/Qwen3-0.6B-Base"
 
 data:
-  type: "sft"
-  source: "hf"
-  # Dataset with reasoning traces (you'll need to create or find this)
-  # Options:
-  # - meta-math/MetaMathQA (has reasoning steps)
-  # - openai/gsm8k (add <think> tags synthetically)
-  # - Custom dataset with <think> tags
-  train_path: "meta-math/MetaMathQA"
-  eval_path: "meta-math/MetaMathQA"
-  max_seq_len: 4096  # Longer for reasoning chains!
+  type: "sft_mixed"
+  datasets_config:
+    - path: "kaist-ai/CoT-Collection"
+      weight: 0.5
+    - path: "allenai/big-reasoning-traces"
+      weight: 0.3
+    - path: "open-r1/OpenThoughts3-1.2M"
+      weight: 0.15
+    - path: "AI-MO/NuminaMath-CoT"
+      weight: 0.05
+  max_seq_len: 1536
   num_proc: 12
-  packing: false  # Don't pack - reasoning chains are long
+  packing: true
+
 
 training:
-  # Optimized for thinking model
-  per_device_train_batch_size: 4  # Smaller due to longer sequences
-  per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 8  # Effective batch = 32
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 4
 
-  # Data loading
   dataloader_num_workers: 8
   dataloader_pin_memory: true
   dataloader_prefetch_factor: 2
 
-  # Training parameters
-  max_steps: 5000  # Fewer steps for specialized training
+  max_steps: 8000
   save_steps: 500
   eval_steps: 500
-  learning_rate: 1.0e-5  # Lower LR (continuing from DPO)
-  warmup_steps: 200
+  learning_rate: 1.0e-5
+  warmup_steps: 400
 
-  # Logging
   logging_steps: 10
   logging_first_step: true
+  bf16: true
+  torch_compile: true
 
 wandb:
   tags: ["qwen3-0.6b", "sft", "thinking", "reasoning", "math"]

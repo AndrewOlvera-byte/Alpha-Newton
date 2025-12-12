@@ -60,6 +60,7 @@ class Config:
     data: Dict[str, Any]
     training: Dict[str, Any]
     wandb: Dict[str, Any]
+    grpo: Dict[str, Any] = None  # RLVR/GRPO specific config
 
     @classmethod
     def load(cls, path: str | Path, base_configs: List[str | Path] = None):
@@ -75,9 +76,10 @@ class Config:
 
         if base_configs:
             for base_path in base_configs:
-                with open(base_path, "r") as f:
-                    base = yaml.safe_load(f)
-                merged = deep_merge(merged, base)
+                if Path(base_path).exists():
+                    with open(base_path, "r") as f:
+                        base = yaml.safe_load(f)
+                    merged = deep_merge(merged, base)
 
         # Load and merge main config
         with open(path, "r") as f:
@@ -88,16 +90,34 @@ class Config:
         # Interpolate variables like ${run.name}
         merged = interpolate_variables(merged)
 
-        return cls(**merged)
+        # Filter to only known fields (handles extra sections gracefully)
+        known_fields = {'run', 'model', 'tokenizer', 'data', 'training', 'wandb', 'grpo'}
+        filtered = {k: v for k, v in merged.items() if k in known_fields}
+
+        return cls(**filtered)
 
     @classmethod
     def from_experiment(cls, exp_name: str):
         """
         Load config for an experiment
 
-        Merges: configs/base/common.yaml -> configs/exp/{exp_name}.yaml
+        Merges based on mode:
+        - rlvr: common.yaml -> rlvr.yaml -> exp/{exp_name}.yaml
+        - default: common.yaml -> exp/{exp_name}.yaml
         """
         common_path = Path("configs/base/common.yaml")
+        rlvr_path = Path("configs/base/rlvr.yaml")
         exp_path = Path("configs/exp") / f"{exp_name}.yaml"
 
-        return cls.load(exp_path, base_configs=[common_path])
+        # Peek at exp config to check mode
+        with open(exp_path, "r") as f:
+            exp_cfg = yaml.safe_load(f)
+
+        mode = exp_cfg.get("run", {}).get("mode", "")
+
+        # Build base config list based on mode
+        base_configs = [common_path]
+        if mode == "rlvr" and rlvr_path.exists():
+            base_configs.append(rlvr_path)
+
+        return cls.load(exp_path, base_configs=base_configs)

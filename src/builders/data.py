@@ -453,3 +453,103 @@ def build_mixed_sft_dataset(
     eval = eval.with_format("torch", columns=columns)
 
     return {"train": train, "eval": eval}
+
+
+@register("data", "rlvr_math")
+def build_rlvr_math_dataset(
+    source: str,
+    train_path: str,
+    max_prompt_len: int,
+    num_proc: int,
+    tokenizer,
+    eval_path: str = None,
+    cache_dir: str = None,
+    subset_pct: float = 100.0,
+    **kwargs
+):
+    """
+    Build math dataset for RLVR (online GRPO training).
+    
+    Returns dataset with:
+    - prompt: Formatted prompt string for generation
+    - answer: Ground truth answer for reward verification
+    
+    Supports:
+    - DeepMath-103K: question, final_answer columns
+    - GSM8K: question, answer columns (extracts number after ####)
+    - Custom: expects 'question' and 'answer' columns
+    """
+    assert source in ("hf", "local"), f"Invalid source: {source}"
+    
+    # === 1. Load dataset === #
+    if source == "hf":
+        dataset = load_dataset(train_path, split="train", cache_dir=cache_dir)
+    else:
+        dataset = load_dataset("json", data_files=train_path, split="train", cache_dir=cache_dir)
+    
+    # Optional subset for testing
+    if subset_pct < 100.0:
+        n_samples = int(len(dataset) * subset_pct / 100)
+        dataset = dataset.select(range(n_samples))
+        print(f"[RLVR Math] Using {subset_pct}% subset: {n_samples:,} samples")
+    
+    # Split train/eval
+    split = dataset.train_test_split(test_size=0.05, seed=42)
+    train = split["train"]
+    eval_ds = split["test"]
+    
+    print(f"[RLVR Math] Dataset: {train_path}")
+    print(f"[RLVR Math] Train: {len(train):,} | Eval: {len(eval_ds):,}")
+    
+    # === 2. Detect format and extract question/answer === #
+    
+    def format_sample(sample):
+        """
+        Convert various math dataset formats to GRPO format.
+        Returns: {prompt: str, answer: str}
+        """
+        # Detect question field
+        if "question" in sample:
+            question = sample["question"]
+        elif "problem" in sample:
+            question = sample["problem"]
+        else:
+            raise ValueError(f"No question field found. Keys: {list(sample.keys())}")
+        
+        # Detect answer field
+        if "final_answer" in sample:
+            # DeepMath-103K format
+            answer = str(sample["final_answer"]).strip()
+        elif "answer" in sample:
+            raw_answer = sample["answer"]
+            # GSM8K format: "... #### 42"
+            if "####" in str(raw_answer):
+                answer = str(raw_answer).split("####")[-1].strip()
+            else:
+                answer = str(raw_answer).strip()
+        else:
+            raise ValueError(f"No answer field found. Keys: {list(sample.keys())}")
+        
+        # Format as chat prompt
+        messages = [
+            {"role": "user", "content": question}
+        ]
+        
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,  # Add assistant prefix for generation
+        )
+        
+        return {"prompt": prompt, "answer": answer}
+    
+    train = train.map(format_sample, num_proc=num_proc)
+    eval_ds = eval_ds.map(format_sample, num_proc=num_proc)
+    
+    # Keep only required columns for GRPO
+    train = train.select_columns(["prompt", "answer"])
+    eval_ds = eval_ds.select_columns(["prompt", "answer"])
+    
+    print(f"[RLVR Math] ✓ Formatted for GRPO (prompt + answer columns)")
+    
+    return {"train": train, "eval": eval_ds}

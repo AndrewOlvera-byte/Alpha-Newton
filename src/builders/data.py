@@ -1,5 +1,6 @@
 from src.core.registry import register
 from datasets import load_dataset, interleave_datasets
+from typing import Any, Dict, List
 
 
 def _pack_tokenized_dataset(dataset, max_seq_len: int):
@@ -9,16 +10,23 @@ def _pack_tokenized_dataset(dataset, max_seq_len: int):
     """
 
     def group_texts(examples):
-        # Flatten then chunk to max_seq_len
-        concatenated = sum(examples["input_ids"], [])
-        total_length = (len(concatenated) // max_seq_len) * max_seq_len
-        concatenated = concatenated[:total_length]
+        # Flatten then chunk to max_seq_len (keeps label masking intact)
+        concatenated_ids = sum(examples["input_ids"], [])
+        concatenated_labels = sum(examples["labels"], [])
+
+        total_length = (len(concatenated_ids) // max_seq_len) * max_seq_len
+        concatenated_ids = concatenated_ids[:total_length]
+        concatenated_labels = concatenated_labels[:total_length]
 
         if total_length == 0:
             return {"input_ids": [], "attention_mask": [], "labels": []}
 
         input_ids = [
-            concatenated[i : i + max_seq_len]
+            concatenated_ids[i : i + max_seq_len]
+            for i in range(0, total_length, max_seq_len)
+        ]
+        labels = [
+            concatenated_labels[i : i + max_seq_len]
             for i in range(0, total_length, max_seq_len)
         ]
         attention_mask = [[1] * max_seq_len for _ in input_ids]
@@ -26,7 +34,7 @@ def _pack_tokenized_dataset(dataset, max_seq_len: int):
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "labels": input_ids,
+            "labels": labels,
         }
 
     packed = dataset.map(
@@ -35,6 +43,188 @@ def _pack_tokenized_dataset(dataset, max_seq_len: int):
         remove_columns=dataset.column_names,
     )
     return packed
+
+
+def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """
+    Normalize/clean message list into the minimal schema expected by chat templates:
+      [{"role": "system"|"user"|"assistant", "content": str}, ...]
+    """
+    cleaned: List[Dict[str, str]] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role not in {"system", "user", "assistant"}:
+            continue
+        if content is None:
+            continue
+        content = str(content).strip()
+        if not content:
+            continue
+        cleaned.append({"role": role, "content": content})
+    return cleaned
+
+
+def _messages_from_sample(sample: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Convert a dataset row (various formats) into OpenAI-style messages.
+    Returns [] if unrecognized.
+    """
+    messages: List[Dict[str, Any]] = []
+
+    # Parser 1: Standard OpenAI format (already correct)
+    if sample.get("messages") and isinstance(sample["messages"], list):
+        messages = sample["messages"]
+
+    # Parser 2: Glaive (system + chat text) - must check before conversations
+    elif sample.get("system") and sample.get("chat"):
+        system_text = sample["system"]
+        if system_text and "SYSTEM:" in system_text:
+            system_content = system_text.split("SYSTEM:", 1)[1].strip()
+            if system_content:
+                messages.append({"role": "system", "content": system_content})
+
+        chat_text = sample["chat"]
+        current_role = None
+        current_content: List[str] = []
+
+        for chunk in str(chat_text).split("\n\n"):
+            line = chunk.strip()
+            if not line or line == "<|endoftext|>":
+                continue
+
+            if line.startswith("USER:"):
+                if current_role and current_content:
+                    messages.append(
+                        {"role": current_role, "content": "\n".join(current_content).strip()}
+                    )
+                current_role = "user"
+                current_content = [line.replace("USER:", "", 1).strip()]
+
+            elif line.startswith("ASSISTANT:"):
+                if current_role and current_content:
+                    messages.append(
+                        {"role": current_role, "content": "\n".join(current_content).strip()}
+                    )
+                current_role = "assistant"
+                current_content = [line.replace("ASSISTANT:", "", 1).strip()]
+
+            else:
+                if current_role:
+                    current_content.append(line)
+
+        if current_role and current_content:
+            messages.append({"role": current_role, "content": "\n".join(current_content).strip()})
+
+    # Parser 3: OpenHermes (conversations list with from/value)
+    elif sample.get("conversations") and isinstance(sample.get("conversations"), list):
+        if sample.get("system_prompt"):
+            messages.append({"role": "system", "content": sample["system_prompt"]})
+
+        for turn in sample["conversations"]:
+            if isinstance(turn, dict) and "from" in turn and "value" in turn:
+                role = "user" if turn["from"] in ["human", "user"] else "assistant"
+                messages.append({"role": role, "content": turn["value"]})
+
+    # Parser 4: Capybara (conversation list with input/output)
+    elif sample.get("conversation") and isinstance(sample.get("conversation"), list):
+        for turn in sample["conversation"]:
+            if isinstance(turn, dict) and "input" in turn and "output" in turn:
+                messages.append({"role": "user", "content": turn["input"]})
+                messages.append({"role": "assistant", "content": turn["output"]})
+
+    return _normalize_messages(messages)
+
+
+def _tokenize_prompt_and_response(
+    messages: List[Dict[str, str]],
+    tokenizer,
+    max_seq_len: int,
+):
+    """
+    Turn a multi-turn chat into many SFT examples (one per assistant turn),
+    where labels are masked (-100) for the prompt and active for the assistant response.
+
+    Uses chat template tokenization to avoid double special-token insertion.
+    """
+    examples: List[Dict[str, Any]] = []
+
+    if not messages:
+        return examples
+
+    trunc_side = getattr(tokenizer, "truncation_side", "right")
+
+    def _extract_input_ids(tokenized):
+        # `apply_chat_template(..., tokenize=True)` can return List[int] or an encoding/dict.
+        if isinstance(tokenized, list):
+            return tokenized
+        if isinstance(tokenized, dict) and "input_ids" in tokenized:
+            return tokenized["input_ids"]
+        if hasattr(tokenized, "input_ids"):
+            return getattr(tokenized, "input_ids")
+        return None
+
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "assistant":
+            continue
+        if i == 0:
+            continue
+
+        prefix = messages[:i]
+        full = messages[: i + 1]
+
+        try:
+            prompt_ids = tokenizer.apply_chat_template(
+                prefix,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            full_ids = tokenizer.apply_chat_template(
+                full,
+                tokenize=True,
+                add_generation_prompt=False,
+            )
+        except Exception:
+            continue
+
+        prompt_ids = _extract_input_ids(prompt_ids)
+        full_ids = _extract_input_ids(full_ids)
+
+        if not isinstance(prompt_ids, list) or not isinstance(full_ids, list):
+            continue
+        if len(full_ids) == 0:
+            continue
+
+        # Safety: ensure prompt is a prefix of full (expected for chat templates)
+        if len(prompt_ids) > len(full_ids) or full_ids[: len(prompt_ids)] != prompt_ids:
+            continue
+
+        labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids) :]
+
+        # Truncate consistently (keep labels aligned)
+        if len(full_ids) > max_seq_len:
+            if trunc_side == "left":
+                full_ids = full_ids[-max_seq_len:]
+                labels = labels[-max_seq_len:]
+            else:
+                full_ids = full_ids[:max_seq_len]
+                labels = labels[:max_seq_len]
+
+        attention_mask = [1] * len(full_ids)
+        if len(full_ids) != len(labels):
+            continue
+
+        examples.append(
+            {
+                "input_ids": full_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            }
+        )
+
+    return examples
 
 
 @register("data", "sft")
@@ -75,85 +265,41 @@ def build_sft_dataset(source: str, train_path: str, eval_path: str, max_seq_len:
             cache_dir=cache_dir,
         )
 
-    # === 2. Format chat with tokenizer's chat template === #
+    # === 2. Convert rows -> (prompt + single assistant response) tokenized examples === #
 
-    def format_chat(sample):
-        """
-        Convert various dataset formats to universal OpenAI messages format,
-        then apply tokenizer's chat template.
+    def to_sft_features(batch):
+        input_ids, attention_mask, labels = [], [], []
 
-        Supports:
-        - Standard "messages": [{"role": "user", "content": "..."}]
-        - Capybara "conversation": [{"input": "...", "output": "..."}]
-        - OpenHermes "conversations": [{"from": "human/gpt", "value": "..."}]
-        """
-        messages = []
+        batch_size = len(next(iter(batch.values()))) if batch else 0
+        for idx in range(batch_size):
+            sample = {k: v[idx] for k, v in batch.items()}
+            messages = _messages_from_sample(sample)
+            exs = _tokenize_prompt_and_response(messages, tokenizer=tokenizer, max_seq_len=max_seq_len)
+            for ex in exs:
+                input_ids.append(ex["input_ids"])
+                attention_mask.append(ex["attention_mask"])
+                labels.append(ex["labels"])
 
-        # Standard OpenAI format
-        if "messages" in sample:
-            messages = sample["messages"]
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        # Capybara conversation format
-        elif "conversation" in sample:
-            for turn in sample["conversation"]:
-                messages.append({"role": "user", "content": turn["input"]})
-                messages.append({"role": "assistant", "content": turn["output"]})
-
-        # OpenHermes-2.5 format
-        elif "conversations" in sample:
-            # Add system prompt if exists
-            if sample.get("system_prompt"):
-                messages.append({"role": "system", "content": sample["system_prompt"]})
-
-            # Convert conversations
-            for turn in sample["conversations"]:
-                role = "user" if turn["from"] in ["human", "user"] else "assistant"
-                messages.append({"role": role, "content": turn["value"]})
-
-        else:
-            raise ValueError(f"Unknown format. Expected 'messages', 'conversation', or 'conversations', got: {list(sample.keys())}")
-
-        # Apply tokenizer's chat template
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        return {"text": text}
-
-    train = train.map(format_chat, num_proc=num_proc)
-    eval = eval.map(format_chat, num_proc=num_proc)
-
-    # === 3. Tokenize (fast batched tokenization) === #
-
-    def tokenize(batch):
-        return tokenizer(
-            batch["text"],
-            max_length=max_seq_len,
-            truncation=True,
-            padding=False,
-        )
-
-    train = train.map(tokenize, batched=True, num_proc=num_proc)
-    eval = eval.map(tokenize, batched=True, num_proc=num_proc)
-
-    # Remove raw text to keep only tensor-ready columns
-    keep_cols = {"input_ids", "attention_mask"}
-    train = train.remove_columns([c for c in train.column_names if c not in keep_cols])
-    eval = eval.remove_columns([c for c in eval.column_names if c not in keep_cols])
+    train = train.map(
+        to_sft_features,
+        batched=True,
+        num_proc=num_proc,
+        remove_columns=train.column_names,
+    )
+    eval = eval.map(
+        to_sft_features,
+        batched=True,
+        num_proc=num_proc,
+        remove_columns=eval.column_names,
+    )
 
     # === 4. Optional packing === #
 
     if packing:
         train = _pack_tokenized_dataset(train, max_seq_len)
         eval = _pack_tokenized_dataset(eval, max_seq_len)
-    else:
-        # Add labels to mirror input_ids for trainer/collator
-        def add_labels(batch):
-            return {"labels": batch["input_ids"]}
-
-        train = train.map(add_labels, batched=True)
-        eval = eval.map(add_labels, batched=True)
 
     # Ensure PyTorch format for efficient collation
     columns = ["input_ids", "attention_mask", "labels"]
@@ -322,128 +468,38 @@ def build_mixed_sft_dataset(
 
     # === Format and tokenize === #
 
-    def format_chat(sample):
-        """
-        Convert various dataset formats to universal OpenAI messages format.
+    def to_sft_features(batch):
+        input_ids, attention_mask, labels = [], [], []
 
-        Uses smart detection to handle any dataset format without hardcoding checks.
-        """
-        messages = []
+        batch_size = len(next(iter(batch.values()))) if batch else 0
+        for idx in range(batch_size):
+            sample = {k: v[idx] for k, v in batch.items()}
+            messages = _messages_from_sample(sample)
+            exs = _tokenize_prompt_and_response(messages, tokenizer=tokenizer, max_seq_len=max_seq_len)
+            for ex in exs:
+                input_ids.append(ex["input_ids"])
+                attention_mask.append(ex["attention_mask"])
+                labels.append(ex["labels"])
 
-        # Strategy: Try each parser in order, return first successful parse
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-        # Parser 1: Standard OpenAI format (already correct)
-        if sample.get("messages") and isinstance(sample["messages"], list):
-            messages = sample["messages"]
-
-        # Parser 2: Glaive (system + chat text) - must check before conversations
-        elif sample.get("system") and sample.get("chat"):
-            system_text = sample["system"]
-            if system_text and "SYSTEM:" in system_text:
-                system_content = system_text.split("SYSTEM:", 1)[1].strip()
-                messages.append({"role": "system", "content": system_content})
-
-            chat_text = sample["chat"]
-            current_role = None
-            current_content = []
-
-            for line in chat_text.split("\n\n"):
-                line = line.strip()
-                if not line or line == "<|endoftext|>":
-                    continue
-
-                if line.startswith("USER:"):
-                    if current_role and current_content:
-                        messages.append({
-                            "role": current_role,
-                            "content": "\n".join(current_content).strip()
-                        })
-                    current_role = "user"
-                    current_content = [line.replace("USER:", "").strip()]
-
-                elif line.startswith("ASSISTANT:"):
-                    if current_role and current_content:
-                        messages.append({
-                            "role": current_role,
-                            "content": "\n".join(current_content).strip()
-                        })
-                    current_role = "assistant"
-                    current_content = [line.replace("ASSISTANT:", "").strip()]
-
-                else:
-                    if current_role:
-                        current_content.append(line)
-
-            if current_role and current_content:
-                messages.append({
-                    "role": current_role,
-                    "content": "\n".join(current_content).strip()
-                })
-
-        # Parser 3: OpenHermes (conversations list with from/value)
-        elif sample.get("conversations") and isinstance(sample.get("conversations"), list):
-            if sample.get("system_prompt"):
-                messages.append({"role": "system", "content": sample["system_prompt"]})
-
-            for turn in sample["conversations"]:
-                if isinstance(turn, dict) and "from" in turn and "value" in turn:
-                    role = "user" if turn["from"] in ["human", "user"] else "assistant"
-                    messages.append({"role": role, "content": turn["value"]})
-
-        # Parser 4: Capybara (conversation list with input/output)
-        elif sample.get("conversation") and isinstance(sample.get("conversation"), list):
-            for turn in sample["conversation"]:
-                if isinstance(turn, dict) and "input" in turn and "output" in turn:
-                    messages.append({"role": "user", "content": turn["input"]})
-                    messages.append({"role": "assistant", "content": turn["output"]})
-
-        # If no parser worked, skip this sample (don't crash)
-        if not messages:
-            return {"text": ""}
-
-        # Apply chat template
-        try:
-            text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False
-            )
-        except Exception as e:
-            # Fallback: skip samples that fail chat template
-            return {"text": ""}
-
-        return {"text": text}
-
-    train = train.map(format_chat, num_proc=num_proc)
-    eval = eval.map(format_chat, num_proc=num_proc)
-
-    # Tokenize
-    def tokenize(batch):
-        return tokenizer(
-            batch["text"],
-            max_length=max_seq_len,
-            truncation=True,
-            padding=False,
-        )
-
-    train = train.map(tokenize, batched=True, num_proc=num_proc)
-    eval = eval.map(tokenize, batched=True, num_proc=num_proc)
-
-    # Keep only token columns
-    keep_cols = {"input_ids", "attention_mask"}
-    train = train.remove_columns([c for c in train.column_names if c not in keep_cols])
-    eval = eval.remove_columns([c for c in eval.column_names if c not in keep_cols])
+    train = train.map(
+        to_sft_features,
+        batched=True,
+        num_proc=num_proc,
+        remove_columns=train.column_names,
+    )
+    eval = eval.map(
+        to_sft_features,
+        batched=True,
+        num_proc=num_proc,
+        remove_columns=eval.column_names,
+    )
 
     # Packing to fixed blocks for better GPU utilization
     if packing:
         train = _pack_tokenized_dataset(train, max_seq_len)
         eval = _pack_tokenized_dataset(eval, max_seq_len)
-    else:
-        def add_labels(batch):
-            return {"labels": batch["input_ids"]}
-
-        train = train.map(add_labels, batched=True)
-        eval = eval.map(add_labels, batched=True)
 
     print(f"[Mixed Dataset] ✓ Train: {len(train):,} | Eval: {len(eval):,}\n")
 

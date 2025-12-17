@@ -1,6 +1,55 @@
 import wandb
 from src.core.registry import register
 from trl import SFTTrainer, SFTConfig, DPOTrainer, DPOConfig, GRPOTrainer, GRPOConfig
+import torch
+from typing import Any, Dict, List, Optional
+
+
+class DataCollatorForCausalLMWithLabels:
+    """
+    Pads a batch of tokenized CausalLM features while preserving precomputed `labels`.
+
+    This is critical for SFT when we pre-mask prompt tokens with -100 and only train
+    on assistant tokens. TRL/Transformers' default LM collators often overwrite labels.
+    """
+
+    def __init__(self, tokenizer, pad_to_multiple_of: Optional[int] = 8):
+        self.tokenizer = tokenizer
+        self.pad_to_multiple_of = pad_to_multiple_of
+
+    def __call__(self, features: List[Dict[str, Any]]):
+        labels = []
+        features_wo_labels = []
+        for f in features:
+            # Keep original labels (may be list[int] or torch.Tensor)
+            lab = f.get("labels")
+            if isinstance(lab, torch.Tensor):
+                lab = lab.tolist()
+            labels.append(lab)
+            features_wo_labels.append({k: v for k, v in f.items() if k != "labels"})
+
+        batch = self.tokenizer.pad(
+            features_wo_labels,
+            padding=True,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors="pt",
+        )
+
+        max_len = batch["input_ids"].shape[1]
+        pad_side = getattr(self.tokenizer, "padding_side", "right")
+        padded_labels = []
+        for lab in labels:
+            lab = lab or []
+            if len(lab) > max_len:
+                lab = lab[:max_len]
+            pad_len = max_len - len(lab)
+            if pad_side == "left":
+                padded_labels.append(([-100] * pad_len) + lab)
+            else:
+                padded_labels.append(lab + ([-100] * pad_len))
+
+        batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
+        return batch
 
 
 @register("trainer", "trl_sft")
@@ -33,12 +82,16 @@ def build_trl_sft_trainer(model, tokenizer, dataset, training_cfg, wandb_cfg):
 
     training_args = SFTConfig(**training_cfg)
 
+    # IMPORTANT: preserve prompt-masked labels coming from the dataset builder.
+    data_collator = DataCollatorForCausalLMWithLabels(tokenizer=tokenizer, pad_to_multiple_of=8)
+
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,  # Renamed from 'tokenizer' in TRL 0.12.0+
         train_dataset=dataset["train"],
         eval_dataset=dataset.get("eval"),
         args=training_args,
+        data_collator=data_collator,
     )
     return trainer
 

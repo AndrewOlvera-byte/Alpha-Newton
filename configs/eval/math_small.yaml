@@ -1,0 +1,24 @@
+# Math eval suite (small): GSM8K only
+
+suite:
+  name: "math_small"
+
+runner:
+  backend: "lm_eval"
+  model: "hf"
+
+  # Accepts task aliases; entrypoint maps them to lm-eval task IDs
+  tasks: ["gsm8k"]
+
+  num_fewshot: 0
+  batch_size: 4
+
+  # Deterministic generation for comparable benchmark numbers
+  apply_chat_template: true
+  gen_kwargs:
+    do_sample: false
+    temperature: 0.0
+
+output:
+  # If null, defaults to outputs/<run.name>/eval/<suite>.json
+  path: null

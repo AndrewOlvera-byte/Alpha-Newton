@@ -100,6 +100,31 @@ docker compose exec alpha-newton python src/entrypoints/train_dpo.py \
 
 DPO (Direct Preference Optimization) fine-tunes the model on preference pairs from Anthropic HH-RLHF.
 
+### 3. Evaluate on Math Benchmarks (GSM8K, MATH)
+
+This project includes a lightweight evaluation entrypoint that runs ecosystem-standard benchmarks via **EleutherAI lm-evaluation-harness**.
+
+Install eval-only dependencies (kept separate from training deps):
+
+```bash
+pip install -r requirements/eval.txt
+```
+
+Run a math suite using the same `--exp` experiment naming pattern as training:
+
+```bash
+# Evaluate the checkpoint saved at training.output_dir
+python src/entrypoints/eval_math.py --exp qwen3_600M_rlvr_math --suite math_small
+
+# Full math suite (GSM8K + MATH)
+python src/entrypoints/eval_math.py --exp qwen3_600M_rlvr_math --suite math_full
+
+# Smoke test (limit samples)
+python src/entrypoints/eval_math.py --exp qwen3_600M_rlvr_math --suite math_small --limit 100
+```
+
+Suites live in `configs/eval/*.yaml`, and can be swapped by changing the task list. By default we pass `--apply_chat_template`, which wraps each benchmark prompt into an OpenAI-style messages list (user role) and uses your tokenizer chat template for formatting.
+
 ### 3. Chat with Your Model
 
 ```bash

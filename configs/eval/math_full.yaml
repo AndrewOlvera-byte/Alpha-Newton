@@ -1,0 +1,21 @@
+# Math eval suite (full): GSM8K + MATH
+
+suite:
+  name: "math_full"
+
+runner:
+  backend: "lm_eval"
+  model: "hf"
+
+  tasks: ["gsm8k", "math"]
+
+  num_fewshot: 0
+  batch_size: 2
+
+  apply_chat_template: true
+  gen_kwargs:
+    do_sample: false
+    temperature: 0.0
+
+output:
+  path: null

@@ -106,14 +106,32 @@ def generate_response(
 
     # Generate
     with torch.no_grad():
+        # Qwen-style chat templates use an explicit end-of-message token.
+        # Include it as an EOS to prevent the model from "continuing the transcript"
+        # into the next user/assistant turn.
+        eos_token_ids = []
+        if tokenizer.eos_token_id is not None:
+            eos_token_ids.append(tokenizer.eos_token_id)
+
+        for tok in ("<|im_end|>", "<|endoftext|>"):
+            try:
+                tid = tokenizer.convert_tokens_to_ids(tok)
+            except Exception:
+                tid = None
+            if tid is not None and tid != getattr(tokenizer, "unk_token_id", None) and tid not in eos_token_ids:
+                eos_token_ids.append(tid)
+
+        eos_arg = eos_token_ids[0] if len(eos_token_ids) == 1 else eos_token_ids
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
             do_sample=True,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=pad_id,
+            eos_token_id=eos_arg,
         )
 
     # Decode only the new tokens (exclude the prompt)

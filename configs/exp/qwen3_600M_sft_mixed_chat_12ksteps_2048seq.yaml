@@ -1,5 +1,5 @@
 run:
-  name: "qwen3_600M_sft_mixed_2ksteps_1536seq"
+  name: "qwen3_600M_sft_mixed_chat_12ksteps_2048seq"
   mode: "sft"
 
 model:
@@ -18,12 +18,13 @@ data:
   type: "sft_mixed"
   datasets_config:
     - path: "teknium/OpenHermes-2.5"
-      weight: 0.7
+      weight: 0.8
     - path: "glaiveai/glaive-function-calling-v2"
-      weight: 0.3
-  max_seq_len: 1536
+      weight: 0.2
+  max_seq_len: 2048
   num_proc: 12
-  packing: true
+  # For best chat quality, avoid cross-sample context leakage.
+  packing: false
 
 training:
   per_device_train_batch_size: 8
@@ -33,16 +34,20 @@ training:
   dataloader_pin_memory: true
   dataloader_prefetch_factor: 2
 
-  max_steps: 2000
-  save_steps: 500
-  eval_steps: 500
-  learning_rate: 2.0e-5
-  warmup_steps: 200
+  max_steps: 12000
+  save_steps: 1000
+  eval_steps: 1000
 
-  logging_steps: 50
+  learning_rate: 1.5e-5
+  warmup_steps: 600
+  lr_scheduler_type: "cosine"
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+
+  logging_steps: 10
   logging_first_step: true
   bf16: true
   torch_compile: true
 
 wandb:
-  tags: ["qwen3-0.6b", "sft", "mixed", "openhermes+glaive", "assistant-only-loss", "2ksteps", "1536seq"]
+  tags: ["qwen3-0.6b", "sft", "mixed", "openhermes+glaive", "assistant-only-loss", "no-packing", "12ksteps", "2048seq"]

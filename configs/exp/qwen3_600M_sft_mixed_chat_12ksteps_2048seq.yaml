@@ -23,8 +23,7 @@ data:
       weight: 0.2
   max_seq_len: 2048
   num_proc: 12
-  # For best chat quality, avoid cross-sample context leakage.
-  packing: false
+  packing: true
 
 training:
   per_device_train_batch_size: 8

@@ -1,9 +1,12 @@
-from src.core.registry import register
-from datasets import load_dataset, interleave_datasets
+import re
 from typing import Any, Dict, List
 
+from datasets import load_dataset, interleave_datasets
 
-def _pack_tokenized_dataset(dataset, max_seq_len: int):
+from src.core.registry import register
+
+
+def _pack_tokenized_dataset(dataset, max_seq_len: int, eos_token_id: int):
     """
     Concatenate and chunk tokenized sequences into fixed-length blocks.
     Ensures every sample is max_seq_len to better utilize the GPU.
@@ -11,8 +14,16 @@ def _pack_tokenized_dataset(dataset, max_seq_len: int):
 
     def group_texts(examples):
         # Flatten then chunk to max_seq_len (keeps label masking intact)
-        concatenated_ids = sum(examples["input_ids"], [])
-        concatenated_labels = sum(examples["labels"], [])
+        concatenated_ids = []
+        concatenated_labels = []
+
+        for ids, labs in zip(examples["input_ids"], examples["labels"]):
+            concatenated_ids.extend(ids)
+            concatenated_labels.extend(labs)
+            
+            # Insert EOS separator
+            concatenated_ids.append(eos_token_id)
+            concatenated_labels.append(eos_token_id)
 
         total_length = (len(concatenated_ids) // max_seq_len) * max_seq_len
         concatenated_ids = concatenated_ids[:total_length]
@@ -67,73 +78,168 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     return cleaned
 
 
+def _parse_glaive_chat(system_text: str, chat_text: str) -> List[Dict[str, str]]:
+    """
+    Parse Glaive function-calling dataset format (plain text with role prefixes).
+    
+    Format:
+        system: "SYSTEM: You are a helpful assistant..."
+        chat: "USER: Hello\n\nASSISTANT: Hi there!..."
+    
+    Handles:
+        - Case-insensitive role prefixes
+        - Function call markers (<functioncall>, FUNCTION RESPONSE)
+        - Multi-line content within turns
+    """
+    messages: List[Dict[str, str]] = []
+    
+    # Extract system message
+    if system_text:
+        # Handle "SYSTEM: content" or just the content directly
+        sys_match = re.match(r"(?:SYSTEM:\s*)?(.+)", str(system_text), re.IGNORECASE | re.DOTALL)
+        if sys_match:
+            sys_content = sys_match.group(1).strip()
+            if sys_content:
+                messages.append({"role": "system", "content": sys_content})
+    
+    if not chat_text:
+        return messages
+    
+    # Split on role markers (case-insensitive)
+    # Pattern matches USER:, ASSISTANT:, or FUNCTION RESPONSE: at line start
+    pattern = r'\n*(?=(?:USER|ASSISTANT|FUNCTION\s*RESPONSE)\s*:)'
+    chunks = re.split(pattern, str(chat_text), flags=re.IGNORECASE)
+    
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk or chunk == "<|endoftext|>":
+            continue
+        
+        chunk_upper = chunk.upper()
+        
+        if chunk_upper.startswith("USER:"):
+            content = chunk[5:].strip()  # len("USER:") = 5
+            if content:
+                messages.append({"role": "user", "content": content})
+        
+        elif chunk_upper.startswith("ASSISTANT:"):
+            content = chunk[10:].strip()  # len("ASSISTANT:") = 10
+            if content:
+                # Keep function calls in the content (model should learn this format)
+                messages.append({"role": "assistant", "content": content})
+        
+        elif chunk_upper.startswith("FUNCTION RESPONSE:") or chunk_upper.startswith("FUNCTION_RESPONSE:"):
+            # Treat function responses as user messages (they're inputs to the model)
+            colon_idx = chunk.find(":")
+            content = chunk[colon_idx + 1:].strip() if colon_idx != -1 else chunk.strip()
+            if content:
+                messages.append({"role": "user", "content": f"[Function Response]\n{content}"})
+    
+    return messages
+
+
 def _messages_from_sample(sample: Dict[str, Any]) -> List[Dict[str, str]]:
     """
     Convert a dataset row (various formats) into OpenAI-style messages.
     Returns [] if unrecognized.
+    
+    Supported formats:
+        1. OpenAI format: {"messages": [{"role": "...", "content": "..."}]}
+           Used by: NuminaMath-CoT, big-reasoning-traces, general chat datasets
+        
+        2. ShareGPT format: {"conversations": [{"from": "...", "value": "..."}]}
+           Used by: OpenHermes-2.5, OpenThoughts3-1.2M
+        
+        3. CoT-Collection format: {"source": "...", "rationale": "...", "target": "..."}
+           Used by: kaist-ai/CoT-Collection
+        
+        4. Glaive format: {"system": "SYSTEM: ...", "chat": "USER: ... ASSISTANT: ..."}
+           Used by: glaiveai/glaive-function-calling-v2
+        
+        5. Capybara format: {"conversation": [{"input": "...", "output": "..."}]}
+           Used by: LDJnr/Capybara
+        
+        6. Problem/Solution format: {"problem": "...", "solution": "..."}
+           Used by: Various math datasets as fallback
     """
     messages: List[Dict[str, Any]] = []
 
-    # Parser 1: Standard OpenAI format (already correct)
+    # === Parser 1: OpenAI format (messages with role/content) ===
+    # Used by: NuminaMath-CoT, big-reasoning-traces, most modern datasets
     if sample.get("messages") and isinstance(sample["messages"], list):
         messages = sample["messages"]
 
-    # Parser 2: Glaive (system + chat text) - must check before conversations
-    elif sample.get("system") and sample.get("chat"):
-        system_text = sample["system"]
-        if system_text and "SYSTEM:" in system_text:
-            system_content = system_text.split("SYSTEM:", 1)[1].strip()
-            if system_content:
-                messages.append({"role": "system", "content": system_content})
+    # === Parser 2: Glaive format (system + chat plain text) ===
+    # Check before conversations since Glaive samples may have empty conversations field
+    elif sample.get("chat") and isinstance(sample.get("chat"), str):
+        system_text = sample.get("system", "")
+        messages = _parse_glaive_chat(system_text, sample["chat"])
 
-        chat_text = sample["chat"]
-        current_role = None
-        current_content: List[str] = []
-
-        for chunk in str(chat_text).split("\n\n"):
-            line = chunk.strip()
-            if not line or line == "<|endoftext|>":
-                continue
-
-            if line.startswith("USER:"):
-                if current_role and current_content:
-                    messages.append(
-                        {"role": current_role, "content": "\n".join(current_content).strip()}
-                    )
-                current_role = "user"
-                current_content = [line.replace("USER:", "", 1).strip()]
-
-            elif line.startswith("ASSISTANT:"):
-                if current_role and current_content:
-                    messages.append(
-                        {"role": current_role, "content": "\n".join(current_content).strip()}
-                    )
-                current_role = "assistant"
-                current_content = [line.replace("ASSISTANT:", "", 1).strip()]
-
-            else:
-                if current_role:
-                    current_content.append(line)
-
-        if current_role and current_content:
-            messages.append({"role": current_role, "content": "\n".join(current_content).strip()})
-
-    # Parser 3: OpenHermes (conversations list with from/value)
-    elif sample.get("conversations") and isinstance(sample.get("conversations"), list):
+    # === Parser 3: ShareGPT format (conversations with from/value) ===
+    # Used by: OpenHermes-2.5, OpenThoughts3-1.2M
+    elif sample.get("conversations") and isinstance(sample["conversations"], list):
+        # Check for external system_prompt field first
         if sample.get("system_prompt"):
             messages.append({"role": "system", "content": sample["system_prompt"]})
 
         for turn in sample["conversations"]:
-            if isinstance(turn, dict) and "from" in turn and "value" in turn:
-                role = "user" if turn["from"] in ["human", "user"] else "assistant"
-                messages.append({"role": role, "content": turn["value"]})
+            if not isinstance(turn, dict):
+                continue
+            
+            # Get role: normalize "human"/"user" -> "user", "gpt"/"assistant" -> "assistant"
+            from_field = str(turn.get("from", "")).lower()
+            value = turn.get("value")
+            
+            if not value:
+                continue
+            
+            if from_field in ("human", "user"):
+                messages.append({"role": "user", "content": value})
+            elif from_field in ("gpt", "assistant"):
+                messages.append({"role": "assistant", "content": value})
+            elif from_field == "system":
+                # System message embedded in conversations (OpenThoughts3 style)
+                messages.append({"role": "system", "content": value})
 
-    # Parser 4: Capybara (conversation list with input/output)
-    elif sample.get("conversation") and isinstance(sample.get("conversation"), list):
+    # === Parser 4: CoT-Collection format (source/rationale/target) ===
+    # Used by: kaist-ai/CoT-Collection
+    elif sample.get("source") and sample.get("target"):
+        source = str(sample["source"]).strip()
+        target = str(sample["target"]).strip()
+        rationale = sample.get("rationale", "")
+        
+        if source:
+            messages.append({"role": "user", "content": source})
+        
+        if rationale and target:
+            # Combine rationale (CoT) with final answer
+            rationale = str(rationale).strip()
+            response = f"{rationale}\n\nThe answer is: {target}" if rationale else target
+            messages.append({"role": "assistant", "content": response})
+        elif target:
+            messages.append({"role": "assistant", "content": target})
+
+    # === Parser 5: Capybara format (conversation with input/output) ===
+    # Used by: LDJnr/Capybara
+    elif sample.get("conversation") and isinstance(sample["conversation"], list):
         for turn in sample["conversation"]:
             if isinstance(turn, dict) and "input" in turn and "output" in turn:
-                messages.append({"role": "user", "content": turn["input"]})
-                messages.append({"role": "assistant", "content": turn["output"]})
+                inp = str(turn["input"]).strip()
+                out = str(turn["output"]).strip()
+                if inp:
+                    messages.append({"role": "user", "content": inp})
+                if out:
+                    messages.append({"role": "assistant", "content": out})
+
+    # === Parser 6: Problem/Solution fallback ===
+    # Used by: Various math datasets
+    elif sample.get("problem") and sample.get("solution"):
+        problem = str(sample["problem"]).strip()
+        solution = str(sample["solution"]).strip()
+        if problem:
+            messages.append({"role": "user", "content": problem})
+        if solution:
+            messages.append({"role": "assistant", "content": solution})
 
     return _normalize_messages(messages)
 
@@ -298,8 +404,8 @@ def build_sft_dataset(source: str, train_path: str, eval_path: str, max_seq_len:
     # === 4. Optional packing === #
 
     if packing:
-        train = _pack_tokenized_dataset(train, max_seq_len)
-        eval = _pack_tokenized_dataset(eval, max_seq_len)
+        train = _pack_tokenized_dataset(train, max_seq_len, tokenizer.eos_token_id)
+        eval = _pack_tokenized_dataset(eval, max_seq_len, tokenizer.eos_token_id)
 
     # Ensure PyTorch format for efficient collation
     columns = ["input_ids", "attention_mask", "labels"]
@@ -498,8 +604,8 @@ def build_mixed_sft_dataset(
 
     # Packing to fixed blocks for better GPU utilization
     if packing:
-        train = _pack_tokenized_dataset(train, max_seq_len)
-        eval = _pack_tokenized_dataset(eval, max_seq_len)
+        train = _pack_tokenized_dataset(train, max_seq_len, tokenizer.eos_token_id)
+        eval = _pack_tokenized_dataset(eval, max_seq_len, tokenizer.eos_token_id)
 
     print(f"[Mixed Dataset] ✓ Train: {len(train):,} | Eval: {len(eval):,}\n")
 

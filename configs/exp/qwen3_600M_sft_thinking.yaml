@@ -6,27 +6,31 @@ model:
   type: "hf_causal"
   id: "Qwen/Qwen3-0.6B-Base"
   dtype: "bfloat16"
-  gradient_checkpointing: false
+  # Required for longer sequences to fit in memory
+  gradient_checkpointing: true
 
 tokenizer:
   type: "hf"
   id: "Qwen/Qwen3-0.6B-Base"
+  # Keep the most recent reasoning when truncating long traces
+  truncation_side: "left"
 
 data:
   type: "sft_mixed"
   datasets_config:
-    - path: "kaist-ai/CoT-Collection"
-      weight: 0.5
-    - path: "allenai/big-reasoning-traces"
-      weight: 0.3
+    # Prioritize high-quality reasoning traces for benchmark performance
     - path: "open-r1/OpenThoughts3-1.2M"
-      weight: 0.15
+      weight: 0.45  # Best quality, QwQ-32B generated traces
     - path: "AI-MO/NuminaMath-CoT"
-      weight: 0.05
-  max_seq_len: 1536
+      weight: 0.30  # Math-focused for benchmark scores
+    - path: "kaist-ai/CoT-Collection"
+      weight: 0.15  # Broad CoT coverage
+    - path: "allenai/big-reasoning-traces"
+      weight: 0.10  # Additional reasoning diversity
+  # Increased to capture full reasoning chains (avg trace ~2-3K tokens)
+  max_seq_len: 2048
   num_proc: 12
   packing: true
-
 
 training:
   per_device_train_batch_size: 8
@@ -37,16 +41,23 @@ training:
   dataloader_pin_memory: true
   dataloader_prefetch_factor: 2
 
-  max_steps: 8000
-  save_steps: 500
-  eval_steps: 500
-  learning_rate: 1.0e-5
-  warmup_steps: 400
+  # Increased for better data coverage (~1.6B tokens)
+  # Dataset has ~6B+ tokens; this covers ~25% with weighted sampling
+  max_steps: 25000
+  save_steps: 2500
+  eval_steps: 2500
 
-  logging_steps: 10
+  # Slightly higher LR for small model, with weight decay for regularization
+  learning_rate: 2.0e-5
+  warmup_steps: 1000
+  lr_scheduler_type: "cosine"
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  logging_steps: 25
   logging_first_step: true
   bf16: true
   torch_compile: true
 
 wandb:
-  tags: ["qwen3-0.6b", "sft", "thinking", "reasoning", "math"]
+  tags: ["qwen3-0.6b", "sft", "thinking", "reasoning", "math", "25k-steps", "2048seq"]

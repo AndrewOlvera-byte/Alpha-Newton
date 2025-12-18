@@ -458,19 +458,19 @@ def build_dpo_dataset(source: str, train_path: str, eval_path: str, max_seq_len:
 
         TRL expects: {"prompt": str, "chosen": str, "rejected": str}
         """
-        # Anthropic HH-RLHF format: "\n\nH: ...\n\nA: ..."
+        # Anthropic HH-RLHF format: "\n\nHuman: ...\n\nAssistant: ..."
         if "chosen" in sample and "rejected" in sample and "prompt" not in sample:
             chosen = sample["chosen"]
             rejected = sample["rejected"]
 
             # Extract prompt from conversation (everything before last assistant response)
-            if "\n\nH:" in chosen and "\n\nA:" in chosen:
-                parts = chosen.split("\n\nA:")
+            if "\n\nHuman:" in chosen and "\n\nAssistant:" in chosen:
+                parts = chosen.split("\n\nAssistant:")
                 if len(parts) > 1:
-                    prompt = parts[0] + "\n\nA:"  # Include "A:" prefix for completion
+                    prompt = "\n\nAssistant:".join(parts[:-1]) + "\n\nAssistant:"  # Keep all but last response
                     chosen_response = parts[-1].strip()
 
-                    rejected_parts = rejected.split("\n\nA:")
+                    rejected_parts = rejected.split("\n\nAssistant:")
                     rejected_response = rejected_parts[-1].strip() if len(rejected_parts) > 1 else rejected
 
                     return {

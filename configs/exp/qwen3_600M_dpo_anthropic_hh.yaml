@@ -4,13 +4,13 @@ run:
 
 model:
   type: "hf_causal"
-  id: "outputs/qwen3_600M_sft_mixed_optimized"
+  id: "outputs/qwen3_600M_sft_mixed_chat_12ksteps_2048seq"
   dtype: "bfloat16"
   gradient_checkpointing: true
 
 tokenizer:
   type: "hf"
-  id: "outputs/qwen3_600M_sft_mixed_optimized"
+  id: "outputs/qwen3_600M_sft_mixed_chat_12ksteps_2048seq"
 
 data:
   type: "dpo"
@@ -34,10 +34,15 @@ training:
   eval_steps: 250
   learning_rate: 5.0e-7
   warmup_steps: 50
+  lr_scheduler_type: "cosine"
+  weight_decay: 0.0
+  max_grad_norm: 1.0
   beta: 0.1
 
   logging_steps: 10
   logging_first_step: true
+  bf16: true
+  torch_compile: true
 
 wandb:
   tags: ["qwen3-0.6b", "dpo", "anthropic-hh", "from-sft-mixed"]

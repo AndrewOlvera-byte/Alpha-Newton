@@ -131,13 +131,28 @@ def build_trl_dpo_trainer(model, tokenizer, dataset, training_cfg, wandb_cfg, re
     training_cfg = {**training_cfg}
     training_cfg["report_to"] = ["wandb"]
 
-    # Extract DPO-specific beta parameter
+    # Extract DPO-specific parameters
     beta = training_cfg.pop("beta", 0.1)
+    max_length = training_cfg.pop("max_length", 2048)
+    max_prompt_length = training_cfg.pop("max_prompt_length", max_length // 3)
+    # Precompute ref log probs upfront - major speedup (avoids ref model forward pass each step)
+    precompute_ref_log_probs = training_cfg.pop("precompute_ref_log_probs", True)
 
     training_args = DPOConfig(
         **training_cfg,
         beta=beta,  # DPO temperature (higher = more conservative, typical: 0.1-0.5)
+        max_length=max_length,
+        max_prompt_length=max_prompt_length,
+        # Precompute reference log probs once upfront instead of every training step
+        # This is the main DPO speedup - eliminates ref model forward pass during training
+        precompute_ref_log_probs=precompute_ref_log_probs,
+        # Padding settings for efficient batching
+        padding_value=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+        truncation_mode="keep_end",  # Keep end of sequences (most relevant for responses)
     )
+
+    if precompute_ref_log_probs:
+        print("[DPO Trainer] Will precompute reference log probabilities (one-time cost, faster training)")
 
     trainer = DPOTrainer(
         model=model,

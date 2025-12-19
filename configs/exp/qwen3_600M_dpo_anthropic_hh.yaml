@@ -6,7 +6,7 @@ model:
   type: "hf_causal"
   id: "outputs/qwen3_600M_sft_mixed_chat_12ksteps_2048seq"
   dtype: "bfloat16"
-  gradient_checkpointing: true
+  gradient_checkpointing: false
 
 tokenizer:
   type: "hf"
@@ -21,28 +21,37 @@ data:
   num_proc: 12
 
 training:
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 4
+  # Batch settings optimized for 5070 Ti (16GB VRAM)
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 2
 
-  dataloader_num_workers: 8
+  # Dataloader optimization for faster throughput
+  dataloader_num_workers: 12
   dataloader_pin_memory: true
-  dataloader_prefetch_factor: 2
+  dataloader_prefetch_factor: 4
 
-  max_steps: 1000
-  save_steps: 250
-  eval_steps: 250
-  learning_rate: 5.0e-7
-  warmup_steps: 50
+  # Training schedule
+  max_steps: 2000
+  save_steps: 500
+  eval_steps: 500
+
+  # Learning rate - FIXED (was 10x too low)
+  learning_rate: 5.0e-6
+  warmup_steps: 100
   lr_scheduler_type: "cosine"
-  weight_decay: 0.0
+  weight_decay: 0.01
   max_grad_norm: 1.0
+
+  # DPO-specific settings
   beta: 0.1
+  max_length: 2048
+  max_prompt_length: 512
 
   logging_steps: 10
   logging_first_step: true
   bf16: true
-  torch_compile: true
+  torch_compile: false
 
 wandb:
-  tags: ["qwen3-0.6b", "dpo", "anthropic-hh", "from-sft-mixed"]
+  tags: ["qwen3-0.6b", "dpo", "anthropic-hh", "from-sft-mixed", "optimized"]

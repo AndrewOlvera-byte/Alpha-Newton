@@ -1,0 +1,35 @@
+# Reasoning-focused eval suite
+# Good for: evaluating reasoning/thinking models, RLVR checkpoints
+#
+# Focuses on tasks that benefit from chain-of-thought reasoning
+
+suite:
+  name: "reasoning"
+
+runner:
+  backend: "lm_eval"
+  model: "hf"
+
+  tasks:
+    # === Math Reasoning (primary focus) ===
+    - gsm8k              # Grade school math - multi-step
+    - hendrycks_math     # MATH benchmark - complex proofs
+
+    # === Logical Reasoning ===
+    - arc_challenge      # Science reasoning
+    - winogrande         # Pronoun/context reasoning
+
+  # 0-shot for instruct/reasoning models
+  num_fewshot: 0
+  batch_size: 2
+
+  # Wrap prompts in chat template
+  apply_chat_template: true
+
+  gen_kwargs:
+    do_sample: false
+    temperature: 0.0
+    max_new_tokens: 2048  # Long for reasoning chains
+
+output:
+  path: null

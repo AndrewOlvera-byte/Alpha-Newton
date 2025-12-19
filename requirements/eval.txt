@@ -1,9 +1,17 @@
 # Evaluation-only dependencies (kept separate from training deps)
 # Install: pip install -r requirements/eval.txt
+#
+# Usage:
+#   python src/entrypoints/eval.py --exp <exp_name> --suite <suite>
+#   python src/entrypoints/eval.py --model <hf_model_id> --suite quick
+#
+# Available suites: quick, standard, full, reasoning, math_small, math_full
 
 # EleutherAI lm-evaluation-harness (standard benchmark runner)
-lm-eval==0.4.7
+# Handles benchmark datasets automatically (GSM8K, MMLU, ARC, etc.)
+lm-eval>=0.4.7
 
-# Some tasks rely on these; keep lightweight
-sacrebleu>=2.4.0
-rouge-score>=0.1.2
+# Task-specific dependencies
+sacrebleu>=2.4.0      # Translation metrics
+rouge-score>=0.1.2    # Summarization metrics
+antlr4-python3-runtime==4.11  # MATH parsing (hendrycks_math)

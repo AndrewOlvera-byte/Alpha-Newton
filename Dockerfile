@@ -17,9 +17,11 @@ WORKDIR /workspace
 
 # Install dependencies first for Docker layer caching
 COPY requirements.txt /workspace/requirements.txt
+COPY requirements/ /workspace/requirements/
 RUN pip install --upgrade pip && \
     pip install flash-attn>=2.4.0 --no-build-isolation && \
-    grep -v "flash-attn" /workspace/requirements.txt | pip install -r /dev/stdin
+    grep -v "flash-attn" /workspace/requirements.txt | pip install -r /dev/stdin && \
+    pip install -r /workspace/requirements/eval.txt
 
 # Copy project code
 COPY . /workspace

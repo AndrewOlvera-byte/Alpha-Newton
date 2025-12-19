@@ -1,0 +1,37 @@
+# Standard eval suite - balanced coverage (~30-60 min)
+# Good for: checkpoint evaluation, regular benchmarking
+
+suite:
+  name: "standard"
+
+runner:
+  backend: "lm_eval"
+  model: "hf"
+
+  tasks:
+    # Math reasoning
+    - gsm8k
+
+    # Commonsense & reasoning
+    - arc_challenge
+    - arc_easy
+    - hellaswag
+    - winogrande
+
+    # Truthfulness
+    - truthfulqa_mc2
+
+  # 0-shot for instruct models
+  num_fewshot: 0
+  batch_size: 4
+
+  # Wrap prompts in chat template for instruct/chat models
+  apply_chat_template: true
+
+  gen_kwargs:
+    do_sample: false
+    temperature: 0.0
+    max_new_tokens: 512
+
+output:
+  path: null

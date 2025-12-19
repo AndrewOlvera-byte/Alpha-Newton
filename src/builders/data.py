@@ -415,10 +415,53 @@ def build_sft_dataset(source: str, train_path: str, eval_path: str, max_seq_len:
     return {"train": train, "eval": eval}
 
 
-@register("data", "dpo")
-def build_dpo_dataset(source: str, train_path: str, eval_path: str, max_seq_len: int, num_proc: int, tokenizer, cache_dir: str = None, **kwargs):
+def _parse_anthropic_hh(sample):
     """
-    Build DPO dataset from preference pairs
+    Parse Anthropic HH-RLHF format into prompt/chosen/rejected.
+    
+    Format: "\n\nHuman: ...\n\nAssistant: ..."
+    Returns dict with prompt, chosen, rejected strings.
+    """
+    chosen = sample["chosen"]
+    rejected = sample["rejected"]
+
+    # Extract prompt from conversation (everything before last assistant response)
+    if "\n\nHuman:" in chosen and "\n\nAssistant:" in chosen:
+        parts = chosen.split("\n\nAssistant:")
+        if len(parts) > 1:
+            prompt = "\n\nAssistant:".join(parts[:-1]) + "\n\nAssistant:"
+            chosen_response = parts[-1].strip()
+
+            rejected_parts = rejected.split("\n\nAssistant:")
+            rejected_response = rejected_parts[-1].strip() if len(rejected_parts) > 1 else rejected
+
+            return {
+                "prompt": prompt,
+                "chosen": chosen_response,
+                "rejected": rejected_response,
+            }
+
+    # Fallback: use full conversations
+    return {
+        "prompt": "",
+        "chosen": chosen,
+        "rejected": rejected,
+    }
+
+
+@register("data", "dpo")
+def build_dpo_dataset(
+    source: str,
+    train_path: str,
+    eval_path: str,
+    max_seq_len: int,
+    num_proc: int,
+    tokenizer,
+    cache_dir: str = None,
+    **kwargs
+):
+    """
+    Build DPO dataset from preference pairs.
 
     Supports datasets with (chosen, rejected) pairs:
         - Anthropic/hh-rlhf
@@ -426,10 +469,18 @@ def build_dpo_dataset(source: str, train_path: str, eval_path: str, max_seq_len:
         - Intel/orca_dpo_pairs
         - argilla/ultrafeedback-binarized-preferences-cleaned
 
-    Expected format:
-        - chosen: preferred response
-        - rejected: dis-preferred response
-        - (optional) prompt: the input prompt
+    Args:
+        source: "hf" or "local"
+        train_path: HuggingFace dataset name or local path
+        eval_path: HuggingFace dataset name or local path
+        max_seq_len: Maximum sequence length (used by trainer, not here)
+        num_proc: Number of processes for parallel processing
+        tokenizer: Tokenizer instance
+        cache_dir: Cache directory for datasets
+
+    Returns:
+        Dict with 'train' and 'eval' datasets containing prompt/chosen/rejected text columns.
+        TRL DPOTrainer handles tokenization internally.
     """
     assert source in ("hf", "local", "jsonl"), f"Invalid source: {source}"
 
@@ -441,54 +492,32 @@ def build_dpo_dataset(source: str, train_path: str, eval_path: str, max_seq_len:
         if train_path == eval_path:
             split_dataset = dataset.train_test_split(test_size=0.05, seed=42)
             train = split_dataset["train"]
-            eval = split_dataset["test"]
+            eval_ds = split_dataset["test"]
         else:
             train = dataset
-            eval = load_dataset(eval_path, split="train", cache_dir=cache_dir)
+            eval_ds = load_dataset(eval_path, split="train", cache_dir=cache_dir)
 
     elif source == "local":
         train = load_dataset("json", data_files=train_path, split="train", cache_dir=cache_dir)
-        eval = load_dataset("json", data_files=eval_path, split="train", cache_dir=cache_dir)
+        eval_ds = load_dataset("json", data_files=eval_path, split="train", cache_dir=cache_dir)
+
+    print(f"[DPO Data] Loaded {len(train):,} train, {len(eval_ds):,} eval samples")
 
     # === 2. Format for DPO === #
 
     def format_dpo_sample(sample):
-        """
-        Convert to DPO format expected by TRL DPOTrainer
-
-        TRL expects: {"prompt": str, "chosen": str, "rejected": str}
-        """
-        # Anthropic HH-RLHF format: "\n\nHuman: ...\n\nAssistant: ..."
+        """Convert to DPO format: {"prompt": str, "chosen": str, "rejected": str}"""
+        # Anthropic HH-RLHF format
         if "chosen" in sample and "rejected" in sample and "prompt" not in sample:
-            chosen = sample["chosen"]
-            rejected = sample["rejected"]
-
-            # Extract prompt from conversation (everything before last assistant response)
-            if "\n\nHuman:" in chosen and "\n\nAssistant:" in chosen:
-                parts = chosen.split("\n\nAssistant:")
-                if len(parts) > 1:
-                    prompt = "\n\nAssistant:".join(parts[:-1]) + "\n\nAssistant:"  # Keep all but last response
-                    chosen_response = parts[-1].strip()
-
-                    rejected_parts = rejected.split("\n\nAssistant:")
-                    rejected_response = rejected_parts[-1].strip() if len(rejected_parts) > 1 else rejected
-
-                    return {
-                        "prompt": prompt,
-                        "chosen": chosen_response,
-                        "rejected": rejected_response,
-                    }
-
-            # Fallback: use full conversations
-            return {
-                "prompt": "",
-                "chosen": chosen,
-                "rejected": rejected,
-            }
+            return _parse_anthropic_hh(sample)
 
         # Already in correct format
         elif all(k in sample for k in ["prompt", "chosen", "rejected"]):
-            return sample
+            return {
+                "prompt": sample["prompt"],
+                "chosen": sample["chosen"],
+                "rejected": sample["rejected"],
+            }
 
         else:
             raise ValueError(
@@ -496,15 +525,17 @@ def build_dpo_dataset(source: str, train_path: str, eval_path: str, max_seq_len:
                 f"got: {list(sample.keys())}"
             )
 
-    train = train.map(format_dpo_sample, num_proc=num_proc)
-    eval = eval.map(format_dpo_sample, num_proc=num_proc)
+    train = train.map(format_dpo_sample, num_proc=num_proc, desc="Formatting train")
+    eval_ds = eval_ds.map(format_dpo_sample, num_proc=num_proc, desc="Formatting eval")
 
-    # Keep only required columns
+    # Keep only required text columns - TRL DPOTrainer handles tokenization
     required_cols = ["prompt", "chosen", "rejected"]
     train = train.select_columns(required_cols)
-    eval = eval.select_columns(required_cols)
+    eval_ds = eval_ds.select_columns(required_cols)
 
-    return {"train": train, "eval": eval}
+    print(f"[DPO Data] ✓ Formatted: {len(train):,} train, {len(eval_ds):,} eval")
+
+    return {"train": train, "eval": eval_ds}
 
 
 @register("data", "sft_mixed")

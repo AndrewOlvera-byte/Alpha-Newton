@@ -1,0 +1,29 @@
+# Quick eval suite - fast sanity check (~5-10 min)
+# Good for: rapid iteration, checkpoint sanity checks
+
+suite:
+  name: "quick"
+
+runner:
+  backend: "lm_eval"
+  model: "hf"
+
+  tasks:
+    - gsm8k           # Math reasoning (generation)
+    - arc_challenge   # Science reasoning (log-likelihood)
+    - hellaswag       # Commonsense (log-likelihood)
+
+  # 0-shot for instruct models
+  num_fewshot: 0
+  batch_size: 8
+
+  # Wrap prompts in chat template for instruct/chat models
+  apply_chat_template: true
+
+  gen_kwargs:
+    do_sample: false
+    temperature: 0.0
+    max_new_tokens: 512
+
+output:
+  path: null

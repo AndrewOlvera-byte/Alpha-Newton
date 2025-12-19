@@ -1,0 +1,46 @@
+# Full eval suite - comprehensive benchmarks (~2-4 hours)
+# Good for: final model evaluation, paper results, leaderboard comparison
+#
+# Matches standard small LLM benchmarks (Open LLM Leaderboard style)
+
+suite:
+  name: "full"
+
+runner:
+  backend: "lm_eval"
+  model: "hf"
+
+  tasks:
+    # === Math Reasoning ===
+    - gsm8k              # Grade school math (generation)
+    - hendrycks_math     # MATH benchmark - harder (generation)
+
+    # === Commonsense & Reasoning ===
+    - arc_challenge      # AI2 Reasoning Challenge - hard (log-likelihood)
+    - arc_easy           # AI2 Reasoning Challenge - easy (log-likelihood)
+    - hellaswag          # Commonsense inference (log-likelihood)
+    - winogrande         # Pronoun resolution (log-likelihood)
+
+    # === Knowledge ===
+    - mmlu               # 57-subject knowledge test (log-likelihood)
+
+    # === Truthfulness ===
+    - truthfulqa_mc2     # Factual accuracy (log-likelihood)
+
+    # === Instruction Following ===
+    - ifeval             # Format/constraint adherence (generation)
+
+  # 0-shot for instruct models (few-shot not needed)
+  num_fewshot: 0
+  batch_size: 2  # Lower batch size for MMLU memory
+
+  # Wrap prompts in chat template for instruct/chat models
+  apply_chat_template: true
+
+  gen_kwargs:
+    do_sample: false
+    temperature: 0.0
+    max_new_tokens: 1024  # Longer for MATH/reasoning chains
+
+output:
+  path: null

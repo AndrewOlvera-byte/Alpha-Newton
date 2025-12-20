@@ -22,9 +22,8 @@ from src.core.registry import build
 from src.builders.data import _messages_from_sample, _normalize_messages
 
 import src.builders.tokenizer
+from src.builders.data import _tokenize_prompt_and_response
 
-
-# ANSI colors for terminal output
 class Colors:
     HEADER = '\033[95m'
     BLUE = '\033[94m'
@@ -39,30 +38,25 @@ class Colors:
 
 
 def print_header(text: str, char: str = "="):
-    """Print a formatted header."""
     print(f"\n{Colors.BOLD}{Colors.CYAN}{char * 70}")
     print(f" {text}")
     print(f"{char * 70}{Colors.END}\n")
 
 
 def print_subheader(text: str):
-    """Print a formatted subheader."""
     print(f"\n{Colors.BOLD}{Colors.YELLOW}>>> {text}{Colors.END}")
 
 
 def truncate_text(text: str, max_len: int = 200) -> str:
-    """Truncate text for display."""
     if len(text) <= max_len:
         return text
     return text[:max_len] + f"{Colors.DIM}... [{len(text) - max_len} more chars]{Colors.END}"
 
 
 def visualize_raw_sample(sample: Dict[str, Any], idx: int):
-    """Display raw sample from dataset."""
     print(f"\n{Colors.BLUE}[Raw Sample {idx + 1}]{Colors.END}")
     print(f"{Colors.DIM}Keys: {list(sample.keys())}{Colors.END}")
     
-    # Show key fields based on detected format
     if "messages" in sample:
         print(f"  Format: {Colors.GREEN}OpenAI (messages){Colors.END}")
         for i, msg in enumerate(sample["messages"][:3]):
@@ -106,7 +100,6 @@ def visualize_raw_sample(sample: Dict[str, Any], idx: int):
 
 
 def visualize_parsed_messages(messages: List[Dict[str, str]], idx: int):
-    """Display parsed OpenAI-style messages."""
     print(f"\n{Colors.GREEN}[Parsed Messages {idx + 1}]{Colors.END}")
     
     if not messages:
@@ -136,16 +129,13 @@ def visualize_tokenized(
     idx: int,
     show_tokens: int = 50
 ):
-    """Display tokenized sequence with label masking."""
     print(f"\n{Colors.CYAN}[Tokenized Sequence {idx + 1}]{Colors.END}")
     print(f"  Length: {len(input_ids)} tokens")
     
-    # Count masked vs active labels
     masked = sum(1 for l in labels if l == -100)
     active = len(labels) - masked
     print(f"  Labels: {Colors.DIM}{masked} masked (-100){Colors.END}, {Colors.GREEN}{active} active (trained){Colors.END}")
     
-    # Show first N tokens with their labels
     print(f"\n  {Colors.BOLD}First {show_tokens} tokens:{Colors.END}")
     print(f"  {'Token':<20} {'ID':>8} {'Label':>8}")
     print(f"  {'-' * 40}")
@@ -154,19 +144,15 @@ def visualize_tokenized(
         token_id = input_ids[i]
         label = labels[i]
         
-        # Decode single token
         try:
             token_str = tokenizer.decode([token_id])
-            # Escape special characters for display
-            token_str = repr(token_str)[1:-1]  # Remove quotes from repr
+            token_str = repr(token_str)[1:-1]
         except:
             token_str = f"<{token_id}>"
         
-        # Truncate long tokens
         if len(token_str) > 18:
             token_str = token_str[:15] + "..."
         
-        # Color label
         if label == -100:
             label_str = f"{Colors.DIM}-100{Colors.END}"
         else:
@@ -184,7 +170,6 @@ def visualize_packed_batch(
     batch_idx: int,
     show_samples: int = 2
 ):
-    """Display packed batch with EOS token boundaries."""
     print_subheader(f"Packed Batch {batch_idx + 1}")
     
     input_ids_batch = batch["input_ids"]
@@ -204,7 +189,6 @@ def visualize_packed_batch(
         input_ids = input_ids_batch[sample_idx]
         labels = labels_batch[sample_idx]
         
-        # Convert tensors to lists if needed
         if hasattr(input_ids, "tolist"):
             input_ids = input_ids.tolist()
         if hasattr(labels, "tolist"):
@@ -212,16 +196,14 @@ def visualize_packed_batch(
         
         print(f"\n  {Colors.BOLD}[Sample {sample_idx + 1} in batch]{Colors.END}")
         
-        # Find EOS positions (sequence boundaries)
         eos_positions = [i for i, tid in enumerate(input_ids) if tid == eos_token_id]
         print(f"  EOS positions: {eos_positions[:10]}{'...' if len(eos_positions) > 10 else ''}")
         print(f"  Packed sequences: ~{len(eos_positions)} original samples")
         
-        # Show segments around EOS tokens
         print(f"\n  {Colors.BOLD}Sequence boundaries (around EOS):{Colors.END}")
         
         shown = 0
-        for eos_pos in eos_positions[:3]:  # Show first 3 boundaries
+        for eos_pos in eos_positions[:3]:
             start = max(0, eos_pos - 5)
             end = min(len(input_ids), eos_pos + 6)
             
@@ -240,7 +222,6 @@ def visualize_packed_batch(
                 if len(token_str) > 15:
                     token_str = token_str[:12] + "..."
                 
-                # Highlight EOS
                 if tid == eos_token_id:
                     marker = f"{Colors.RED}◀ EOS{Colors.END}"
                 else:
@@ -257,12 +238,8 @@ def visualize_packed_batch(
 
 
 def main(exp_name: str, num_samples: int = 2, num_batches: int = 2):
-    """
-    Debug data pipeline for an experiment.
-    """
     print_header(f"Data Pipeline Debug: {exp_name}")
     
-    # Load config
     cfg = Config.from_experiment(exp_name)
     
     print(f"Run: {cfg.run['name']}")
@@ -271,7 +248,6 @@ def main(exp_name: str, num_samples: int = 2, num_batches: int = 2):
     print(f"Max seq len: {cfg.data.get('max_seq_len', 'N/A')}")
     print(f"Packing: {cfg.data.get('packing', False)}")
     
-    # Build tokenizer
     print_subheader("Building Tokenizer")
     tokenizer = build("tokenizer", **cfg.tokenizer)
     print(f"Tokenizer: {cfg.tokenizer.get('id', 'N/A')}")
@@ -294,12 +270,20 @@ def main(exp_name: str, num_samples: int = 2, num_batches: int = 2):
     for ds_cfg in datasets_config:
         path = ds_cfg["path"]
         weight = ds_cfg.get("weight", 1.0)
-        
+        name = ds_cfg.get("name", None)
+        trust_remote_code = ds_cfg.get("trust_remote_code", False)
+
         print_subheader(f"Dataset: {path} (weight={weight})")
-        
+
         try:
-            # Load small sample
-            ds = load_dataset(path, split="train", streaming=True)
+            # Load small sample with config parameters
+            ds = load_dataset(
+                path,
+                name=name,
+                split="train",
+                streaming=True,
+                trust_remote_code=trust_remote_code
+            )
             samples = list(ds.take(num_samples))
             
             for idx, sample in enumerate(samples):
@@ -320,16 +304,24 @@ def main(exp_name: str, num_samples: int = 2, num_batches: int = 2):
     # =========================================================================
     print_header("PART 2: Tokenized Sequences with Label Masking", "=")
     
-    # Import tokenization function
-    from src.builders.data import _tokenize_prompt_and_response
+
     
-    # Use first dataset for demo
     if datasets_config:
-        path = datasets_config[0]["path"]
+        ds_cfg = datasets_config[0]
+        path = ds_cfg["path"]
+        name = ds_cfg.get("name", None)
+        trust_remote_code = ds_cfg.get("trust_remote_code", False)
+
         print(f"Using dataset: {path}\n")
-        
+
         try:
-            ds = load_dataset(path, split="train", streaming=True)
+            ds = load_dataset(
+                path,
+                name=name,
+                split="train",
+                streaming=True,
+                trust_remote_code=trust_remote_code
+            )
             samples = list(ds.take(num_samples))
             
             max_seq_len = cfg.data.get("max_seq_len", 2048)
@@ -377,14 +369,12 @@ def main(exp_name: str, num_samples: int = 2, num_batches: int = 2):
         print(f"{Colors.DIM}(This may take a moment for large datasets){Colors.END}\n")
         
         try:
-            # Build the actual dataset
             import src.builders.data
             dataset = build("data", tokenizer=tokenizer, **cfg.data)
             
             train_ds = dataset["train"]
             print(f"Train dataset size: {len(train_ds)} packed sequences")
             
-            # Show a few packed batches
             for batch_idx in range(min(num_batches, len(train_ds))):
                 batch = {
                     "input_ids": [train_ds[batch_idx]["input_ids"]],

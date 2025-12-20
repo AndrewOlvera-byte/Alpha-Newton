@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""
-Interactive chat interface for trained models using Gradio
-
-Usage:
-    python src/entrypoints/chat.py --model outputs/qwen3_600M_base_sft_test
-    python src/entrypoints/chat.py --model outputs/qwen3_600M_base_sft_test --checkpoint checkpoint-100
-"""
-
 import argparse
 from pathlib import Path
 import torch
@@ -15,10 +6,8 @@ import gradio as gr
 
 
 def load_model(model_path: str, checkpoint: str = None):
-    """Load trained model and tokenizer"""
     base_path = Path(model_path)
 
-    # If checkpoint specified, load from checkpoint subdirectory
     if checkpoint:
         load_path = base_path / checkpoint
     else:
@@ -27,12 +16,10 @@ def load_model(model_path: str, checkpoint: str = None):
     if not load_path.exists():
         raise ValueError(f"Model path does not exist: {load_path}")
 
-    # Check if tokenizer files exist
     required_files = ["tokenizer.json", "tokenizer_config.json"]
     missing_files = [f for f in required_files if not (load_path / f).exists()]
 
     if missing_files:
-        # List available checkpoints
         checkpoints = sorted([d.name for d in base_path.glob("checkpoint-*") if d.is_dir()])
         error_msg = f"Tokenizer files not found in: {load_path}\n"
 
@@ -48,18 +35,16 @@ def load_model(model_path: str, checkpoint: str = None):
 
     print(f"Loading model from: {load_path}")
 
-    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(load_path, fix_mistral_regex=True)
 
-    # Load model
     model = AutoModelForCausalLM.from_pretrained(
         load_path,
         dtype=torch.bfloat16,
         device_map="auto",
     )
 
-    print(f" Model loaded: {model.config.model_type}")
-    print(f" Device: {model.device}")
+    print(f" Model loaded: {model.config.model_type}")
+    print(f" Device: {model.device}")
 
     return model, tokenizer
 
@@ -73,42 +58,22 @@ def generate_response(
     temperature: float = 0.7,
     top_p: float = 0.9,
 ):
-    """
-    Generate response from model
-
-    Args:
-        message: User's current message
-        history: List of [user_msg, bot_msg] pairs
-        model: Loaded model
-        tokenizer: Loaded tokenizer
-        max_new_tokens: Maximum tokens to generate
-        temperature: Sampling temperature
-        top_p: Nucleus sampling parameter
-    """
-    # Build conversation history
     conversation = []
     for user_msg, bot_msg in history:
         conversation.append({"role": "user", "content": user_msg})
         conversation.append({"role": "assistant", "content": bot_msg})
 
-    # Add current message
     conversation.append({"role": "user", "content": message})
 
-    # Apply chat template
     prompt = tokenizer.apply_chat_template(
         conversation,
         tokenize=False,
         add_generation_prompt=True,
     )
 
-    # Tokenize
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-    # Generate
     with torch.no_grad():
-        # Qwen-style chat templates use an explicit end-of-message token.
-        # Include it as an EOS to prevent the model from "continuing the transcript"
-        # into the next user/assistant turn.
         eos_token_ids = []
         if tokenizer.eos_token_id is not None:
             eos_token_ids.append(tokenizer.eos_token_id)
@@ -134,7 +99,6 @@ def generate_response(
             eos_token_id=eos_arg,
         )
 
-    # Decode only the new tokens (exclude the prompt)
     response = tokenizer.decode(
         outputs[0][inputs.input_ids.shape[1]:],
         skip_special_tokens=True,
@@ -144,7 +108,6 @@ def generate_response(
 
 
 def create_chat_interface(model, tokenizer, model_name: str):
-    """Create Gradio chat interface"""
 
     def respond(message, history, max_tokens, temperature, top_p):
         response = generate_response(
@@ -158,7 +121,6 @@ def create_chat_interface(model, tokenizer, model_name: str):
         )
         return response
 
-    # Create Gradio interface
     demo = gr.ChatInterface(
         fn=respond,
         title=f"Chat with {model_name}",
@@ -198,30 +160,26 @@ def create_chat_interface(model, tokenizer, model_name: str):
 
 
 def main(model_path: str, checkpoint: str = None, share: bool = False):
-    """Launch chat interface"""
 
     print("=" * 60)
     print("Alpha-Newton Chat Interface")
     print("=" * 60)
 
-    # Load model
     model, tokenizer = load_model(model_path, checkpoint)
 
-    # Get model name for display
     model_name = Path(model_path).name
     if checkpoint:
         model_name = f"{model_name}/{checkpoint}"
 
-    # Create and launch interface
     print(f"\nLaunching Gradio interface...")
     print(f"Model: {model_name}")
 
     demo = create_chat_interface(model, tokenizer, model_name)
 
     demo.launch(
-        server_name="0.0.0.0",  # Allow external connections (for Docker)
+        server_name="0.0.0.0",
         server_port=7860,
-        share=share,  # Create public link if requested
+        share=share,
     )
 
 

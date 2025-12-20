@@ -11,7 +11,6 @@ model:
 tokenizer:
   type: "hf"
   id: "Qwen/Qwen3-0.6B-Base"
-  # Keep the most recent turns + assistant answer when truncating
   truncation_side: "left"
 
 data:

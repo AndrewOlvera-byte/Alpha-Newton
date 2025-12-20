@@ -3,6 +3,8 @@ Math Verifier for RLVR
 
 Extracts numeric answers from LLM completions and compares against ground truth.
 Returns binary rewards for use with GRPOTrainer.
+
+TODO: This is a basic implementation
 """
 
 import re

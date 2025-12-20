@@ -29,12 +29,10 @@ training:
   dataloader_pin_memory: true
   dataloader_prefetch_factor: 4
 
-  # Training schedule
   max_steps: 2000
   save_steps: 500
   eval_steps: 500
 
-  # Learning rate
   learning_rate: 5.0e-6
   warmup_steps: 100
   lr_scheduler_type: "cosine"

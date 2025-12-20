@@ -82,7 +82,6 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
 
 
 def _gen_kwargs_to_str(gen_kwargs: Dict[str, Any]) -> str:
-    """Convert gen_kwargs dict to lm-eval CLI format."""
     parts: List[str] = []
     for k, v in gen_kwargs.items():
         if isinstance(v, bool):
@@ -94,7 +93,6 @@ def _gen_kwargs_to_str(gen_kwargs: Dict[str, Any]) -> str:
 
 
 def _resolve_tasks(tasks: List[str]) -> List[str]:
-    """Resolve task aliases to lm-eval task IDs."""
     resolved = []
     for t in tasks:
         t_norm = str(t).strip()
@@ -103,13 +101,10 @@ def _resolve_tasks(tasks: List[str]) -> List[str]:
 
 
 def _default_output_dir(training_output_dir: str, suite_name: str) -> Path:
-    """Default output path: outputs/<run_name>/eval/<suite>"""
     return Path(training_output_dir) / "eval" / suite_name
 
 
 def _pick_results_json(output_path: Path) -> Optional[Path]:
-    """Find the results JSON file in lm-eval output."""
-    # lm-eval can write to a file path or a directory
     if output_path.suffix.lower() == ".json" and output_path.exists():
         return output_path
 
@@ -118,7 +113,6 @@ def _pick_results_json(output_path: Path) -> Optional[Path]:
         if preferred.exists():
             return preferred
 
-        # Fallback: pick the newest json file in the directory
         json_files = [
             p for p in output_path.iterdir() 
             if p.is_file() and p.suffix.lower() == ".json"
@@ -131,7 +125,6 @@ def _pick_results_json(output_path: Path) -> Optional[Path]:
 
 
 def _print_summary(results: Dict[str, Any]) -> None:
-    """Print a human-readable summary of evaluation results."""
     task_results = results.get("results", {})
     if not isinstance(task_results, dict) or not task_results:
         print("[Eval] No task results found in lm-eval output.")
@@ -145,7 +138,6 @@ def _print_summary(results: Dict[str, Any]) -> None:
         print(f"\n📊 {task}")
         print("-" * 40)
         if isinstance(metrics, dict):
-            # Filter to main metrics (skip stderr, alias, etc.)
             main_metrics = {
                 k: v for k, v in metrics.items() 
                 if isinstance(v, (int, float)) and not k.endswith("_stderr")
@@ -165,7 +157,6 @@ def _build_model_args(
     pretrained: str,
     training_cfg: Optional[Config] = None,
 ) -> str:
-    """Build lm-eval model_args string."""
     parts = [f"pretrained={pretrained}"]
     
     if training_cfg is not None:
@@ -191,7 +182,6 @@ Examples:
         """
     )
     
-    # Model source (one of these required)
     model_group = parser.add_argument_group("Model Selection (pick one)")
     model_group.add_argument(
         "--exp", type=str, default=None,
@@ -206,7 +196,6 @@ Examples:
         help="Checkpoint folder under output_dir (e.g. checkpoint-2000)"
     )
     
-    # Eval configuration
     eval_group = parser.add_argument_group("Evaluation Settings")
     eval_group.add_argument(
         "--suite", type=str, required=True,
@@ -225,7 +214,6 @@ Examples:
         help="Override batch size from config"
     )
     
-    # Logging
     log_group = parser.add_argument_group("Logging")
     log_group.add_argument(
         "--wandb", action="store_true",
@@ -234,7 +222,6 @@ Examples:
 
     args = parser.parse_args()
 
-    # Load eval suite config
     suite_path = Path("configs/eval") / f"{args.suite}.yaml"
     if not suite_path.exists():
         available = [p.stem for p in Path("configs/eval").glob("*.yaml")]
@@ -245,12 +232,10 @@ Examples:
 
     suite_cfg = _load_yaml(suite_path)
 
-    # Load training experiment config (optional)
     training_cfg: Optional[Config] = None
     if args.exp:
         training_cfg = Config.from_experiment(args.exp)
 
-    # Determine model path
     if args.model:
         pretrained = args.model
         training_output_dir = None
@@ -260,13 +245,11 @@ Examples:
     else:
         raise ValueError("Provide either --exp or --model")
 
-    # Handle checkpoint
     if args.checkpoint:
         if training_output_dir is None:
             raise ValueError("--checkpoint requires --exp (so we know output_dir)")
         pretrained = str(Path(training_output_dir) / args.checkpoint)
 
-    # Parse runner settings from suite config
     runner = suite_cfg.get("runner", {})
     tasks = _resolve_tasks(runner.get("tasks", []))
     if not tasks:
@@ -277,10 +260,8 @@ Examples:
     apply_chat_template = bool(runner.get("apply_chat_template", True))
     gen_kwargs = runner.get("gen_kwargs", {}) or {}
 
-    # Build model args
     model_args = _build_model_args(pretrained, training_cfg)
 
-    # Determine output path
     suite_name = (suite_cfg.get("suite", {}) or {}).get("name", args.suite)
     output_cfg = suite_cfg.get("output", {}) or {}
     output_path_raw = args.output if args.output is not None else output_cfg.get("path")
@@ -303,13 +284,11 @@ Examples:
                 training_cfg.training["output_dir"], suite_name
             )
 
-    # Ensure output directory exists
     if output_path.suffix.lower() != ".json":
         output_path.mkdir(parents=True, exist_ok=True)
     else:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build lm-eval command
     cmd: List[str] = [
         sys.executable,
         "-m",
@@ -331,7 +310,6 @@ Examples:
     if args.limit is not None:
         cmd.extend(["--limit", str(args.limit)])
 
-    # Print run info
     print("\n" + "=" * 70)
     print(" ALPHA-NEWTON EVALUATION")
     print("=" * 70)
@@ -345,11 +323,9 @@ Examples:
         print(f"  Limit:      {args.limit} samples/task")
     print("=" * 70 + "\n")
 
-    # Run lm-eval
     env = os.environ.copy()
     subprocess.run(cmd, check=True, env=env)
 
-    # Read and display results
     results_path = _pick_results_json(output_path)
     if results_path is None:
         print("[Eval] Completed, but could not find results JSON.")
@@ -360,7 +336,6 @@ Examples:
 
     _print_summary(results)
 
-    # Optional WandB logging
     if args.wandb and training_cfg is not None:
         try:
             import wandb
@@ -372,7 +347,6 @@ Examples:
                 tags=(training_cfg.wandb.get("tags", []) + ["eval", suite_name]),
             )
 
-            # Log flattened metrics
             task_results = results.get("results", {}) or {}
             flat = {}
             for task, metrics in task_results.items():

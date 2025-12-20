@@ -5,15 +5,15 @@ from datasets import load_dataset, interleave_datasets
 
 from src.core.registry import register
 
+def _strip_think_tokens(text: str) -> str:
+      text = re.sub(r'<think>\s*', '', text, flags=re.IGNORECASE)
+      text = re.sub(r'\s*</think>', '', text, flags=re.IGNORECASE)
+      return text.strip()
+
 
 def _pack_tokenized_dataset(dataset, max_seq_len: int, eos_token_id: int):
-    """
-    Concatenate and chunk tokenized sequences into fixed-length blocks.
-    Ensures every sample is max_seq_len to better utilize the GPU.
-    """
 
     def group_texts(examples):
-        # Flatten then chunk to max_seq_len (keeps label masking intact)
         concatenated_ids = []
         concatenated_labels = []
 
@@ -21,7 +21,6 @@ def _pack_tokenized_dataset(dataset, max_seq_len: int, eos_token_id: int):
             concatenated_ids.extend(ids)
             concatenated_labels.extend(labs)
             
-            # Insert EOS separator
             concatenated_ids.append(eos_token_id)
             concatenated_labels.append(eos_token_id)
 
@@ -57,10 +56,6 @@ def _pack_tokenized_dataset(dataset, max_seq_len: int, eos_token_id: int):
 
 
 def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """
-    Normalize/clean message list into the minimal schema expected by chat templates:
-      [{"role": "system"|"user"|"assistant", "content": str}, ...]
-    """
     cleaned: List[Dict[str, str]] = []
     for m in messages or []:
         if not isinstance(m, dict):
@@ -71,7 +66,7 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
             continue
         if content is None:
             continue
-        content = str(content).strip()
+        content = _strip_think_tokens(str(content))
         if not content:
             continue
         cleaned.append({"role": role, "content": content})
@@ -79,23 +74,9 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
 
 
 def _parse_glaive_chat(system_text: str, chat_text: str) -> List[Dict[str, str]]:
-    """
-    Parse Glaive function-calling dataset format (plain text with role prefixes).
-    
-    Format:
-        system: "SYSTEM: You are a helpful assistant..."
-        chat: "USER: Hello\n\nASSISTANT: Hi there!..."
-    
-    Handles:
-        - Case-insensitive role prefixes
-        - Function call markers (<functioncall>, FUNCTION RESPONSE)
-        - Multi-line content within turns
-    """
     messages: List[Dict[str, str]] = []
     
-    # Extract system message
     if system_text:
-        # Handle "SYSTEM: content" or just the content directly
         sys_match = re.match(r"(?:SYSTEM:\s*)?(.+)", str(system_text), re.IGNORECASE | re.DOTALL)
         if sys_match:
             sys_content = sys_match.group(1).strip()
@@ -105,8 +86,6 @@ def _parse_glaive_chat(system_text: str, chat_text: str) -> List[Dict[str, str]]
     if not chat_text:
         return messages
     
-    # Split on role markers (case-insensitive)
-    # Pattern matches USER:, ASSISTANT:, or FUNCTION RESPONSE: at line start
     pattern = r'\n*(?=(?:USER|ASSISTANT|FUNCTION\s*RESPONSE)\s*:)'
     chunks = re.split(pattern, str(chat_text), flags=re.IGNORECASE)
     
@@ -118,18 +97,16 @@ def _parse_glaive_chat(system_text: str, chat_text: str) -> List[Dict[str, str]]
         chunk_upper = chunk.upper()
         
         if chunk_upper.startswith("USER:"):
-            content = chunk[5:].strip()  # len("USER:") = 5
+            content = chunk[5:].strip()
             if content:
                 messages.append({"role": "user", "content": content})
         
         elif chunk_upper.startswith("ASSISTANT:"):
-            content = chunk[10:].strip()  # len("ASSISTANT:") = 10
+            content = chunk[10:].strip()
             if content:
-                # Keep function calls in the content (model should learn this format)
                 messages.append({"role": "assistant", "content": content})
         
         elif chunk_upper.startswith("FUNCTION RESPONSE:") or chunk_upper.startswith("FUNCTION_RESPONSE:"):
-            # Treat function responses as user messages (they're inputs to the model)
             colon_idx = chunk.find(":")
             content = chunk[colon_idx + 1:].strip() if colon_idx != -1 else chunk.strip()
             if content:
@@ -249,12 +226,6 @@ def _tokenize_prompt_and_response(
     tokenizer,
     max_seq_len: int,
 ):
-    """
-    Turn a multi-turn chat into many SFT examples (one per assistant turn),
-    where labels are masked (-100) for the prompt and active for the assistant response.
-
-    Uses chat template tokenization to avoid double special-token insertion.
-    """
     examples: List[Dict[str, Any]] = []
 
     if not messages:
@@ -263,7 +234,6 @@ def _tokenize_prompt_and_response(
     trunc_side = getattr(tokenizer, "truncation_side", "right")
 
     def _extract_input_ids(tokenized):
-        # `apply_chat_template(..., tokenize=True)` can return List[int] or an encoding/dict.
         if isinstance(tokenized, list):
             return tokenized
         if isinstance(tokenized, dict) and "input_ids" in tokenized:
@@ -303,13 +273,11 @@ def _tokenize_prompt_and_response(
         if len(full_ids) == 0:
             continue
 
-        # Safety: ensure prompt is a prefix of full (expected for chat templates)
         if len(prompt_ids) > len(full_ids) or full_ids[: len(prompt_ids)] != prompt_ids:
             continue
 
         labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids) :]
 
-        # Truncate consistently (keep labels aligned)
         if len(full_ids) > max_seq_len:
             if trunc_side == "left":
                 full_ids = full_ids[-max_seq_len:]
@@ -342,17 +310,13 @@ def build_sft_dataset(source: str, train_path: str, eval_path: str, max_seq_len:
     # === 1. Load raw dataset === #
 
     if source == "hf":
-        # Load dataset
         dataset = load_dataset(train_path, split="train", cache_dir=cache_dir)
 
-        # If train_path == eval_path, split it ourselves
         if train_path == eval_path:
-            # 95% train, 5% eval split
             split_dataset = dataset.train_test_split(test_size=0.05, seed=42)
             train = split_dataset["train"]
             eval = split_dataset["test"]
         else:
-            # Separate datasets specified
             train = dataset
             eval = load_dataset(eval_path, split="train", cache_dir=cache_dir)
 
@@ -425,7 +389,6 @@ def _parse_anthropic_hh(sample):
     chosen = sample["chosen"]
     rejected = sample["rejected"]
 
-    # Extract prompt from conversation (everything before last assistant response)
     if "\n\nHuman:" in chosen and "\n\nAssistant:" in chosen:
         parts = chosen.split("\n\nAssistant:")
         if len(parts) > 1:
@@ -441,7 +404,6 @@ def _parse_anthropic_hh(sample):
                 "rejected": rejected_response,
             }
 
-    # Fallback: use full conversations
     return {
         "prompt": "",
         "chosen": chosen,
@@ -479,8 +441,8 @@ def build_dpo_dataset(
         cache_dir: Cache directory for datasets
 
     Returns:
-        Dict with 'train' and 'eval' datasets containing prompt/chosen/rejected text columns.
-        TRL DPOTrainer handles tokenization internally.
+        Dict with 'train' and 'eval' datasets containing prompt/chosen/rejected text columns
+        TRL DPOTrainer handles tokenization internally
     """
     assert source in ("hf", "local", "jsonl"), f"Invalid source: {source}"
 
@@ -507,11 +469,9 @@ def build_dpo_dataset(
 
     def format_dpo_sample(sample):
         """Convert to DPO format: {"prompt": str, "chosen": str, "rejected": str}"""
-        # Anthropic HH-RLHF format
         if "chosen" in sample and "rejected" in sample and "prompt" not in sample:
             return _parse_anthropic_hh(sample)
 
-        # Already in correct format
         elif all(k in sample for k in ["prompt", "chosen", "rejected"]):
             return {
                 "prompt": sample["prompt"],
@@ -528,12 +488,11 @@ def build_dpo_dataset(
     train = train.map(format_dpo_sample, num_proc=num_proc, desc="Formatting train")
     eval_ds = eval_ds.map(format_dpo_sample, num_proc=num_proc, desc="Formatting eval")
 
-    # Keep only required text columns - TRL DPOTrainer handles tokenization
     required_cols = ["prompt", "chosen", "rejected"]
     train = train.select_columns(required_cols)
     eval_ds = eval_ds.select_columns(required_cols)
 
-    print(f"[DPO Data] ✓ Formatted: {len(train):,} train, {len(eval_ds):,} eval")
+    print(f"[DPO Data] Formatted: {len(train):,} train, {len(eval_ds):,} eval")
 
     return {"train": train, "eval": eval_ds}
 
@@ -569,26 +528,30 @@ def build_mixed_sft_dataset(
     for i, ds_config in enumerate(datasets_config):
         path = ds_config["path"]
         weight = ds_config.get("weight", 1.0)
+        name = ds_config.get("name", None)  # Config name (e.g., "DeepSeek")
+        trust_remote_code = ds_config.get("trust_remote_code", False)
 
         print(f"  [{i+1}] {path} (weight: {weight})")
 
-        # Load dataset
-        dataset = load_dataset(path, split="train", cache_dir=cache_dir)
+        dataset = load_dataset(
+            path,
+            name=name,
+            split="train",
+            cache_dir=cache_dir,
+            trust_remote_code=trust_remote_code
+        )
 
-        # Split into train/eval (95/5)
         split_dataset = dataset.train_test_split(test_size=0.05, seed=42)
 
         train_datasets.append(split_dataset["train"])
         eval_datasets.append(split_dataset["test"])
         probabilities.append(weight)
 
-    # Normalize probabilities
     total = sum(probabilities)
     probabilities = [p / total for p in probabilities]
 
     print(f"[Mixed Dataset] Sampling: {[f'{p:.1%}' for p in probabilities]}\n")
 
-    # Interleave with probabilities
     train = interleave_datasets(
         train_datasets,
         probabilities=probabilities,
@@ -633,12 +596,11 @@ def build_mixed_sft_dataset(
         remove_columns=eval.column_names,
     )
 
-    # Packing to fixed blocks for better GPU utilization
     if packing:
         train = _pack_tokenized_dataset(train, max_seq_len, tokenizer.eos_token_id)
         eval = _pack_tokenized_dataset(eval, max_seq_len, tokenizer.eos_token_id)
 
-    print(f"[Mixed Dataset] ✓ Train: {len(train):,} | Eval: {len(eval):,}\n")
+    print(f"[Mixed Dataset] Train: {len(train):,} | Eval: {len(eval):,}\n")
 
     # Set torch format for efficient collation
     columns = ["input_ids", "attention_mask", "labels"]
@@ -686,7 +648,6 @@ def build_rlvr_math_dataset(
         dataset = dataset.select(range(n_samples))
         print(f"[RLVR Math] Using {subset_pct}% subset: {n_samples:,} samples")
     
-    # Split train/eval
     split = dataset.train_test_split(test_size=0.05, seed=42)
     train = split["train"]
     eval_ds = split["test"]
@@ -697,11 +658,6 @@ def build_rlvr_math_dataset(
     # === 2. Detect format and extract question/answer === #
     
     def format_sample(sample):
-        """
-        Convert various math dataset formats to GRPO format.
-        Returns: {prompt: str, answer: str}
-        """
-        # Detect question field
         if "question" in sample:
             question = sample["question"]
         elif "problem" in sample:
@@ -709,7 +665,6 @@ def build_rlvr_math_dataset(
         else:
             raise ValueError(f"No question field found. Keys: {list(sample.keys())}")
         
-        # Detect answer field
         if "final_answer" in sample:
             # DeepMath-103K format
             answer = str(sample["final_answer"]).strip()
@@ -723,7 +678,6 @@ def build_rlvr_math_dataset(
         else:
             raise ValueError(f"No answer field found. Keys: {list(sample.keys())}")
         
-        # Format as chat prompt
         messages = [
             {"role": "user", "content": question}
         ]
@@ -731,7 +685,7 @@ def build_rlvr_math_dataset(
         prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True,  # Add assistant prefix for generation
+            add_generation_prompt=True,
         )
         
         return {"prompt": prompt, "answer": answer}
@@ -739,10 +693,9 @@ def build_rlvr_math_dataset(
     train = train.map(format_sample, num_proc=num_proc)
     eval_ds = eval_ds.map(format_sample, num_proc=num_proc)
     
-    # Keep only required columns for GRPO
     train = train.select_columns(["prompt", "answer"])
     eval_ds = eval_ds.select_columns(["prompt", "answer"])
     
-    print(f"[RLVR Math] ✓ Formatted for GRPO (prompt + answer columns)")
+    print(f"[RLVR Math] Formatted for GRPO (prompt + answer columns)")
     
     return {"train": train, "eval": eval_ds}

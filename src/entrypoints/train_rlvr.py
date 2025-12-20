@@ -19,17 +19,10 @@ import src.builders.tokenizer
 import src.builders.data
 import src.builders.trainer
 
-# Import RLVR reward functions
 from src.rlvr import math_reward_fn
 
 
 def main(exp_name: str):
-    """
-    Train RLVR model from experiment config.
-    
-    Loads: configs/base/common.yaml + configs/base/rlvr.yaml + configs/exp/{exp_name}.yaml
-    """
-    # Load config with RLVR base
     cfg = Config.from_experiment(exp_name)
     
     print(f"[RLVR] Run: {cfg.run['name']}")
@@ -39,12 +32,10 @@ def main(exp_name: str):
     print(f"[RLVR] Output: {cfg.training['output_dir']}")
     print()
     
-    # Build components
     tokenizer = build("tokenizer", **cfg.tokenizer)
     model = build("model", **cfg.model)
     dataset = build("data", tokenizer=tokenizer, **cfg.data)
     
-    # Get GRPO config section
     grpo_cfg = getattr(cfg, 'grpo', {})
     
     print(f"[RLVR] GRPO Config:")
@@ -54,7 +45,6 @@ def main(exp_name: str):
     print(f"  - use_vllm: {grpo_cfg.get('use_vllm', False)}")
     print()
     
-    # Build GRPO trainer with math reward
     trainer = build(
         "trainer",
         type="trl_grpo",
@@ -67,11 +57,9 @@ def main(exp_name: str):
         reward_funcs=math_reward_fn,
     )
     
-    # Train
     print("[RLVR] Starting online GRPO training...")
     trainer.train()
     
-    # Save final model
     print(f"\n[RLVR] Saving final model to: {cfg.training['output_dir']}")
     trainer.save_model(cfg.training['output_dir'])
     tokenizer.save_pretrained(cfg.training['output_dir'])

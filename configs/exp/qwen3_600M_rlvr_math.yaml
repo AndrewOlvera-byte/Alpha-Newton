@@ -1,8 +1,3 @@
-# RLVR Math Training: Qwen2.5-0.5B on DeepMath-103K
-#
-# Online GRPO training with verifiable math rewards.
-# Model generates solutions → verifier checks answers → RL update.
-
 run:
   name: "qwen3_600M_rlvr_math"
   mode: "rlvr"

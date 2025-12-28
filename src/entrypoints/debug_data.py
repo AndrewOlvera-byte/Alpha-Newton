@@ -360,36 +360,15 @@ def main(exp_name: str, num_samples: int = 2, num_batches: int = 2):
             traceback.print_exc()
     
     # =========================================================================
-    # PART 3: Show packed batches with EOS boundaries
+    # PART 3: Show packed batches with EOS boundaries (SKIPPED FOR SPEED)
     # =========================================================================
+    print_header("PART 3: Packed Batches (Skipped for Speed)", "=")
+
     if cfg.data.get("packing", False):
-        print_header("PART 3: Packed Batches with EOS Boundaries", "=")
-        
-        print("Building full dataset with packing...")
-        print(f"{Colors.DIM}(This may take a moment for large datasets){Colors.END}\n")
-        
-        try:
-            import src.builders.data
-            dataset = build("data", tokenizer=tokenizer, **cfg.data)
-            
-            train_ds = dataset["train"]
-            print(f"Train dataset size: {len(train_ds)} packed sequences")
-            
-            for batch_idx in range(min(num_batches, len(train_ds))):
-                batch = {
-                    "input_ids": [train_ds[batch_idx]["input_ids"]],
-                    "labels": [train_ds[batch_idx]["labels"]],
-                }
-                visualize_packed_batch(batch, tokenizer, batch_idx, show_samples=1)
-        
-        except Exception as e:
-            print(f"{Colors.RED}Error building dataset: {e}{Colors.END}")
-            import traceback
-            traceback.print_exc()
+        print(f"{Colors.YELLOW}⚠ Skipping full dataset build{Colors.END}")
+        print(f"\nPacking is ENABLED in your config.")
     else:
-        print_header("PART 3: Packing Disabled", "=")
         print("Packing is disabled for this experiment.")
-        print("Sequences will be padded individually during collation.")
     
     # =========================================================================
     # Summary

@@ -1,0 +1,57 @@
+run:
+  name: "qwen3_600M_format_adaptation"
+  mode: "sft"
+
+model:
+  type: "hf_causal"
+  id: "outputs/qwen3_600M_sft_thinking"
+  dtype: "bfloat16"
+  gradient_checkpointing: true
+
+tokenizer:
+  type: "hf"
+  id: "Qwen/Qwen3-0.6B-Base"
+  truncation_side: "right"
+
+data:
+  type: "format_adaptation"
+  datasets_config:
+    - path: "AI-MO/NuminaMath-CoT"
+      weight: 0.70
+    - path: "microsoft/orca-math-word-problems-200k"
+      weight: 0.20
+    - path: "HuggingFaceH4/no_robots"
+      weight: 0.10
+  max_seq_len: 2048
+  max_token_filter: 1800
+  num_proc: 12
+  packing: false
+
+training:
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 2
+
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+
+  max_steps: 1500
+  save_steps: 500
+  eval_steps: 250
+
+  learning_rate: 5.0e-6
+  warmup_steps: 150
+  lr_scheduler_type: "cosine"
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  logging_steps: 25
+  logging_first_step: true
+  bf16: true
+  torch_compile: true
+
+  output_dir: "outputs/qwen3_600M_format_adaptation"
+
+wandb:
+  tags: ["qwen3-0.6b", "format-adaptation", "thinking-tags", "1500-steps", "2048seq"]

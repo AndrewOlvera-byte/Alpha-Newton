@@ -697,5 +697,223 @@ def build_rlvr_math_dataset(
     eval_ds = eval_ds.select_columns(["prompt", "answer"])
     
     print(f"[RLVR Math] Formatted for GRPO (prompt + answer columns)")
-    
+
+    return {"train": train, "eval": eval_ds}
+
+
+def _extract_final_answer(text: str) -> str:
+    boxed_match = re.search(r'\\boxed\{([^}]+)\}', text)
+    if boxed_match:
+        return boxed_match.group(1)
+
+    answer_patterns = [
+        r'(?:answer|result|solution)\s*(?:is|=|:)\s*([+-]?\d+(?:\.\d+)?)',
+        r'=\s*([+-]?\d+(?:\.\d+)?)\s*$',
+    ]
+
+    for pattern in answer_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    all_numbers = re.findall(r'[+-]?\d+(?:\.\d+)?', text)
+    if all_numbers:
+        return all_numbers[-1]
+
+    return "0"
+
+
+def _format_numina_sample(sample: Dict[str, Any]) -> Dict[str, str]:
+    if "messages" in sample and isinstance(sample["messages"], list):
+        problem = None
+        solution = None
+
+        for msg in sample["messages"]:
+            if msg.get("role") == "user":
+                problem = msg.get("content", "")
+            elif msg.get("role") == "assistant":
+                solution = msg.get("content", "")
+
+        if problem and solution:
+            answer = _extract_final_answer(solution)
+
+            thinking_content = solution.strip()
+            assistant_response = f"<think>\n{thinking_content}\n</think>\n\nThe answer is {answer}"
+
+            return {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a helpful math assistant. Show your reasoning using <think></think> tags, then provide your final answer."
+                    },
+                    {"role": "user", "content": problem},
+                    {"role": "assistant", "content": assistant_response}
+                ]
+            }
+
+    if "problem" in sample and "solution" in sample:
+        problem = str(sample["problem"]).strip()
+        solution = str(sample["solution"]).strip()
+        answer = _extract_final_answer(solution)
+
+        thinking_content = solution
+        assistant_response = f"<think>\n{thinking_content}\n</think>\n\nThe answer is {answer}"
+
+        return {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful math assistant. Show your reasoning using <think></think> tags, then provide your final answer."
+                },
+                {"role": "user", "content": problem},
+                {"role": "assistant", "content": assistant_response}
+            ]
+        }
+
+    return {"messages": []}
+
+
+def _format_orca_sample(sample: Dict[str, Any]) -> Dict[str, str]:
+    question = sample.get("question", "")
+    answer = sample.get("answer", "")
+
+    if not question or not answer:
+        return {"messages": []}
+
+    thinking_content = answer.strip()
+    final_answer = _extract_final_answer(answer)
+    assistant_response = f"<think>\n{thinking_content}\n</think>\n\nThe answer is {final_answer}"
+
+    return {
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a helpful math assistant. Show your reasoning using <think></think> tags, then provide your final answer."
+            },
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": assistant_response}
+        ]
+    }
+
+
+def _format_no_robots_sample(sample: Dict[str, Any]) -> Dict[str, str]:
+    if "messages" in sample and isinstance(sample["messages"], list):
+        return {"messages": sample["messages"]}
+
+    return {"messages": []}
+
+
+@register("data", "format_adaptation")
+def build_format_adaptation_dataset(
+    datasets_config: list,
+    max_seq_len: int,
+    num_proc: int,
+    packing: bool,
+    tokenizer,
+    cache_dir: str = None,
+    max_token_filter: int = 1800,
+    **kwargs
+):
+    all_train_datasets = []
+    all_eval_datasets = []
+    probabilities = []
+
+    print(f"\n[Format Adaptation] Loading {len(datasets_config)} datasets:")
+
+    for i, ds_config in enumerate(datasets_config):
+        path = ds_config["path"]
+        weight = ds_config.get("weight", 1.0)
+        name = ds_config.get("name", None)
+        trust_remote_code = ds_config.get("trust_remote_code", False)
+
+        print(f"  [{i+1}] {path} (weight: {weight})")
+
+        dataset = load_dataset(
+            path,
+            name=name,
+            split="train",
+            cache_dir=cache_dir,
+            trust_remote_code=trust_remote_code
+        )
+
+        if "NuminaMath" in path or "numina" in path.lower():
+            dataset = dataset.map(_format_numina_sample, num_proc=num_proc, desc="Formatting NuminaMath")
+        elif "orca-math" in path.lower():
+            dataset = dataset.map(_format_orca_sample, num_proc=num_proc, desc="Formatting Orca")
+        elif "no_robots" in path.lower():
+            dataset = dataset.map(_format_no_robots_sample, num_proc=num_proc, desc="Formatting no_robots")
+        else:
+            dataset = dataset.map(_format_numina_sample, num_proc=num_proc, desc="Formatting dataset")
+
+        dataset = dataset.filter(lambda x: len(x.get("messages", [])) > 0, num_proc=num_proc)
+
+        split_dataset = dataset.train_test_split(test_size=0.05, seed=42)
+
+        all_train_datasets.append(split_dataset["train"])
+        all_eval_datasets.append(split_dataset["test"])
+        probabilities.append(weight)
+
+    total = sum(probabilities)
+    probabilities = [p / total for p in probabilities]
+
+    print(f"[Format Adaptation] Sampling: {[f'{p:.1%}' for p in probabilities]}\n")
+
+    train = interleave_datasets(
+        all_train_datasets,
+        probabilities=probabilities,
+        seed=42,
+        stopping_strategy="all_exhausted",
+    )
+
+    eval_ds = interleave_datasets(
+        all_eval_datasets,
+        probabilities=probabilities,
+        seed=42,
+        stopping_strategy="first_exhausted",
+    )
+
+    def to_sft_features(batch):
+        input_ids, attention_mask, labels = [], [], []
+
+        batch_size = len(next(iter(batch.values()))) if batch else 0
+        for idx in range(batch_size):
+            sample = {k: v[idx] for k, v in batch.items()}
+            messages = sample.get("messages", [])
+
+            if not messages:
+                continue
+
+            exs = _tokenize_prompt_and_response(messages, tokenizer=tokenizer, max_seq_len=max_seq_len)
+
+            for ex in exs:
+                if len(ex["input_ids"]) <= max_token_filter:
+                    input_ids.append(ex["input_ids"])
+                    attention_mask.append(ex["attention_mask"])
+                    labels.append(ex["labels"])
+
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+    train = train.map(
+        to_sft_features,
+        batched=True,
+        num_proc=num_proc,
+        remove_columns=train.column_names,
+    )
+    eval_ds = eval_ds.map(
+        to_sft_features,
+        batched=True,
+        num_proc=num_proc,
+        remove_columns=eval_ds.column_names,
+    )
+
+    if packing:
+        train = _pack_tokenized_dataset(train, max_seq_len, tokenizer.eos_token_id)
+        eval_ds = _pack_tokenized_dataset(eval_ds, max_seq_len, tokenizer.eos_token_id)
+
+    print(f"[Format Adaptation] Train: {len(train):,} | Eval: {len(eval_ds):,}\n")
+
+    columns = ["input_ids", "attention_mask", "labels"]
+    train = train.with_format("torch", columns=columns)
+    eval_ds = eval_ds.with_format("torch", columns=columns)
+
     return {"train": train, "eval": eval_ds}

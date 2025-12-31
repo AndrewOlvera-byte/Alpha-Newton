@@ -620,25 +620,26 @@ def build_rlvr_math_dataset(
     eval_path: str = None,
     cache_dir: str = None,
     subset_pct: float = 100.0,
+    name: str = None,
     **kwargs
 ):
     """
     Build math dataset for RLVR (online GRPO training).
-    
+
     Returns dataset with:
     - prompt: Formatted prompt string for generation
     - answer: Ground truth answer for reward verification
-    
+
     Supports:
     - DeepMath-103K: question, final_answer columns
     - GSM8K: question, answer columns (extracts number after ####)
     - Custom: expects 'question' and 'answer' columns
     """
     assert source in ("hf", "local"), f"Invalid source: {source}"
-    
+
     # === 1. Load dataset === #
     if source == "hf":
-        dataset = load_dataset(train_path, split="train", cache_dir=cache_dir)
+        dataset = load_dataset(train_path, name=name, split="train", cache_dir=cache_dir)
     else:
         dataset = load_dataset("json", data_files=train_path, split="train", cache_dir=cache_dir)
     

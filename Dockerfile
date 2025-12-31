@@ -1,4 +1,8 @@
-FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-devel
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+
+# NOTE: vLLM 0.13.0 will automatically upgrade PyTorch to 2.9.0 during pip install
+# This is required for RTX 5070 Ti (Blackwell, sm_120) support
+# Base image provides PyTorch 2.5.1, but final runtime will use 2.9.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -19,8 +23,7 @@ WORKDIR /workspace
 COPY requirements.txt /workspace/requirements.txt
 COPY requirements/ /workspace/requirements/
 RUN pip install --upgrade pip && \
-    pip install flash-attn>=2.4.0 --no-build-isolation && \
-    grep -v "flash-attn" /workspace/requirements.txt | pip install -r /dev/stdin && \
+    pip install -r /workspace/requirements.txt && \
     pip install -r /workspace/requirements/eval.txt
 
 # Copy project code

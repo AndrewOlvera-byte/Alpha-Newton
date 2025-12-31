@@ -1,11 +1,13 @@
-# torch provided by base image (pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime)
-transformers>=4.40.0
+# PyTorch: Base image has 2.5.1, vLLM 0.11.2 auto-upgrades to 2.9.0 (required for RTX 5070 Ti Blackwell support)
+# vLLM 0.11.2 chosen for TRL compatibility (TRL 0.26.x only supports vLLM 0.10.2-0.11.2)
+# torch.compile disabled via VLLM_TORCH_COMPILE_LEVEL=0 to avoid PyTorch 2.9.0 crash
+transformers>=4.47.0
 datasets>=2.14.0
-trl>=0.8.0
+trl>=0.26.0  # Latest version, supports vLLM colocate mode
 pyyaml>=6.0
 accelerate>=0.20.0
 wandb>=0.15.0
 peft>=0.8.0
 bitsandbytes>=0.41.0
 gradio>=4.0.0
-flash-attn>=2.4.0
+vllm==0.11.2  # Highest version supported by TRL

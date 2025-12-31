@@ -158,8 +158,15 @@ def build_trl_grpo_trainer(model, tokenizer, dataset, training_cfg, grpo_cfg, wa
         num_generations=grpo_cfg.get("num_generations", 4),
         max_completion_length=grpo_cfg.get("max_completion_length", 512),
         max_prompt_length=grpo_cfg.get("max_prompt_length", 1024),
+        beta=grpo_cfg.get("beta", 0.001),
+        scale_rewards=grpo_cfg.get("scale_rewards", "group"),
+        loss_type=grpo_cfg.get("loss_type", "dapo"),
+        epsilon=grpo_cfg.get("epsilon", 0.2),
         temperature=grpo_cfg.get("temperature", 0.7),
+        top_k=grpo_cfg.get("top_k", 0),
+        top_p=grpo_cfg.get("top_p", 1.0),
         use_vllm=grpo_cfg.get("use_vllm", False),
+        vllm_gpu_memory_utilization=grpo_cfg.get("vllm_gpu_memory_utilization", 0.85),
     )
     
     trainer = GRPOTrainer(

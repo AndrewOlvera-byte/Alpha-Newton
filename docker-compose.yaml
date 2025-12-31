@@ -29,11 +29,13 @@ services:
     command: tail -f /dev/null
 
     # Environment variables
+    env_file:
+      - .env.vllm  # vLLM configuration (FlashInfer backend, torch.compile disabled)
     environment:
       - CUDA_VISIBLE_DEVICES=0
       - WANDB_API_KEY=${WANDB_API_KEY}  # Pass from host environment
 
-    # Port mappings (better for Windows/WSL2 than network_mode: host)
+    # Port mappings
     ports:
       - "7860:7860"  # Gradio web UI
       - "6006:6006"  # TensorBoard (if needed)

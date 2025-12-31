@@ -2,7 +2,7 @@ from src.core.registry import register
 from transformers import AutoModelForCausalLM
 
 @register("model", "hf_causal")
-def build_hf_model(id: str, revision: str, dtype: str, trust_remote_code: bool, load_in_4bit: bool, gradient_checkpointing: bool):
+def build_hf_model(id: str, revision: str, dtype: str, trust_remote_code: bool, load_in_4bit: bool, gradient_checkpointing: bool, attn_implementation: str = "sdpa"):
 
     model = AutoModelForCausalLM.from_pretrained(
         id,
@@ -10,7 +10,7 @@ def build_hf_model(id: str, revision: str, dtype: str, trust_remote_code: bool, 
         dtype=dtype,
         trust_remote_code=trust_remote_code,
         load_in_4bit=load_in_4bit,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_implementation,
     )
 
     if gradient_checkpointing:

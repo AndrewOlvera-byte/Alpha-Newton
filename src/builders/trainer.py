@@ -165,8 +165,13 @@ def build_trl_grpo_trainer(model, tokenizer, dataset, training_cfg, grpo_cfg, wa
         temperature=grpo_cfg.get("temperature", 0.7),
         top_k=grpo_cfg.get("top_k", 0),
         top_p=grpo_cfg.get("top_p", 1.0),
+        # vLLM configuration
         use_vllm=grpo_cfg.get("use_vllm", False),
-        vllm_gpu_memory_utilization=grpo_cfg.get("vllm_gpu_memory_utilization", 0.85),
+        vllm_mode=grpo_cfg.get("vllm_mode", "server"),  # "server" or "colocate"
+        vllm_gpu_memory_utilization=grpo_cfg.get("vllm_gpu_memory_utilization", 0.3),
+        vllm_tensor_parallel_size=grpo_cfg.get("vllm_tensor_parallel_size", 1),
+        vllm_max_model_length=grpo_cfg.get("vllm_max_model_length", None),
+        vllm_enable_sleep_mode=grpo_cfg.get("vllm_enable_sleep_mode", False),
     )
     
     trainer = GRPOTrainer(

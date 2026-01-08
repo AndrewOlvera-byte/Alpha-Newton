@@ -22,7 +22,10 @@ from src.core.registry import build
 from src.builders.data import _messages_from_sample, _normalize_messages
 
 import src.builders.tokenizer
+import src.builders.data
+import src.builders.data_thinking
 from src.builders.data import _tokenize_prompt_and_response
+from src.builders.data_thinking import get_adapter
 
 class Colors:
     HEADER = '\033[95m'
@@ -92,7 +95,36 @@ def visualize_raw_sample(sample: Dict[str, Any], idx: int):
         print(f"  Format: {Colors.GREEN}Problem/Solution{Colors.END}")
         print(f"    problem: {truncate_text(str(sample.get('problem', '')), 150)}")
         print(f"    solution: {truncate_text(str(sample.get('solution', '')), 150)}")
-    
+
+    elif "question" in sample and "generated_solution" in sample and "expected_answer" in sample:
+        print(f"  Format: {Colors.GREEN}OpenMathInstruct (question/generated_solution/expected_answer){Colors.END}")
+        print(f"    question: {truncate_text(str(sample.get('question', '')), 150)}")
+        print(f"    generated_solution: {truncate_text(str(sample.get('generated_solution', '')), 200)}")
+        print(f"    expected_answer: {truncate_text(str(sample.get('expected_answer', '')), 50)}")
+        print(f"    is_correct: {sample.get('is_correct', 'N/A')}")
+        print(f"    error_message: {truncate_text(str(sample.get('error_message', '')), 100) or '(empty - no code execution)'}")
+
+    elif "question" in sample and "answer" in sample:
+        print(f"  Format: {Colors.GREEN}Question/Answer (e.g., Orca Math){Colors.END}")
+        print(f"    question: {truncate_text(str(sample.get('question', '')), 150)}")
+        print(f"    answer: {truncate_text(str(sample.get('answer', '')), 200)}")
+
+    elif "query" in sample and "resp" in sample and "ans_correct" in sample:
+        print(f"  Format: {Colors.GREEN}DART-Math (query/resp/ans_correct){Colors.END}")
+        print(f"    query: {truncate_text(str(sample.get('query', '')), 150)}")
+        print(f"    resp: {truncate_text(str(sample.get('resp', '')), 300)}")
+        print(f"    gt_ans: {sample.get('gt_ans', 'N/A')}")
+        print(f"    ans_correct: {sample.get('ans_correct', 'N/A')}")
+        if sample.get('query_metadata'):
+            print(f"    query_metadata: {sample.get('query_metadata')}")
+
+    elif "problem_text" in sample and "solution" in sample:
+        print(f"  Format: {Colors.GREEN}SciBench (problem_text/solution){Colors.END}")
+        print(f"    problem_text: {truncate_text(str(sample.get('problem_text', '')), 150)}")
+        print(f"    solution: {truncate_text(str(sample.get('solution', '')), 200)}")
+        print(f"    answer_number: {sample.get('answer_number', 'N/A')}")
+        print(f"    subject: {sample.get('subject', 'N/A')}")
+
     else:
         print(f"  Format: {Colors.RED}Unknown{Colors.END}")
         for k, v in list(sample.items())[:5]:
@@ -118,7 +150,9 @@ def visualize_parsed_messages(messages: List[Dict[str, str]], idx: int):
         else:  # assistant
             role_color = Colors.GREEN
         
-        content_preview = truncate_text(content, 200)
+        # Show more content for assistant to see <think> tags and \\boxed{}
+        max_len = 400 if role == "assistant" else 200
+        content_preview = truncate_text(content, max_len)
         print(f"  [{i}] {role_color}{role:>10}{Colors.END}: {content_preview}")
 
 
@@ -267,20 +301,33 @@ def main(exp_name: str, num_samples: int = 2, num_batches: int = 2):
         if train_path:
             datasets_config = [{"path": train_path, "weight": 1.0}]
     
+    # Get system prompt and data type from config
+    system_prompt = cfg.data.get("system_prompt", "")
+    data_type = cfg.data.get("type", "")
+    
+    # Check if we should use adapters (for math_thinking_sft or similar)
+    use_adapters = data_type in ["math_thinking_sft"] and system_prompt
+    
     for ds_cfg in datasets_config:
         path = ds_cfg["path"]
         weight = ds_cfg.get("weight", 1.0)
         name = ds_cfg.get("name", None)
+        split = ds_cfg.get("split", "train")
         trust_remote_code = ds_cfg.get("trust_remote_code", False)
+        adapter_name = ds_cfg.get("adapter", None)
 
         print_subheader(f"Dataset: {path} (weight={weight})")
+        if adapter_name:
+            print(f"Adapter: {adapter_name}")
+        if split != "train":
+            print(f"Split: {split}")
 
         try:
             # Load small sample with config parameters
             ds = load_dataset(
                 path,
                 name=name,
-                split="train",
+                split=split,
                 streaming=True,
                 trust_remote_code=trust_remote_code
             )
@@ -289,15 +336,51 @@ def main(exp_name: str, num_samples: int = 2, num_batches: int = 2):
             for idx, sample in enumerate(samples):
                 # Show raw
                 visualize_raw_sample(sample, idx)
-                
-                # Parse to messages
-                messages = _messages_from_sample(sample)
+
+                # Parse to messages using adapter if available
+                if use_adapters and adapter_name:
+                    try:
+                        adapter_fn = get_adapter(adapter_name)
+                        messages = adapter_fn(sample, system_prompt)
+
+                        # Diagnostic: Show reasoning length for all adapters
+                        if messages:
+                            assistant_msg = next((m for m in messages if m.get("role") == "assistant"), None)
+                            if assistant_msg:
+                                content = assistant_msg.get("content", "")
+                                # Extract just the reasoning part (inside <think> tags)
+                                import re
+                                think_match = re.search(r'<think>(.*?)</think>', content, re.DOTALL)
+                                if think_match:
+                                    reasoning = think_match.group(1).strip()
+                                    print(f"  {Colors.DIM}📊 Reasoning length: {len(reasoning)} chars{Colors.END}")
+
+                        if not messages and adapter_name == "openmath1":
+                            # Debug why OpenMathInstruct-1 is failing
+                            print(f"  {Colors.YELLOW}Debug: generated_solution present: {bool(sample.get('generated_solution'))}{Colors.END}")
+                            if sample.get('generated_solution'):
+                                print(f"  {Colors.YELLOW}Debug: solution length: {len(str(sample.get('generated_solution')))}{Colors.END}")
+                    except Exception as e:
+                        print(f"  {Colors.RED}Adapter error: {e}{Colors.END}")
+                        import traceback
+                        traceback.print_exc()
+                        messages = []
+                else:
+                    # Fallback to generic parser
+                    messages = _messages_from_sample(sample)
+
                 visualize_parsed_messages(messages, idx)
                 
                 print(f"\n{Colors.DIM}{'─' * 60}{Colors.END}")
         
         except Exception as e:
-            print(f"  {Colors.RED}Error loading dataset: {e}{Colors.END}")
+            error_msg = str(e)
+            print(f"  {Colors.RED}Error loading dataset: {error_msg}{Colors.END}")
+            if "gated dataset" in error_msg.lower() or "authenticated" in error_msg.lower():
+                print(f"  {Colors.YELLOW}💡 Tip: This is a gated dataset. You may need to:{Colors.END}")
+                print(f"  {Colors.YELLOW}     1. Request access at https://huggingface.co/{path}{Colors.END}")
+                print(f"  {Colors.YELLOW}     2. Login with: huggingface-cli login{Colors.END}")
+                print(f"  {Colors.YELLOW}     3. Or set HF_TOKEN environment variable{Colors.END}")
     
     # =========================================================================
     # PART 2: Show tokenization with label masking
@@ -310,15 +393,22 @@ def main(exp_name: str, num_samples: int = 2, num_batches: int = 2):
         ds_cfg = datasets_config[0]
         path = ds_cfg["path"]
         name = ds_cfg.get("name", None)
+        split = ds_cfg.get("split", "train")
         trust_remote_code = ds_cfg.get("trust_remote_code", False)
+        adapter_name = ds_cfg.get("adapter", None)
 
-        print(f"Using dataset: {path}\n")
+        print(f"Using dataset: {path}")
+        if adapter_name:
+            print(f"Adapter: {adapter_name}")
+        if split != "train":
+            print(f"Split: {split}")
+        print()
 
         try:
             ds = load_dataset(
                 path,
                 name=name,
-                split="train",
+                split=split,
                 streaming=True,
                 trust_remote_code=trust_remote_code
             )
@@ -327,7 +417,16 @@ def main(exp_name: str, num_samples: int = 2, num_batches: int = 2):
             max_seq_len = cfg.data.get("max_seq_len", 2048)
             
             for idx, sample in enumerate(samples):
-                messages = _messages_from_sample(sample)
+                # Parse using adapter if available
+                if use_adapters and adapter_name:
+                    try:
+                        adapter_fn = get_adapter(adapter_name)
+                        messages = adapter_fn(sample, system_prompt)
+                    except Exception as e:
+                        print(f"{Colors.RED}[Sample {idx + 1}] Adapter error: {e}{Colors.END}")
+                        messages = []
+                else:
+                    messages = _messages_from_sample(sample)
                 
                 if not messages:
                     print(f"{Colors.RED}[Sample {idx + 1}] No messages parsed, skipping{Colors.END}")
@@ -374,15 +473,23 @@ def main(exp_name: str, num_samples: int = 2, num_batches: int = 2):
     # Summary
     # =========================================================================
     print_header("Summary", "=")
-    
-    print(f"✓ Experiment: {exp_name}")
-    print(f"✓ Datasets: {len(datasets_config)}")
+
+    print(f" Experiment: {exp_name}")
+    print(f" Datasets: {len(datasets_config)}")
     for ds_cfg in datasets_config:
         print(f"    - {ds_cfg['path']} (weight={ds_cfg.get('weight', 1.0)})")
-    print(f"✓ Max sequence length: {cfg.data.get('max_seq_len', 'N/A')}")
-    print(f"✓ Packing: {cfg.data.get('packing', False)}")
-    print(f"✓ EOS token ID: {tokenizer.eos_token_id}")
-    
+    print(f" Max sequence length: {cfg.data.get('max_seq_len', 'N/A')}")
+    print(f" Packing: {cfg.data.get('packing', False)}")
+    print(f" EOS token ID: {tokenizer.eos_token_id}")
+
+    print(f"\n{Colors.BOLD}📝 Notes:{Colors.END}")
+    print(f" • DART-Math datasets use rejection sampling for high-quality long reasoning")
+    print(f" • Check the '📊 Reasoning length' diagnostics above for each dataset")
+    print(f" • Target: 500-2000+ chars per reasoning chain to fill 4096 seq length")
+    print(f" • Gated datasets require HuggingFace authentication")
+    print(f" • Adapters apply dataset-specific formatting and quality filters")
+    print(f" • All code blocks/tool traces are stripped for code-free reasoning")
+
     print(f"\n{Colors.GREEN}Data pipeline validation complete!{Colors.END}")
 
 

@@ -5,6 +5,7 @@ from src.core.registry import build
 import src.builders.model
 import src.builders.tokenizer
 import src.builders.data
+import src.builders.data_thinking
 import src.builders.trainer
 
 

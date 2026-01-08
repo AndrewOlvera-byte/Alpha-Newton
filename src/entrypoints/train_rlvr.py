@@ -19,6 +19,8 @@ import src.builders.tokenizer
 import src.builders.data
 import src.builders.trainer
 
+import glob
+import os
 from src.rlvr import math_reward_fn
 
 
@@ -57,10 +59,31 @@ def main(exp_name: str):
         reward_funcs=math_reward_fn,
     )
     
+    # Auto-resume from latest checkpoint if exists
+    output_dir = cfg.training['output_dir']
+
+    checkpoint_path = None
+    if os.path.exists(output_dir):
+        checkpoints = glob.glob(os.path.join(output_dir, "checkpoint-*"))
+        if checkpoints:
+            # Get latest checkpoint by step number
+            latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("-")[-1]))
+            checkpoint_path = latest_checkpoint
+            step_num = latest_checkpoint.split("-")[-1]
+            print(f"[RLVR] Found checkpoint: {latest_checkpoint}")
+            print(f"[RLVR] Resuming training from step {step_num}")
+        else:
+            print("[RLVR] Starting training from scratch (no checkpoints found)")
+    else:
+        print("[RLVR] Starting training from scratch (output directory created)")
+
+    print(f"[RLVR] Training will save checkpoints every {cfg.training.get('save_steps', 500)} steps")
+    print()
+
     print("[RLVR] Starting online GRPO training...")
-    trainer.train()
-    
-    print(f"\n[RLVR] Saving final model to: {cfg.training['output_dir']}")
+    trainer.train(resume_from_checkpoint=checkpoint_path)
+
+    print(f"\n[RLVR] Training completed! Saving final model to: {cfg.training['output_dir']}")
     trainer.save_model(cfg.training['output_dir'])
     tokenizer.save_pretrained(cfg.training['output_dir'])
     print("[RLVR] Model and tokenizer saved successfully")

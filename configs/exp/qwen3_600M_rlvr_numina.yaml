@@ -18,33 +18,52 @@ data:
   train_path: "AI-MO/NuminaMath-CoT"
   max_prompt_len: 512
   num_proc: 12
+  subset_pct: 100.0
 
 grpo:
   num_generations: 8
   max_prompt_length: 512
   max_completion_length: 1536
+
   beta: 0.001
   scale_rewards: "group"
   loss_type: "dapo"
   epsilon: 0.2
+
   temperature: 0.8
   top_p: 0.95
   top_k: 0
+
+  # vLLM configuration
   use_vllm: true
-  vllm_gpu_memory_utilization: 0.85
+  vllm_mode: "colocate"
+  vllm_gpu_memory_utilization: 0.45
+  vllm_enable_sleep_mode: true
+  vllm_tensor_parallel_size: 1
 
 training:
-  per_device_train_batch_size: 1
-  per_device_eval_batch_size: 1
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
   gradient_accumulation_steps: 8
 
   learning_rate: 1.0e-5
-  warmup_steps: 100
-  max_steps: 5000
+  warmup_steps: 200
+  lr_scheduler_type: "cosine"
+  weight_decay: 0.01
+  max_grad_norm: 1.0
 
-  logging_steps: 25
+  max_steps: 7500
   save_steps: 500
   eval_steps: 250
+  save_total_limit: 3
+  load_best_model_at_end: false
+
+  logging_steps: 25
+  logging_first_step: true
+
+  bf16: true
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
 
 wandb:
-  tags: ["qwen3-0.6b", "rlvr", "grpo", "numina", "proper-eval", "5k-steps"]
+  tags: ["qwen3-0.6b", "rlvr", "grpo", "numina", "production", "10k-steps", "world-model-eval"]

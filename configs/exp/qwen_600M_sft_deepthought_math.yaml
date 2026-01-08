@@ -1,0 +1,84 @@
+run:
+  name: "qwen_600M_sft_deepthought_math_optimal"
+  mode: "sft"
+
+model:
+  type: "hf_causal"
+  id: "outputs/qwen3_600M_format_adaptation"
+  dtype: "bfloat16"
+  gradient_checkpointing: true
+
+tokenizer:
+  type: "hf"
+  id: "Qwen/Qwen3-0.6B-Base"
+  truncation_side: "right"
+
+data:
+  type: "math_thinking_sft"
+  datasets_config:
+    - path: "hkust-nlp/dart-math-pool-gsm8k"
+      weight: 0.30
+      adapter: "dart_math"
+      split: "train"
+      trust_remote_code: false
+
+    - path: "hkust-nlp/dart-math-pool-math"
+      weight: 0.20
+      adapter: "dart_math"
+      split: "train"
+      trust_remote_code: false
+
+    - path: "nvidia/OpenMathReasoning"
+      weight: 0.25
+      adapter: "openmath_reasoning"
+      split: "cot"
+      trust_remote_code: false
+
+    - path: "AI-MO/NuminaMath-CoT"
+      weight: 0.15
+      adapter: "numina_cot"
+      split: "train"
+      trust_remote_code: false
+
+    - path: "meta-math/MetaMathQA"
+      weight: 0.10
+      adapter: "metamath"
+      split: "train"
+      trust_remote_code: false
+
+  max_seq_len: 4096
+  max_token_filter: 3800
+  num_proc: 12
+  packing: true
+  deduplicate: false
+  eval_split_ratio: 0.03
+  system_prompt: "You are a helpful math assistant. Show your reasoning step-by-step using <think></think> tags, then provide your final answer as \\boxed{answer}."
+
+training:
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4
+
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+
+  max_steps: 30000
+  save_steps: 3000
+  eval_steps: 3000
+
+  learning_rate: 2.0e-6
+  warmup_steps: 1500
+  lr_scheduler_type: "cosine"
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  logging_steps: 50
+  logging_first_step: true
+  bf16: true
+  torch_compile: false
+
+  output_dir: "outputs/qwen_600M_sft_deepthought_math_optimal"
+
+wandb:
+  tags: ["qwen-0.6b", "sft", "deepthought", "math", "4096seq", "dart-math", "long-cot", "optimal"]

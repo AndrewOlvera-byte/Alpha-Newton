@@ -825,8 +825,8 @@ def build_math_thinking_sft_dataset(
                     hashes.append("")
             return {"_content_hash": hashes}
 
-        train = train.map(add_hash, batched=True, num_proc=num_proc)
-        eval_ds = eval_ds.map(add_hash, batched=True, num_proc=num_proc)
+        train = train.map(add_hash, batched=True, batch_size=50, num_proc=num_proc)
+        eval_ds = eval_ds.map(add_hash, batched=True, batch_size=50, num_proc=num_proc)
 
         # Remove duplicates within train
         seen_hashes: Set[str] = set()
@@ -863,21 +863,25 @@ def build_math_thinking_sft_dataset(
 
         batch_size = len(next(iter(batch.values()))) if batch else 0
         for idx in range(batch_size):
-            sample = {k: v[idx] for k, v in batch.items()}
-            messages = sample.get("messages", [])
+            try:
+                sample = {k: v[idx] for k, v in batch.items()}
+                messages = sample.get("messages", [])
 
-            if not messages:
+                if not messages:
+                    continue
+
+                exs = _tokenize_prompt_and_response(
+                    messages, tokenizer=tokenizer, max_seq_len=max_seq_len
+                )
+
+                for ex in exs:
+                    if len(ex["input_ids"]) <= max_token_filter:
+                        input_ids.append(ex["input_ids"])
+                        attention_mask.append(ex["attention_mask"])
+                        labels.append(ex["labels"])
+            except Exception as e:
+                # Skip samples that cause errors to prevent subprocess crashes
                 continue
-
-            exs = _tokenize_prompt_and_response(
-                messages, tokenizer=tokenizer, max_seq_len=max_seq_len
-            )
-
-            for ex in exs:
-                if len(ex["input_ids"]) <= max_token_filter:
-                    input_ids.append(ex["input_ids"])
-                    attention_mask.append(ex["attention_mask"])
-                    labels.append(ex["labels"])
 
         return {
             "input_ids": input_ids,
@@ -888,6 +892,7 @@ def build_math_thinking_sft_dataset(
     train = train.map(
         to_sft_features,
         batched=True,
+        batch_size=50,
         num_proc=num_proc,
         remove_columns=train.column_names,
         desc="Tokenizing train",
@@ -896,6 +901,7 @@ def build_math_thinking_sft_dataset(
     eval_ds = eval_ds.map(
         to_sft_features,
         batched=True,
+        batch_size=50,
         num_proc=num_proc,
         remove_columns=eval_ds.column_names,
         desc="Tokenizing eval",

@@ -35,12 +35,16 @@ grpo:
   use_vllm: true
   vllm_mode: "colocate"
   vllm_gpu_memory_utilization: 0.5
-  vllm_enable_sleep_mode: false
+  vllm_enable_sleep_mode: true
 
 training:
   per_device_train_batch_size: 2
   per_device_eval_batch_size: 2
   gradient_accumulation_steps: 8
+
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
 
   learning_rate: 5.0e-6
   warmup_steps: 20

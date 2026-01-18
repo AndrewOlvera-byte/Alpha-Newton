@@ -1,11 +1,6 @@
 """
 RLVR (Reinforcement Learning with Verifiable Rewards) Training
 
-Online RL training with GRPOTrainer:
-- Model generates completions during training
-- Math verifier scores correctness (1.0 / 0.0)
-- Model learns from its own generations via group-relative policy optimization
-
 Usage:
     python -m src.entrypoints.train_rlvr --exp qwen3_600M_rlvr_math
 """

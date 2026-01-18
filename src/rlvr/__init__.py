@@ -1,4 +1,19 @@
-# RLVR (Reinforcement Learning with Verifiable Rewards) module
-from src.rlvr.math_verifier import math_reward_fn, extract_answer
+from src.rlvr.math_verifier import (
+    get_reward_function,
+    ppo_reward_binary,
+    dapo_reward_advanced,
+    grpo_reward_reflection,
+    extract_answer,
+    compare_answers,
+    check_format_quality,
+)
 
-__all__ = ["math_reward_fn", "extract_answer"]
+__all__ = [
+    "get_reward_function",
+    "ppo_reward_binary",
+    "dapo_reward_advanced",
+    "grpo_reward_reflection",
+    "extract_answer",
+    "compare_answers",
+    "check_format_quality",
+]

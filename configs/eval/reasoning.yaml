@@ -21,7 +21,7 @@ runner:
 
   # 0-shot for instruct/reasoning models
   num_fewshot: 0
-  batch_size: 2
+  batch_size: 4
 
   # Wrap prompts in chat template
   apply_chat_template: true

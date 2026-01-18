@@ -21,32 +21,36 @@ import src.builders.trainer
 
 import glob
 import os
-from src.rlvr import math_reward_fn
+from src.rlvr.math_verifier import get_reward_function
 
 
 def main(exp_name: str):
     cfg = Config.from_experiment(exp_name)
-    
+
     print(f"[RLVR] Run: {cfg.run['name']}")
     print(f"[RLVR] Mode: {cfg.run['mode']}")
     print(f"[RLVR] Model: {cfg.model.get('id', 'N/A')}")
     print(f"[RLVR] Dataset: {cfg.data.get('train_path', 'N/A')}")
     print(f"[RLVR] Output: {cfg.training['output_dir']}")
     print()
-    
+
     tokenizer = build("tokenizer", **cfg.tokenizer)
     model = build("model", **cfg.model)
     dataset = build("data", tokenizer=tokenizer, **cfg.data)
-    
+
     grpo_cfg = getattr(cfg, 'grpo', {})
-    
+
+    reward_function_name = grpo_cfg.get('reward_function', 'dapo_advanced')
+    reward_fn = get_reward_function(reward_function_name)
+
     print(f"[RLVR] GRPO Config:")
+    print(f"  - reward_function: {reward_function_name}")
     print(f"  - num_generations: {grpo_cfg.get('num_generations', 4)}")
     print(f"  - max_completion_length: {grpo_cfg.get('max_completion_length', 512)}")
     print(f"  - temperature: {grpo_cfg.get('temperature', 0.7)}")
     print(f"  - use_vllm: {grpo_cfg.get('use_vllm', False)}")
     print()
-    
+
     trainer = build(
         "trainer",
         type="trl_grpo",
@@ -56,7 +60,7 @@ def main(exp_name: str):
         training_cfg=cfg.training,
         grpo_cfg=grpo_cfg,
         wandb_cfg=cfg.wandb,
-        reward_funcs=math_reward_fn,
+        reward_funcs=reward_fn,
     )
     
     # Auto-resume from latest checkpoint if exists

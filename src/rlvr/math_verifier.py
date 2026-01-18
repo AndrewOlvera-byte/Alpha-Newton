@@ -1,7 +1,8 @@
 import re
+from typing import Optional, Tuple
 
 
-def extract_answer(text: str) -> tuple[str | None, float]:
+def extract_answer(text: str) -> Tuple[Optional[str], float]:
     if not text:
         return None, 0.0
 
@@ -9,37 +10,64 @@ def extract_answer(text: str) -> tuple[str | None, float]:
 
     boxed_match = re.search(r'\\boxed\{([^}]+)\}', after_think)
     if boxed_match:
-        return _normalize_number(boxed_match.group(1)), 1.0
+        return _normalize_answer(boxed_match.group(1)), 1.0
 
     answer_patterns = [
         (r'(?:answer|result|solution)\s*(?:is|=|:)\s*([+-]?\d+(?:\.\d+)?)', 0.9),
-        (r'=\s*([+-]?\d+(?:\.\d+)?)\s*$', 0.7),
+        (r'(?:answer|result|solution)\s*(?:is|=|:)\s*(.+?)(?:\.|$)', 0.8),
     ]
 
     for pattern, confidence in answer_patterns:
         match = re.search(pattern, after_think, re.IGNORECASE)
         if match:
-            return _normalize_number(match.group(1)), confidence
+            return _normalize_answer(match.group(1)), confidence
+
+    equals_match = re.search(r'=\s*([+-]?\d+(?:\.\d+)?)\s*$', after_think)
+    if equals_match:
+        return _normalize_answer(equals_match.group(1)), 0.7
 
     all_numbers = re.findall(r'[+-]?\d+(?:\.\d+)?', after_think)
     if all_numbers:
-        return _normalize_number(all_numbers[-1]), 0.3
+        return _normalize_answer(all_numbers[-1]), 0.3
 
     return None, 0.0
 
 
-def _normalize_number(s: str) -> str:
-    s = s.strip()
+def _normalize_answer(answer_str: str) -> str:
+    answer_str = answer_str.strip()
     try:
-        num = float(s)
+        num = float(answer_str)
         if num == int(num):
             return str(int(num))
         return str(num)
     except ValueError:
-        return s
+        return answer_str
 
 
-def _check_format_quality(text: str) -> dict:
+def compare_answers(predicted: Optional[str], ground_truth: str) -> bool:
+    if predicted is None:
+        return False
+
+    pred_norm = _normalize_answer(predicted)
+    truth_norm = _normalize_answer(ground_truth)
+
+    if pred_norm == truth_norm:
+        return True
+
+    if pred_norm.lower() == truth_norm.lower():
+        return True
+
+    try:
+        pred_num = float(pred_norm)
+        truth_num = float(truth_norm)
+        return abs(pred_num - truth_num) < 1e-6
+    except (ValueError, TypeError):
+        pass
+
+    return False
+
+
+def check_format_quality(text: str) -> dict:
     has_think_open = "<think>" in text
     has_think_close = "</think>" in text
 
@@ -62,77 +90,104 @@ def _check_format_quality(text: str) -> dict:
     }
 
 
-def math_reward_fn(prompts, completions, answer, **kwargs):
-    """
-    Compute rewards for GRPO training with multiple generations per prompt.
+def _extract_completion_text(completion):
+    if isinstance(completion, list) and len(completion) > 0:
+        return completion[0].get("content", "")
+    elif isinstance(completion, dict):
+        return completion.get("content", "")
+    else:
+        return str(completion)
 
-    Args:
-        prompts: List of input prompts (length = batch_size)
-        completions: List of completions, each a list containing dict with "content" key
-                    (length = batch_size * num_generations)
-        answer: List of correct answers (length = batch_size)
 
-    Returns:
-        List of scalar rewards (length = batch_size * num_generations)
-    """
+def ppo_reward_binary(prompts, completions, answer, **kwargs):
     rewards = []
     num_generations = len(completions) // len(prompts) if prompts else 1
 
-    # Iterate through all completions
     for idx, completion in enumerate(completions):
-        # Determine which prompt this completion belongs to
         prompt_idx = idx // num_generations
         correct_answer = answer[prompt_idx] if prompt_idx < len(answer) else answer[0]
 
-        # Extract text from completion
-        if isinstance(completion, list) and len(completion) > 0:
-            text = completion[0].get("content", "")
-        elif isinstance(completion, dict):
-            text = completion.get("content", "")
-        else:
-            text = str(completion)
+        text = _extract_completion_text(completion)
+        extracted, confidence = extract_answer(text)
+        is_correct = compare_answers(extracted, str(correct_answer))
+
+        reward = 1.0 if is_correct else 0.0
+        rewards.append(reward)
+
+    return rewards
+
+
+def dapo_reward_advanced(prompts, completions, answer, **kwargs):
+    rewards = []
+    num_generations = len(completions) // len(prompts) if prompts else 1
+
+    for idx, completion in enumerate(completions):
+        prompt_idx = idx // num_generations
+        correct_answer = answer[prompt_idx] if prompt_idx < len(answer) else answer[0]
+
+        text = _extract_completion_text(completion)
+        extracted, confidence = extract_answer(text)
+        is_correct = compare_answers(extracted, str(correct_answer))
+
+        format_info = check_format_quality(text)
 
         reward = 0.0
 
-        # Answer correctness (primary signal)
-        extracted, confidence = extract_answer(text)
-        correct = _normalize_number(str(correct_answer).strip())
-
-        if extracted == correct:
-            reward += 1.0  # Correct answer
-        elif extracted is not None:
-            reward -= 0.1  # Wrong answer extracted
-        else:
-            reward -= 0.3  # No answer extracted
-
-        # Format quality bonuses/penalties
-        format_info = _check_format_quality(text)
-
-        if format_info["has_think_tags"]:
-            reward += 0.15  # Proper thinking tags
-            if format_info["answer_after_thinking"]:
-                reward += 0.1  # Answer after thinking (correct structure)
-        elif format_info["has_partial_tags"]:
-            reward -= 0.2  # Incomplete tags (bad format)
-
-        # Confidence bonus
-        if extracted is not None:
+        if is_correct:
+            reward = 1.0
+            if format_info["has_think_tags"] and format_info["answer_after_thinking"]:
+                reward += 0.2
             reward += confidence * 0.1
+        elif extracted is not None:
+            reward = 0.2
+            if format_info["has_think_tags"]:
+                reward += 0.1
+        else:
+            reward = 0.0
 
-        # Length penalties
-        if format_info["total_length"] < 50:
-            reward -= 0.2  # Too short (likely incomplete)
-        elif format_info["total_length"] > 2000:
-            if format_info["thinking_lines"] < 5:
-                reward -= 0.15  # Very long but shallow thinking
+        if format_info["has_partial_tags"] and not format_info["has_think_tags"]:
+            reward -= 0.3
 
-        # Thinking quality
-        if format_info["has_think_tags"]:
-            if format_info["thinking_lines"] < 2:
-                reward -= 0.1  # Too little reasoning
-            elif format_info["thinking_lines"] > 50:
-                reward -= 0.05  # Excessive reasoning (may be rambling)
+        if format_info["total_length"] < 30:
+            reward -= 0.2
 
-        rewards.append(reward)  # FIXED: Return scalar, not list
+        rewards.append(reward)
 
     return rewards
+
+
+def grpo_reward_reflection(prompts, completions, answer, **kwargs):
+    rewards = []
+    num_generations = len(completions) // len(prompts) if prompts else 1
+
+    for idx, completion in enumerate(completions):
+        prompt_idx = idx // num_generations
+        correct_answer = answer[prompt_idx] if prompt_idx < len(answer) else answer[0]
+
+        text = _extract_completion_text(completion)
+        extracted, confidence = extract_answer(text)
+        is_correct = compare_answers(extracted, str(correct_answer))
+
+        reward = 1.0 if is_correct else 0.0
+        rewards.append(reward)
+
+    return rewards
+
+
+REWARD_FUNCTIONS = {
+    "ppo_binary": ppo_reward_binary,
+    "dapo_advanced": dapo_reward_advanced,
+    "grpo_reflection": grpo_reward_reflection,
+}
+
+
+def get_reward_function(name: str):
+    if name not in REWARD_FUNCTIONS:
+        raise ValueError(
+            f"Unknown reward function: {name}. "
+            f"Available: {list(REWARD_FUNCTIONS.keys())}"
+        )
+    return REWARD_FUNCTIONS[name]
+
+
+math_reward_fn = dapo_reward_advanced

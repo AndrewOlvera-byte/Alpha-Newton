@@ -927,3 +927,114 @@ def build_math_thinking_sft_dataset(
 
     return {"train": train, "eval": eval_ds}
 
+@register("data", "rlvr_allenai")
+def build_rlvr_allenai_dataset(
+    source: str,
+    train_path: str,
+    max_prompt_len: int,
+    num_proc: int,
+    tokenizer,
+    eval_path: str = None,
+    cache_dir: str = None,
+    subset_pct: float = 100.0,
+    name: str = None,
+    **kwargs
+):
+    """
+    Build RLVR dataset from AllenAI format
+
+    Supports:
+    - allenai/RLVR-GSM (7,473 samples)
+    - allenai/RLVR-GSM-MATH-IF-Mixed-Constraints (29,946 samples)
+
+    Dataset format:
+        - messages: [{"role": "user", "content": "Question: ... Answer: ..."}]
+        - ground_truth: str or int (the correct answer)
+        - dataset: "gsm8k" | "MATH" | "IF"
+        - constraint_type: Optional constraint metadata
+        - constraint: Optional constraint details
+
+    Returns:
+        Dict with 'train' and 'eval' datasets containing:
+        - prompt: str (ready for generation)
+        - answer: str (ground truth for reward computation)
+        - dataset_source: str (for filtering/analysis)
+        - metadata: dict (original fields for advanced reward functions)
+    """
+    assert source in ("hf", "local"), f"Invalid source: {source}"
+
+    if source == "hf":
+        dataset = load_dataset(train_path, name=name, split="train", cache_dir=cache_dir)
+    else:
+        dataset = load_dataset("json", data_files=train_path, split="train", cache_dir=cache_dir)
+
+    print(f"[RLVR AllenAI] Loaded: {train_path}")
+    print(f"[RLVR AllenAI] Total samples: {len(dataset):,}")
+
+    if subset_pct < 100.0:
+        n_samples = int(len(dataset) * subset_pct / 100)
+        dataset = dataset.select(range(n_samples))
+        print(f"[RLVR AllenAI] Using {subset_pct}% subset: {n_samples:,} samples")
+
+    split = dataset.train_test_split(test_size=0.05, seed=42)
+    train = split["train"]
+    eval_ds = split["test"]
+
+    print(f"[RLVR] Train: {len(train):,} | Eval: {len(eval_ds):,}")
+
+    def format_sample(sample):
+        messages = sample.get("messages", [])
+        if not messages or len(messages) == 0:
+            raise ValueError(f"Sample has no messages: {sample}")
+
+        user_message = messages[0]
+        content = user_message.get("content", "")
+
+        if not content:
+            raise ValueError(f"Message has no content: {user_message}")
+
+        formatted_messages = [{"role": "user", "content": content}]
+
+        prompt = tokenizer.apply_chat_template(
+            formatted_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        ground_truth = sample.get("ground_truth", "")
+        answer = str(ground_truth).strip()
+
+        dataset_source = sample.get("dataset", "unknown")
+
+        metadata = {
+            "dataset": dataset_source,
+            "constraint_type": sample.get("constraint_type"),
+            "constraint": sample.get("constraint"),
+        }
+
+        return {
+            "prompt": prompt,
+            "answer": answer,
+            "dataset_source": dataset_source,
+            "metadata": str(metadata),
+        }
+
+    train = train.map(format_sample, num_proc=num_proc, desc="Formatting train")
+    eval_ds = eval_ds.map(format_sample, num_proc=num_proc, desc="Formatting eval")
+
+    train = train.select_columns(["prompt", "answer", "dataset_source", "metadata"])
+    eval_ds = eval_ds.select_columns(["prompt", "answer", "dataset_source", "metadata"])
+
+    print(f"[RLVR] Formatted for GRPO training")
+
+    
+    if "dataset_source" in train.column_names:
+        sources = {}
+        for item in train["dataset_source"]:
+            sources[item] = sources.get(item, 0) + 1
+        print(f"[RLVR] Dataset distribution:")
+        for source, count in sorted(sources.items()):
+            pct = 100 * count / len(train)
+            print(f"  - {source}: {count:,} ({pct:.1f}%)")
+
+    return {"train": train, "eval": eval_ds}

@@ -1,0 +1,58 @@
+run:
+  name: "qwen3_600M_rlvr_MS_PPO"
+  mode: "rlvr"
+
+model:
+  type: "hf_causal"
+  id: "outputs/qwen_600M_sft_deepthought_math_optimal"
+  dtype: "bfloat16"
+  gradient_checkpointing: true
+
+tokenizer:
+  type: "hf"
+  id: "Qwen/Qwen3-0.6B-Base"
+
+data:
+  type: "rlvr_math"
+  source: "hf"
+  train_path: "allenai/RLVR-GSM"
+  name: null
+  max_prompt_len: 512
+  num_proc: 12
+
+grpo:
+  reward_function: "ppo_binary"
+  num_generations: 4
+  max_prompt_length: 512
+  max_completion_length: 768
+  beta: 0.01
+  scale_rewards: "group"
+  loss_type: "ppo"
+  epsilon: 0.1
+  temperature: 0.8
+  top_p: 0.95
+  top_k: 0
+  use_vllm: true
+  vllm_mode: "colocate"
+  vllm_gpu_memory_utilization: 0.5
+  vllm_enable_sleep_mode: false
+
+training:
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+
+  learning_rate: 5.0e-6
+  warmup_steps: 20
+  max_steps: 375
+
+  logging_steps: 10
+  save_steps: 125
+  eval_steps: 125
+
+  bf16: true
+
+  output_dir: "outputs/qwen3_600M_rlvr_MS_PPO"
+
+wandb:
+  tags: ["qwen3-0.6b", "rlvr", "ppo", "gsm8k", "multi-stage", "stage-1", "warmup", "format-learning"]

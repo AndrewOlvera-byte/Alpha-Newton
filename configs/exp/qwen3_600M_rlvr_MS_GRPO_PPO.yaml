@@ -13,7 +13,7 @@ tokenizer:
   id: "Qwen/Qwen3-0.6B-Base"
 
 data:
-  type: "rlvr_math"
+  type: "rlvr_allenai"
   source: "hf"
   train_path: "allenai/RLVR-GSM"
   name: null
@@ -27,7 +27,7 @@ grpo:
   max_completion_length: 768
   beta: 0.01
   scale_rewards: "group"
-  loss_type: "ppo"
+  loss_type: "dr_grpo"
   epsilon: 0.1
   temperature: 0.8
   top_p: 0.95

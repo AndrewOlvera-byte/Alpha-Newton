@@ -1,10 +1,10 @@
 run:
-  name: "qwen3_600M_rlvr_MS_DAPO"
+  name: "qwen3_600M_rlvr_MS_PPO"
   mode: "rlvr"
 
 model:
   type: "hf_causal"
-  id: "outputs/qwen3_600M_rlvr_MS_PPO_v2"
+  id: "outputs/qwen_600M_sft_deepthought_math_optimal"
   dtype: "bfloat16"
   gradient_checkpointing: true
 
@@ -13,22 +13,22 @@ tokenizer:
   id: "Qwen/Qwen3-0.6B-Base"
 
 data:
-  type: "rlvr_math"
+  type: "rlvr_allenai"
   source: "hf"
-  train_path: "allenai/RLVR-GSM-MATH-IF-Mixed-Constraints"
+  train_path: "allenai/RLVR-GSM"
   name: null
   max_prompt_len: 512
   num_proc: 12
 
 grpo:
-  reward_function: "dapo_advanced"
-  num_generations: 8
+  reward_function: "ppo_binary"
+  num_generations: 4
   max_prompt_length: 512
   max_completion_length: 768
-  beta: 0.002
+  beta: 0.01
   scale_rewards: "group"
-  loss_type: "dapo"
-  epsilon: 0.2
+  loss_type: "dr_grpo"
+  epsilon: 0.1
   temperature: 0.8
   top_p: 0.95
   top_k: 0
@@ -42,9 +42,13 @@ training:
   per_device_eval_batch_size: 2
   gradient_accumulation_steps: 8
 
-  learning_rate: 8.0e-6
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+
+  learning_rate: 1.0e-5
   warmup_steps: 50
-  max_steps: 625
+  max_steps: 375
 
   logging_steps: 10
   save_steps: 125
@@ -52,7 +56,7 @@ training:
 
   bf16: true
 
-  output_dir: "outputs/qwen3_600M_rlvr_MS_DAPO"
+  output_dir: "outputs/qwen3_600M_rlvr_MS_PPO_v2"
 
 wandb:
-  tags: ["qwen3-0.6b", "rlvr", "dapo", "gsm8k-math-if", "multi-stage", "stage-2", "reasoning-exploration"]
+  tags: ["qwen3-0.6b", "rlvr", "ppo", "gsm8k", "multi-stage", "stage-1", "warmup", "format-learning", "v2"]

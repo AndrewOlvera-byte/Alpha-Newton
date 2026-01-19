@@ -32,6 +32,17 @@ def extract_answer(text: str) -> Tuple[Optional[str], float]:
 
     return None, 0.0
 
+def extract_answer_GSM8K(text: str) -> Tuple[Optional[str], float]:
+    if not text:
+        return None, 0.0
+
+    after_think = text.split("</think>")[-1] if "</think>" in text else text
+
+    boxed_match = re.search(r'\\boxed\{([^}]+)\}', after_think)
+    if boxed_match:
+        return _normalize_answer(boxed_match.group(1)), 1.0
+    return None, 0.0
+
 
 def _normalize_answer(answer_str: str) -> str:
     answer_str = answer_str.strip()
@@ -100,15 +111,30 @@ def _extract_completion_text(completion):
 
 
 def ppo_reward_binary(prompts, completions, answer, **kwargs):
+    """
+    Binary reward function for PPO warmup stage.
+
+    Requires strict GSM8K format: answer must be in \\boxed{} tags.
+    This enforces format adherence learned during SFT.
+
+    Args:
+        prompts: List of prompt strings (repeated for each generation)
+        completions: List of completion strings
+        answer: List of ground truth answers (automatically repeated by TRL to match completions)
+        **kwargs: Additional fields from dataset
+
+    Returns:
+        List of rewards (1.0 for correct, 0.0 for incorrect)
+
+    Note: TRL automatically repeats all dataset fields to match num_generations,
+    so len(prompts) == len(completions) == len(answer).
+    """
     rewards = []
-    num_generations = len(completions) // len(prompts) if prompts else 1
 
-    for idx, completion in enumerate(completions):
-        prompt_idx = idx // num_generations
-        correct_answer = answer[prompt_idx] if prompt_idx < len(answer) else answer[0]
-
+    # TRL ensures all lists have the same length after repeating dataset fields
+    for completion, correct_answer in zip(completions, answer, strict=True):
         text = _extract_completion_text(completion)
-        extracted, confidence = extract_answer(text)
+        extracted, confidence = extract_answer_GSM8K(text)
         is_correct = compare_answers(extracted, str(correct_answer))
 
         reward = 1.0 if is_correct else 0.0
@@ -118,13 +144,38 @@ def ppo_reward_binary(prompts, completions, answer, **kwargs):
 
 
 def dapo_reward_advanced(prompts, completions, answer, **kwargs):
+    """
+    Advanced reward function for DAPO training with format quality bonuses.
+
+    Accepts flexible answer extraction but rewards proper formatting with bonuses.
+    Designed for later training stages after format has been learned.
+
+    Reward structure:
+    - Correct answer: 1.0 base
+      + 0.2 bonus for proper <think></think> tags
+      + up to 0.1 bonus based on extraction confidence
+    - Wrong but extractable answer: 0.2
+      + 0.1 bonus for proper <think> tags
+    - Malformed responses:
+      - 0.3 penalty for partial think tags (e.g., only opening tag)
+      - 0.2 penalty for very short responses (< 30 chars)
+
+    Args:
+        prompts: List of prompt strings (repeated for each generation)
+        completions: List of completion strings
+        answer: List of ground truth answers (automatically repeated by TRL to match completions)
+        **kwargs: Additional fields from dataset
+
+    Returns:
+        List of rewards (range: -0.5 to 1.3)
+
+    Note: TRL automatically repeats all dataset fields to match num_generations,
+    so len(prompts) == len(completions) == len(answer).
+    """
     rewards = []
-    num_generations = len(completions) // len(prompts) if prompts else 1
 
-    for idx, completion in enumerate(completions):
-        prompt_idx = idx // num_generations
-        correct_answer = answer[prompt_idx] if prompt_idx < len(answer) else answer[0]
-
+    # TRL ensures all lists have the same length after repeating dataset fields
+    for completion, correct_answer in zip(completions, answer, strict=True):
         text = _extract_completion_text(completion)
         extracted, confidence = extract_answer(text)
         is_correct = compare_answers(extracted, str(correct_answer))
@@ -157,13 +208,28 @@ def dapo_reward_advanced(prompts, completions, answer, **kwargs):
 
 
 def grpo_reward_reflection(prompts, completions, answer, **kwargs):
+    """
+    Binary reward function for GRPO reflection training.
+
+    Accepts flexible answer extraction for robustness.
+    Simple binary reward based only on correctness.
+
+    Args:
+        prompts: List of prompt strings (repeated for each generation)
+        completions: List of completion strings
+        answer: List of ground truth answers (automatically repeated by TRL to match completions)
+        **kwargs: Additional fields from dataset
+
+    Returns:
+        List of rewards (1.0 for correct, 0.0 for incorrect)
+
+    Note: TRL automatically repeats all dataset fields to match num_generations,
+    so len(prompts) == len(completions) == len(answer).
+    """
     rewards = []
-    num_generations = len(completions) // len(prompts) if prompts else 1
 
-    for idx, completion in enumerate(completions):
-        prompt_idx = idx // num_generations
-        correct_answer = answer[prompt_idx] if prompt_idx < len(answer) else answer[0]
-
+    # TRL ensures all lists have the same length after repeating dataset fields
+    for completion, correct_answer in zip(completions, answer, strict=True):
         text = _extract_completion_text(completion)
         extracted, confidence = extract_answer(text)
         is_correct = compare_answers(extracted, str(correct_answer))

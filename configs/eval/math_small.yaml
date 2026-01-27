@@ -11,7 +11,7 @@ runner:
   tasks: ["gsm8k"]
 
   num_fewshot: 0
-  batch_size: 8
+  batch_size: 16
 
   # Deterministic generation for comparable benchmark numbers
   apply_chat_template: true

@@ -13,15 +13,17 @@ tokenizer:
   id: "Qwen/Qwen3-0.6B-Base"
 
 data:
-  type: "rlvr_math"
+  type: "rlvr_allenai"
   source: "hf"
   train_path: "allenai/RLVR-GSM-MATH-IF-Mixed-Constraints"
   name: null
   max_prompt_len: 512
   num_proc: 12
+  classify_answer_types: true
+  exclude_datasets: ["ifeval"]
 
 grpo:
-  reward_function: "dapo_advanced"
+  reward_function: "dapo_deepseek"
   num_generations: 8
   max_prompt_length: 512
   max_completion_length: 768
@@ -55,4 +57,4 @@ training:
   output_dir: "outputs/qwen3_600M_rlvr_MS_DAPO"
 
 wandb:
-  tags: ["qwen3-0.6b", "rlvr", "dapo", "gsm8k-math-if", "multi-stage", "stage-2", "reasoning-exploration"]
+  tags: ["qwen3-0.6b", "rlvr", "dapo", "deepseek-style", "gsm8k-math", "multi-stage", "stage-2", "typed-extraction", "pure-math"]

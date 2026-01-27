@@ -1,9 +1,4 @@
 """
-Math SFT Dataset Builder with <think> tags and \\boxed{} formatting.
-
-A flexible, multi-dataset builder for Chain-of-Thought math SFT training
-Supports various math datasets with unified formatting and deduplication
-
 Output format:
     <think>
     {step-by-step reasoning}
@@ -35,6 +30,7 @@ from datasets import load_dataset, interleave_datasets
 
 from src.core.registry import register
 from src.builders.data import _tokenize_prompt_and_response, _pack_tokenized_dataset
+from src.rlvr.math_verifier import _classify_answer_type
 
 _THINK_OPEN_RE = re.compile(r"<think>\s*", flags=re.IGNORECASE)
 _THINK_CLOSE_RE = re.compile(r"\s*</think>", flags=re.IGNORECASE)
@@ -64,7 +60,6 @@ def _strip_tool_traces(text: str) -> str:
     text = _CODE_FENCE_RE.sub("", text)
     text = _EXECUTION_RE.sub("", text)
 
-    # Remove common OpenMathInstruct boilerplate lines
     text = re.sub(
         r"(?im)^\s*let'?s\s+(?:solve|write|use)\s+.*\s+(?:using|in|with)\s+(?:python|code|sympy).*$",
         "",
@@ -79,18 +74,12 @@ def _strip_tool_traces(text: str) -> str:
 
 
 def _strip_boxed_in_reasoning(text: str) -> str:
-    """
-    Prevents the model from seeing the final answer twice during training
-    """
     text = _BOXED_NESTED_RE.sub(r"\1", text)
     text = _BOXED_RE.sub(r"\1", text)
     return text.strip()
 
 
 def _extract_boxed_or_last_number(text: str) -> str:
-    """
-    Extract final answer from solution text
-    """
     m = _BOXED_NESTED_RE.search(text)
     if m:
         return m.group(1).strip()
@@ -149,7 +138,7 @@ def _normalize_messages(messages: List[Dict[str, Any]], strip_think_from_all: bo
 
 def _make_math_messages(user_text: str, reasoning_text: str, final_answer: str, system_prompt: Optional[str] = None) -> List[Dict[str, str]]:
     """
-    Create standardized messages with <think> and \\boxed{} format.
+    Create standardized messages with <think> and \\boxed{} format
     
     Output format:
         system: {system_prompt}
@@ -938,14 +927,16 @@ def build_rlvr_allenai_dataset(
     cache_dir: str = None,
     subset_pct: float = 100.0,
     name: str = None,
+    classify_answer_types: bool = True,
+    exclude_datasets: list = None,
     **kwargs
 ):
     """
     Build RLVR dataset from AllenAI format
 
     Supports:
-    - allenai/RLVR-GSM (7,473 samples)
-    - allenai/RLVR-GSM-MATH-IF-Mixed-Constraints (29,946 samples)
+    - allenai/RLVR-GSM (7,473 samples - pure GSM8K)
+    - allenai/RLVR-GSM-MATH-IF-Mixed-Constraints (29,946 samples - mixed)
 
     Dataset format:
         - messages: [{"role": "user", "content": "Question: ... Answer: ..."}]
@@ -954,11 +945,18 @@ def build_rlvr_allenai_dataset(
         - constraint_type: Optional constraint metadata
         - constraint: Optional constraint details
 
+    Args:
+        classify_answer_types: If True, pre-compute answer types for efficient
+            reward computation (recommended for mixed datasets with MATH)
+        exclude_datasets: List of dataset sources to exclude (e.g., ["IF"] to remove
+            instruction-following samples and focus purely on math reasoning)
+
     Returns:
         Dict with 'train' and 'eval' datasets containing:
         - prompt: str (ready for generation)
         - answer: str (ground truth for reward computation)
         - dataset_source: str (for filtering/analysis)
+        - answer_type: str (numeric/latex/symbolic/text - if classify_answer_types=True)
         - metadata: dict (original fields for advanced reward functions)
     """
     assert source in ("hf", "local"), f"Invalid source: {source}"
@@ -971,6 +969,27 @@ def build_rlvr_allenai_dataset(
     print(f"[RLVR AllenAI] Loaded: {train_path}")
     print(f"[RLVR AllenAI] Total samples: {len(dataset):,}")
 
+    # Filter out excluded datasets (e.g., IF for pure math focus)
+    if exclude_datasets and len(exclude_datasets) > 0:
+        print(f"[RLVR AllenAI] Excluding datasets: {exclude_datasets}")
+
+        # Show distribution before filtering
+        if "dataset" in dataset.column_names:
+            sources_before = {}
+            for item in dataset["dataset"]:
+                sources_before[item] = sources_before.get(item, 0) + 1
+            print(f"[RLVR AllenAI] Distribution before filtering:")
+            for source, count in sorted(sources_before.items()):
+                pct = 100 * count / len(dataset)
+                print(f"  - {source}: {count:,} ({pct:.1f}%)")
+
+        def should_keep(sample):
+            ds = sample.get("dataset", "")
+            return ds not in exclude_datasets
+
+        dataset = dataset.filter(should_keep, num_proc=num_proc, desc="Filtering datasets")
+        print(f"[RLVR AllenAI] After filtering: {len(dataset):,} samples")
+
     if subset_pct < 100.0:
         n_samples = int(len(dataset) * subset_pct / 100)
         dataset = dataset.select(range(n_samples))
@@ -981,6 +1000,16 @@ def build_rlvr_allenai_dataset(
     eval_ds = split["test"]
 
     print(f"[RLVR] Train: {len(train):,} | Eval: {len(eval_ds):,}")
+
+    # Check if diverse sampling is enabled
+    diverse_config = kwargs.get("diverse_sampling", {})
+    diverse_enabled = diverse_config.get("enabled", False)
+
+    if diverse_enabled:
+        print(f"[RLVR] Diverse sampling ENABLED - storing raw questions for dynamic prompting")
+        print(f"[RLVR]   Trainer will cycle through discrete configs for reproducible diversity")
+    else:
+        print(f"[RLVR] Diverse sampling DISABLED - using static prompt formatting")
 
     def format_sample(sample):
         messages = sample.get("messages", [])
@@ -993,14 +1022,6 @@ def build_rlvr_allenai_dataset(
         if not content:
             raise ValueError(f"Message has no content: {user_message}")
 
-        formatted_messages = [{"role": "user", "content": content}]
-
-        prompt = tokenizer.apply_chat_template(
-            formatted_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
         ground_truth = sample.get("ground_truth", "")
         answer = str(ground_truth).strip()
 
@@ -1012,22 +1033,52 @@ def build_rlvr_allenai_dataset(
             "constraint": sample.get("constraint"),
         }
 
-        return {
-            "prompt": prompt,
-            "answer": answer,
-            "dataset_source": dataset_source,
-            "metadata": str(metadata),
-        }
+        if diverse_enabled:
+            result = {
+                # In diverse mode, keep the GRPO/TRL interface stable by providing a
+                # string `prompt` field, but store the raw question text (unformatted)
+                # The rollout_func will inject system prompts + chat template
+                "prompt": content,
+                "answer": answer,
+                "dataset_source": dataset_source,
+                "metadata": str(metadata),
+            }
+        else:
+            formatted_messages = [{"role": "user", "content": content}]
+
+            prompt = tokenizer.apply_chat_template(
+                formatted_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+            result = {
+                "prompt": prompt,
+                "answer": answer,
+                "dataset_source": dataset_source,
+                "metadata": str(metadata),
+            }
+
+        if classify_answer_types:
+            answer_type = _classify_answer_type(answer)
+            result["answer_type"] = answer_type
+
+        return result
 
     train = train.map(format_sample, num_proc=num_proc, desc="Formatting train")
     eval_ds = eval_ds.map(format_sample, num_proc=num_proc, desc="Formatting eval")
 
-    train = train.select_columns(["prompt", "answer", "dataset_source", "metadata"])
-    eval_ds = eval_ds.select_columns(["prompt", "answer", "dataset_source", "metadata"])
+    # Always keep `prompt` to satisfy TRL GRPO's expected interface.
+    columns_to_keep = ["prompt", "answer", "dataset_source", "metadata"]
+
+    if classify_answer_types:
+        columns_to_keep.append("answer_type")
+
+    train = train.select_columns(columns_to_keep)
+    eval_ds = eval_ds.select_columns(columns_to_keep)
 
     print(f"[RLVR] Formatted for GRPO training")
 
-    
     if "dataset_source" in train.column_names:
         sources = {}
         for item in train["dataset_source"]:
@@ -1036,5 +1087,14 @@ def build_rlvr_allenai_dataset(
         for source, count in sorted(sources.items()):
             pct = 100 * count / len(train)
             print(f"  - {source}: {count:,} ({pct:.1f}%)")
+
+    if classify_answer_types and "answer_type" in train.column_names:
+        answer_types = {}
+        for item in train["answer_type"]:
+            answer_types[item] = answer_types.get(item, 0) + 1
+        print(f"[RLVR] Answer type distribution:")
+        for ans_type, count in sorted(answer_types.items()):
+            pct = 100 * count / len(train)
+            print(f"  - {ans_type}: {count:,} ({pct:.1f}%)")
 
     return {"train": train, "eval": eval_ds}

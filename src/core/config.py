@@ -52,6 +52,7 @@ class Config:
     training: Dict[str, Any]
     wandb: Dict[str, Any]
     grpo: Dict[str, Any] = None  # RLVR/GRPO specific config
+    topk_eval: Dict[str, Any] = None  # Top-K checkpoint callback config
 
     @classmethod
     def load(cls, path: str | Path, base_configs: List[str | Path] = None):
@@ -71,7 +72,7 @@ class Config:
 
         merged = interpolate_variables(merged)
 
-        known_fields = {'run', 'model', 'tokenizer', 'data', 'training', 'wandb', 'grpo'}
+        known_fields = {'run', 'model', 'tokenizer', 'data', 'training', 'wandb', 'grpo', 'topk_eval'}
         filtered = {k: v for k, v in merged.items() if k in known_fields}
 
         return cls(**filtered)

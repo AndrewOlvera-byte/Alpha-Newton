@@ -1,0 +1,103 @@
+run:
+  name: "qwen3_600M_rlvr_MS_DAPO_v2"
+  mode: "rlvr"
+
+model:
+  type: "hf_causal"
+  id: "outputs/qwen3_600M_rlvr_MS_GRPO_S1/checkpoint-250"
+  dtype: "bfloat16"
+  gradient_checkpointing: true
+
+tokenizer:
+  type: "hf"
+  id: "Qwen/Qwen3-0.6B-Base"
+
+data:
+  type: "rlvr_allenai"
+  source: "hf"
+  train_path: "allenai/RLVR-GSM-MATH-IF-Mixed-Constraints"
+  eval_path: null
+  name: null
+  max_prompt_len: 512
+  num_proc: 12
+  classify_answer_types: true
+  exclude_datasets: ["ifeval"]
+
+grpo:
+  reward_function: "dapo_diverse_stable"
+  num_generations: 16
+  max_prompt_length: 512
+  max_completion_length: 768
+  beta: 0.015
+
+  scale_rewards: "group"
+  loss_type: "dapo"
+
+  epsilon: 0.12
+  temperature: 0.9
+  top_p: 0.95
+  top_k: 0
+  use_vllm: true
+  vllm_mode: "colocate"
+  vllm_gpu_memory_utilization: 0.5
+  vllm_enable_sleep_mode: true
+
+  diverse_sampling:
+    enabled: true
+
+    sampling_configs:
+      - temperature: 0.7
+        top_p: 0.92
+      - temperature: 0.85
+        top_p: 0.95
+      - temperature: 1.0
+        top_p: 0.97
+      - temperature: 1.15
+        top_p: 0.98
+
+    modes_per_cycle: 2
+
+    system_prompts:
+      - "Think step by step and show your reasoning clearly."
+      - "Work backwards from what you need to find."
+      - "Identify the key equations and solve algebraically."
+      - "First plan your approach, then execute the solution."
+      - "Break this into smaller sub-problems and solve each."
+      - "Look for patterns or use similar problem-solving strategies."
+      - "Visualize or diagram the problem before solving."
+      - "Estimate first, then solve precisely and verify."
+
+training:
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 16
+
+  learning_rate: 1.2e-5
+  lr_scheduler_type: "cosine"
+  warmup_steps: 75
+
+  max_steps: 700
+
+  logging_steps: 10
+  save_strategy: "steps"
+  save_steps: 350
+
+  bf16: true
+
+  output_dir: "outputs/qwen3_600M_rlvr_MS_DAPO_v2"
+
+wandb:
+  tags: ["qwen3-0.6b", "rlvr", "dapo-diverse", "gsm8k-math", "multi-stage", "stage-2", "v2", "16-gen", "diverse-sampling", "modes-2", "beta-0.015", "eps-0.12", "1500-steps", "cosine-decay", "convergence-tuned"]
+
+topk_eval:
+  enabled: true
+  mode: "gsm"
+  k: 7
+  eval_dataset_path: "held_out/gsm_eval.jsonl"
+  eval_every_n_steps: 10
+  source_type: "local"
+  reward_function: "dapo_diverse_stable"
+  difficulty_weights:
+    level1: 1.0
+    level2: 1.5
+    level3: 2.0

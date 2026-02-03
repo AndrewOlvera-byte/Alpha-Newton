@@ -1,0 +1,30 @@
+# Math eval for paper: GSM8K (full test set ~1,319 examples)
+# Uses vLLM backend for 10-20x speedup over HuggingFace
+
+suite:
+  name: "math_paper_gsm"
+
+runner:
+  backend: "lm_eval"
+  model: "vllm"  # vLLM for massive speedup
+
+  tasks: ["gsm8k"]
+
+  num_fewshot: 0  # 0-shot evaluation (standard for reporting)
+  batch_size: 128  # vLLM handles large batches efficiently
+
+  # Deterministic generation for comparable benchmark numbers
+  apply_chat_template: true
+  gen_kwargs:
+    do_sample: false
+    temperature: 0.0
+    # Note: max_tokens handled internally by lm-eval for vLLM backend
+
+  # vLLM-specific optimizations
+  vllm_args:
+    tensor_parallel_size: 1      # Set to num_gpus if multi-GPU
+    gpu_memory_utilization: 0.9  # Higher for eval-only
+    max_model_len: 4096
+
+output:
+  path: null  # Defaults to outputs/<run.name>/eval/math_paper_gsm/

@@ -103,6 +103,8 @@ def main(exp_name: str):
                     output_dir=output_dir,
                     trainer=trainer,
                     tokenizer=tokenizer,
+                    eval_batch_size=cfg.topk_eval.get('eval_batch_size', 8),
+                    use_compile=cfg.topk_eval.get('use_compile', False),
                 )
                 print(f"[RLVR] Added GSMTopKCheckpointCallback (simple accuracy)")
             elif callback_mode == 'mixed':
@@ -116,6 +118,8 @@ def main(exp_name: str):
                     output_dir=output_dir,
                     trainer=trainer,
                     tokenizer=tokenizer,
+                    eval_batch_size=cfg.topk_eval.get('eval_batch_size', 8),
+                    use_compile=cfg.topk_eval.get('use_compile', False),
                 )
                 print(f"[RLVR] Added MixedDifficultyTopKCheckpointCallback (weighted accuracy)")
                 print(f"[RLVR]   - Difficulty weights: {cfg.topk_eval.get('difficulty_weights')}")

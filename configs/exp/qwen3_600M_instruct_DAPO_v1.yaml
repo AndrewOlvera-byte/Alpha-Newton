@@ -1,0 +1,77 @@
+run:
+  name: "qwen3_600M_instruct_DAPO_v1"
+  mode: "rlvr"
+
+model:
+  type: "hf_causal"
+  id: "Qwen/Qwen3-0.6B"  # Using base instruct model with thinking capability
+  dtype: "bfloat16"
+  gradient_checkpointing: true
+
+tokenizer:
+  type: "hf"
+  id: "Qwen/Qwen3-0.6B"  # Chat template with enable_thinking=true by default
+
+data:
+  type: "rlvr_allenai"
+  source: "hf"
+  train_path: "allenai/RLVR-GSM"  # GSM-only dataset (7,473 samples)
+  eval_path: null
+  name: null
+  max_prompt_len: 512
+  num_proc: 12
+  classify_answer_types: false  # GSM is all numeric, no need for classification
+
+grpo:
+  reward_function: "dapo_R1_dense"
+  num_generations: 16
+  max_prompt_length: 512
+  max_completion_length: 768  # Longer for thinking tags
+  beta: 0.015
+
+  scale_rewards: "group"
+  loss_type: "dapo"
+
+  epsilon: 0.08
+  temperature: 0.8  # Balanced for thinking mode exploration
+  top_p: 0.95
+  top_k: 20  # Recommended for Qwen3 thinking mode
+  use_vllm: true
+  vllm_mode: "colocate"
+  vllm_gpu_memory_utilization: 0.5
+  vllm_enable_sleep_mode: true
+
+training:
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 16  # Effective batch = 32
+
+  learning_rate: 5.0e-6  # Conservative for instruct model
+  lr_scheduler_type: "constant_with_warmup"
+  warmup_steps: 25
+
+  max_steps: 250  # ~1 epoch over 7,473 samples (effective batch 32)
+
+  logging_steps: 10
+  save_strategy: "steps"
+  save_steps: 125  # Save mid-epoch and at end
+
+  bf16: true
+
+  output_dir: "outputs/qwen3_600M_instruct_DAPO_v1"
+
+wandb:
+  tags: ["qwen3-0.6b", "rlvr", "dapo", "gsm8k", "instruct-base", "thinking-enabled", "v1", "16-gen", "1-epoch", "R1-format", "think-answer-tags"]
+
+topk_eval:
+  enabled: true
+  mode: "gsm"
+  k: 7
+  eval_dataset_path: "held_out/gsm_eval.jsonl"
+  eval_every_n_steps: 10
+  source_type: "local"
+  reward_function: "dapo_R1_dense"
+  difficulty_weights:
+    level1: 1.0
+    level2: 1.5
+    level3: 2.0

@@ -156,9 +156,10 @@ def _print_summary(results: Dict[str, Any]) -> None:
 def _build_model_args(
     pretrained: str,
     training_cfg: Optional[Config] = None,
+    vllm_args: Optional[Dict[str, Any]] = None,
 ) -> str:
     parts = [f"pretrained={pretrained}"]
-    
+
     if training_cfg is not None:
         if training_cfg.model.get("trust_remote_code", False):
             parts.append("trust_remote_code=True")
@@ -166,7 +167,16 @@ def _build_model_args(
             parts.append(f"dtype={dtype}")
         if revision := training_cfg.model.get("revision"):
             parts.append(f"revision={revision}")
-    
+
+    # Add vLLM-specific args if provided
+    if vllm_args:
+        for k, v in vllm_args.items():
+            if isinstance(v, bool):
+                v_str = "true" if v else "false"
+            else:
+                v_str = str(v)
+            parts.append(f"{k}={v_str}")
+
     return ",".join(parts)
 
 
@@ -259,8 +269,9 @@ Examples:
     batch_size = args.batch_size or runner.get("batch_size", 4)
     apply_chat_template = bool(runner.get("apply_chat_template", True))
     gen_kwargs = runner.get("gen_kwargs", {}) or {}
+    vllm_args = runner.get("vllm_args", {}) or {}
 
-    model_args = _build_model_args(pretrained, training_cfg)
+    model_args = _build_model_args(pretrained, training_cfg, vllm_args)
 
     suite_name = (suite_cfg.get("suite", {}) or {}).get("name", args.suite)
     output_cfg = suite_cfg.get("output", {}) or {}

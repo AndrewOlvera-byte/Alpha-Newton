@@ -45,6 +45,7 @@ class BaseTopKCheckpointCallback(TrainerCallback):
         trainer = None,
         tokenizer = None,
         eval_batch_size: int = 8,
+        use_compile: bool = False,
     ):
         self.k = k
         self.eval_dataset_path = eval_dataset_path
@@ -54,6 +55,7 @@ class BaseTopKCheckpointCallback(TrainerCallback):
         self.source_type = source_type
         self.output_dir = output_dir
         self.eval_batch_size = eval_batch_size
+        self.use_compile = use_compile
 
         # Store trainer and tokenizer references
         self.trainer = trainer
@@ -71,6 +73,7 @@ class BaseTopKCheckpointCallback(TrainerCallback):
         self.eval_dataset = None
         self.reward_fn = None
         self.last_eval_step = -1
+        self.compiled_model = None
 
     def _load_eval_dataset(self):
         """Load held-out evaluation dataset."""
@@ -178,6 +181,18 @@ class BaseTopKCheckpointCallback(TrainerCallback):
         # Switch to eval mode
         model.eval()
         device = next(model.parameters()).device
+
+        # Compile model for faster generation (PyTorch 2.0+)
+        if self.use_compile and self.compiled_model is None:
+            print("[TopK Callback] Compiling model for faster eval (first run only)...")
+            try:
+                self.compiled_model = torch.compile(model, mode="reduce-overhead")
+                print("[TopK Callback] ✓ Model compiled successfully")
+            except Exception as e:
+                print(f"[TopK Callback] Warning: Could not compile model: {e}")
+                self.compiled_model = model
+
+        eval_model = self.compiled_model if self.use_compile and self.compiled_model else model
         completions = []
 
         with torch.no_grad():
@@ -189,17 +204,18 @@ class BaseTopKCheckpointCallback(TrainerCallback):
                     return_tensors="pt",
                     padding=True,
                     truncation=True,
-                    max_length=512,
+                    max_length=384,  # Match training max_prompt_length
                 )
                 inputs = {k: v.to(device) for k, v in inputs.items()}
 
-                outputs = model.generate(
+                outputs = eval_model.generate(
                     **inputs,
-                    max_new_tokens=768,
+                    max_new_tokens=400,  # Reduced from 768 (GSM8K rarely needs more)
                     do_sample=False,  # Greedy decoding for deterministic eval
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                     use_cache=True,  # Enable KV cache for efficiency
+                    early_stopping=True,  # Stop at EOS token
                 )
 
                 for j, output_ids in enumerate(outputs):
@@ -415,6 +431,7 @@ class GSMTopKCheckpointCallback(BaseTopKCheckpointCallback):
         trainer = None,
         tokenizer = None,
         eval_batch_size: int = 8,
+        use_compile: bool = False,
     ):
         super().__init__(
             k=k,
@@ -427,6 +444,7 @@ class GSMTopKCheckpointCallback(BaseTopKCheckpointCallback):
             trainer=trainer,
             tokenizer=tokenizer,
             eval_batch_size=eval_batch_size,
+            use_compile=use_compile,
         )
 
     def _compute_metrics(
@@ -455,13 +473,31 @@ class GSMTopKCheckpointCallback(BaseTopKCheckpointCallback):
         total = len(rewards)
         accuracy = correct / total if total > 0 else 0.0
 
+        # Compute format consistency (valid think tags and boxed answers)
+        from src.rlvr.math_verifier import check_format_quality, extract_answer_typed
+
+        valid_format_count = 0
+        for completion in completions:
+            fmt = check_format_quality(completion)
+            _, _, _, used_boxed = extract_answer_typed(completion)
+
+            # Valid format: proper think tags OR boxed answer (lenient for eval)
+            has_valid_think = fmt["has_think_tags"] and not fmt["has_partial_tags"]
+            has_valid_format = has_valid_think or used_boxed
+
+            if has_valid_format:
+                valid_format_count += 1
+
+        format_consistency = valid_format_count / total if total > 0 else 0.0
+
         metrics = {
             "held_out_accuracy": accuracy,
             "held_out_correct": correct,
             "held_out_total": total,
+            "format_consistency": format_consistency,
         }
 
-        print(f"[GSM TopK] Results: {correct}/{total} correct ({accuracy*100:.1f}%)")
+        print(f"[GSM TopK] Results: {correct}/{total} correct ({accuracy*100:.1f}%), format: {format_consistency*100:.1f}%")
 
         return metrics
 
@@ -486,6 +522,7 @@ class MixedDifficultyTopKCheckpointCallback(BaseTopKCheckpointCallback):
         trainer = None,
         tokenizer = None,
         eval_batch_size: int = 8,
+        use_compile: bool = False,
     ):
         super().__init__(
             k=k,
@@ -498,6 +535,7 @@ class MixedDifficultyTopKCheckpointCallback(BaseTopKCheckpointCallback):
             trainer=trainer,
             tokenizer=tokenizer,
             eval_batch_size=eval_batch_size,
+            use_compile=use_compile,
         )
         self.difficulty_weights = difficulty_weights or {"default": 1.0}
 
@@ -552,14 +590,32 @@ class MixedDifficultyTopKCheckpointCallback(BaseTopKCheckpointCallback):
         total_correct = sum(1 for r in rewards if r > 0.5)
         raw_accuracy = total_correct / len(rewards) if len(rewards) > 0 else 0.0
 
+        # Compute format consistency
+        from src.rlvr.math_verifier import check_format_quality, extract_answer_typed
+
+        valid_format_count = 0
+        for completion in completions:
+            fmt = check_format_quality(completion)
+            _, _, _, used_boxed = extract_answer_typed(completion)
+
+            # Valid format: proper think tags OR boxed answer
+            has_valid_think = fmt["has_think_tags"] and not fmt["has_partial_tags"]
+            has_valid_format = has_valid_think or used_boxed
+
+            if has_valid_format:
+                valid_format_count += 1
+
+        format_consistency = valid_format_count / len(rewards) if len(rewards) > 0 else 0.0
+
         metrics = {
             "held_out_weighted_accuracy": weighted_accuracy,
             "held_out_raw_accuracy": raw_accuracy,
             "held_out_total": len(rewards),
+            "format_consistency": format_consistency,
             **difficulty_accuracies,
         }
 
-        print(f"[Mixed TopK] Weighted: {weighted_accuracy:.4f}, Raw: {raw_accuracy:.4f}")
+        print(f"[Mixed TopK] Weighted: {weighted_accuracy:.4f}, Raw: {raw_accuracy:.4f}, Format: {format_consistency:.4f}")
 
         return metrics
 

@@ -865,9 +865,11 @@ def dapo_diverse_stable(prompts, completions, answer, **kwargs):
 
     Key properties:
     - Narrow range [-0.8, 1.2]
-    - No (or tiny) reward jitter
+    - No reward jitter
     - Cheap repetition penalty
-    - Wrong answers get small format shaping signal (prevents collapse)
+    - Wrong answers get minimal/no shaping (prevents GRPO training on style when all wrong)
+    - Smooth penalties instead of cliffs
+    - No confidence-based rewards (prevents reward hacking)
     """
     rewards = []
 
@@ -875,9 +877,19 @@ def dapo_diverse_stable(prompts, completions, answer, **kwargs):
     if not isinstance(dataset_source, list):
         dataset_source = [dataset_source] * len(completions)
 
-    for idx, (completion, correct_answer) in enumerate(zip(completions, answer, strict=True)):
+    # TRL behavior with custom rollout_func:
+    # - If batch_size=2, num_generations=16:
+    # - TRL passes: len(prompts)=2 (unreplicated), len(completions)=32, len(answer)=2
+    # - Completions are ordered: [p0_g0, p0_g1, ..., p0_g15, p1_g0, p1_g1, ..., p1_g15, ...]
+    # - We return 32 rewards (one per completion)
+    num_generations = len(completions) // len(answer) if len(answer) > 0 else 1
+
+    for idx, completion in enumerate(completions):
+        # Map completion idx to prompt idx: completion i corresponds to prompt i // num_generations
+        prompt_idx = idx // num_generations
+        correct_answer = answer[prompt_idx]
         text = _extract_completion_text(completion)
-        ds_source = dataset_source[idx] if idx < len(dataset_source) else "unknown"
+        ds_source = dataset_source[prompt_idx] if prompt_idx < len(dataset_source) else "unknown"
 
         extracted, answer_type, confidence, used_boxed = extract_answer_typed(text)
         is_correct = compare_answers_typed(extracted, str(correct_answer), pred_type=answer_type)
@@ -895,71 +907,78 @@ def dapo_diverse_stable(prompts, completions, answer, **kwargs):
 
         # ========= Weights (fixed, smooth) =========
         w_struct_correct = 0.30
-        w_depth_correct  = 0.20
-
-        # wrong-answer shaping: cap it strictly
-        w_struct_wrong = 0.12
+        w_depth_correct  = 0.10  # Reduced from 0.20 to limit verbosity incentive
 
         # ========= Base reward =========
         reward = 1.0 if is_correct else 0.0
 
-        # ========= Bonuses =========
+        # ========= Bonuses (ONLY for correct answers) =========
         if is_correct:
             # boxed bonus
             if has_boxed:
                 reward += 0.15
 
-            # contract bonus
-            if struct_score > 0.75:
-                reward += 0.15
-
+            # Continuous structure bonus (removed cliff bonus to avoid saturation)
             reward += w_struct_correct * struct_score
 
-            # Depth: saturating bonus (prevents verbosity incentive)
+            # Depth: saturating bonus with cap to prevent excessive verbosity
+            # Cap at 250 tokens and use faster saturation curve
             if work_len > 0:
-                depth_bonus = 1 - math.exp(-work_len / 220.0)
+                capped_work_len = min(work_len, 250)
+                depth_bonus = 1 - math.exp(-capped_work_len / 120.0)
                 reward += w_depth_correct * depth_bonus
-
-            # tiny confidence bonus
-            reward += 0.03 * confidence
 
             # optional: slightly encourage heavier work on MATH
             if "math" in str(ds_source).lower() and work_len > 350:
                 reward += 0.05
 
         else:
-            # wrong-answer shaping: encourage contract adherence but capped
-            if extracted is not None and struct_score > 0.6 and total_len < 2500 and not refusal:
-                reward += w_struct_wrong * struct_score  # max ~0.12
+            # Fix 1: Minimal wrong-answer shaping with small spread for extractability
+            # Prevents flat reward batches while avoiding style training
+            if extracted is not None:
+                reward = -0.03  # extractable but wrong
+            else:
+                reward = -0.12  # no extractable answer
 
-        # ========= Penalties =========
+        # ========= Penalties (smooth, not cliff-like) =========
+        # Partial tags penalty (malformed format)
         if fmt["has_partial_tags"] and not fmt["has_think_tags"]:
             reward -= 0.4
 
+        # Smooth extraction penalty (Fix 3)
         if extracted is None:
-            reward -= 0.25
+            reward -= 0.20  # slightly reduced from 0.25
 
-        # penalize missing structure hard
-        if struct_score < 0.35:
-            reward -= 0.25
+        # Smooth structure penalty based on score (Fix 3)
+        # Instead of cliff at 0.35, use smooth penalty
+        if struct_score < 0.5:
+            struct_penalty = (0.5 - struct_score) * 0.40  # max 0.20 penalty
+            reward -= struct_penalty
 
-        # penalize not boxing answer if ANSWER exists
+        # Smooth boxing penalty (Fix 3)
         if sections["has_answer"] and not has_boxed:
-            reward -= 0.20
+            reward -= 0.15  # slightly reduced from 0.20
 
+        # Strong refusal penalty (kept strong as this is critical)
         if refusal:
             reward -= 0.6
 
         # repetition penalty (cheap)
         reward -= repeat_pen
 
-        # length sanity penalties
+        # Smooth length penalties (Fix 3)
         if total_len < 60:
-            reward -= 0.25
+            reward -= 0.20  # slightly reduced from 0.25
+        elif total_len < 100:
+            # Smooth transition instead of cliff
+            reward -= 0.10
+
         if total_len > 4500:
-            reward -= 0.25
+            # Smooth penalty for long outputs
+            excess_penalty = min(0.30, (total_len - 4500) / 10000.0)
+            reward -= excess_penalty
         if total_len > 6500:
-            reward -= 0.55
+            reward -= 0.50  # slightly reduced from 0.55
 
         # clamp
         reward = max(-0.8, min(1.2, reward))
@@ -968,6 +987,12 @@ def dapo_diverse_stable(prompts, completions, answer, **kwargs):
     return rewards
 
 
+
+
+def _get_dapo_R1_dense():
+    """Lazy import to avoid circular dependency."""
+    from src.rlvr.math_rewards_v2 import dapo_R1_dense
+    return dapo_R1_dense
 
 
 REWARD_FUNCTIONS = {
@@ -981,10 +1006,14 @@ REWARD_FUNCTIONS = {
 
 
 def get_reward_function(name: str):
+    # Handle lazy-loaded reward functions
+    if name == "dapo_R1_dense":
+        return _get_dapo_R1_dense()
+
     if name not in REWARD_FUNCTIONS:
         raise ValueError(
             f"Unknown reward function: {name}. "
-            f"Available: {list(REWARD_FUNCTIONS.keys())}"
+            f"Available: {list(REWARD_FUNCTIONS.keys()) + ['dapo_R1_dense']}"
         )
     return REWARD_FUNCTIONS[name]
 

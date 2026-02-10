@@ -1,5 +1,5 @@
 run:
-  name: "qwen3_600M_p1_grpo_K32"
+  name: "qwen3_600M_p1_dapo_K32_1200"
   mode: "rlvr"
 
 model:
@@ -28,7 +28,7 @@ grpo:
   max_completion_length: 400
   beta: 0.03
   scale_rewards: "group"
-  loss_type: "grpo"
+  loss_type: "dapo"
   epsilon: 0.10
   temperature: 0.9
   top_p: 1.0
@@ -50,17 +50,17 @@ training:
   learning_rate: 1.0e-5
   lr_scheduler_type: "constant_with_warmup"
   warmup_steps: 50
-  max_steps: 780
+  max_steps: 1200
 
   logging_steps: 1
   save_strategy: "no"
 
   bf16: true
 
-  output_dir: "outputs/qwen3_600M_p1_grpo_K32"
+  output_dir: "outputs/qwen3_600M_p1_dapo_K32_1200"
 
 wandb:
-  tags: ["qwen3-0.6b", "rlvr", "grpo", "gsm8k", "p1", "32-gen"]
+  tags: ["qwen3-0.6b", "rlvr", "dapo", "gsm8k", "p1", "32-gen", "1200-steps"]
 
 topk_eval:
   enabled: true

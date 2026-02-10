@@ -987,6 +987,308 @@ def dapo_diverse_stable(prompts, completions, answer, **kwargs):
     return rewards
 
 
+def _compute_quality_score(text: str, extracted: Optional[str], is_correct: bool) -> float:
+    """
+    Compute deterministic quality score in range [0, 100].
+
+    Scoring breakdown:
+    - Correctness: 40 points (binary)
+    - Structure: 25 points (PLAN/WORK/ANSWER quality)
+    - Format: 15 points (boxed + tags)
+    - Depth: 10 points (work section substance)
+    - Conciseness: 5 points (length appropriateness)
+    - Repetition: 5 points (non-repetitive content)
+
+    Args:
+        text: Completion text to score
+        extracted: Extracted answer (or None if not extractable)
+        is_correct: Whether the extracted answer is correct
+
+    Returns:
+        Score in range [0, 100]
+    """
+    score = 0.0
+
+    # 1. Correctness: 40 points
+    if is_correct:
+        score += 40.0
+
+    # 2. Structure: 25 points (PLAN/WORK/ANSWER quality)
+    struct_score, sections = _structure_score_plan_work_answer(text)
+    score += 25.0 * struct_score
+
+    # 3. Format: 15 points
+    fmt = check_format_quality(text)
+    has_boxed = _has_boxed_answer(text)
+
+    # Complete tags: 7.5 points
+    if fmt["has_think_tags"]:
+        score += 7.5
+
+    # Boxed answer: 7.5 points
+    if has_boxed:
+        score += 7.5
+
+    # 4. Depth: 10 points (work section substance)
+    work_len = len(sections.get("work", ""))
+    if work_len > 0:
+        # Saturate at 400 chars for 10 points
+        depth_score = min(work_len / 400.0, 1.0) * 10.0
+        score += depth_score
+
+    # 5. Conciseness: 5 points (penalize extremes)
+    total_len = len(text)
+    conciseness_score = 5.0
+    if total_len < 80:
+        conciseness_score = 0.0
+    elif total_len < 150:
+        conciseness_score = 2.5
+    elif total_len > 5000:
+        conciseness_score = 2.5
+    elif total_len > 6000:
+        conciseness_score = 0.0
+    score += conciseness_score
+
+    # 6. Repetition: 5 points (non-repetitive)
+    repeat_pen = _cheap_repeat_penalty(text)
+    repetition_score = max(0.0, 5.0 - repeat_pen * 10.0)
+    score += repetition_score
+
+    return min(100.0, max(0.0, score))
+
+
+def dapo_rank_stratified(prompts, completions, answer, **kwargs):
+    """
+    Stratified ranking reward with deterministic quality scoring.
+
+    Ranks completions within correctness tiers to preserve absolute signal
+    while adding relative quality comparisons.
+
+    Correctness tiers:
+    - Correct answers: ranked by quality → [0.0, 1.0]
+    - Wrong answers: ranked by quality → [-1.0, -0.01]
+
+    Quality scoring (deterministic, 0-100 scale):
+    - Correctness: 40 points (binary)
+    - Structure (PLAN/WORK/ANSWER): 25 points
+    - Format (\\boxed{} + tags): 15 points
+    - Depth (work section length): 10 points
+    - Conciseness (length appropriateness): 5 points
+    - Repetition (non-repetitive): 5 points
+
+    Reward range: [-1.0, 1.0]
+
+    Key properties:
+    - Preserves correctness as primary signal (can't rank wrong > correct)
+    - Adds relative quality signal within tier (distinguishes similar answers)
+    - Deterministic and reproducible (no stochastic scoring)
+    - Handles edge cases (single completion in tier, all same score)
+
+    Edge cases:
+    - Single correct in batch: gets +0.5 (midpoint of [0, 1])
+    - All wrong in batch: ranked [-1, 0] by quality
+    - Tied scores: ranked by original order (stable sort)
+
+    Args:
+        prompts: List of prompt strings
+        completions: List of completion strings
+        answer: List of ground truth answers
+        **kwargs: Additional fields (dataset_source, etc.)
+
+    Returns:
+        List of rewards in range [-1.0, 1.0]
+    """
+    rewards = []
+
+    dataset_source = kwargs.get("dataset_source", [])
+    if not isinstance(dataset_source, list):
+        dataset_source = [dataset_source] * len(completions)
+
+    # Handle TRL behavior with custom rollout_func
+    num_generations = len(completions) // len(answer) if len(answer) > 0 else 1
+
+    # Process all completions and compute quality scores
+    completion_data = []
+    for idx, completion in enumerate(completions):
+        prompt_idx = idx // num_generations
+        correct_answer = answer[prompt_idx]
+        text = _extract_completion_text(completion)
+
+        # Strict boxed extraction (like ppo_binary)
+        extracted, _ = extract_answer_GSM8K(text)
+        is_correct = compare_answers(extracted, str(correct_answer))
+
+        # Compute deterministic quality score [0, 100]
+        quality_score = _compute_quality_score(text, extracted, is_correct)
+
+        completion_data.append({
+            'idx': idx,
+            'is_correct': is_correct,
+            'quality_score': quality_score,
+        })
+
+    # Stratify into correct and wrong tiers
+    correct_tier = [d for d in completion_data if d['is_correct']]
+    wrong_tier = [d for d in completion_data if not d['is_correct']]
+
+    # Rank within each tier and assign rewards
+    reward_map = {}
+
+    def rank_and_reward(tier, reward_min, reward_max):
+        """Rank tier by quality and map to [reward_min, reward_max]."""
+        if not tier:
+            return
+
+        # Sort by quality score (ascending, so lowest rank = lowest reward)
+        sorted_tier = sorted(tier, key=lambda x: x['quality_score'])
+
+        n = len(sorted_tier)
+        if n == 1:
+            # Single completion: use midpoint of range
+            reward_map[sorted_tier[0]['idx']] = (reward_min + reward_max) / 2.0
+        else:
+            # Multiple completions: linear mapping from rank
+            for rank, item in enumerate(sorted_tier):
+                # rank / (n - 1) maps [0, n-1] → [0, 1]
+                normalized_rank = rank / (n - 1)
+                reward = reward_min + normalized_rank * (reward_max - reward_min)
+                reward_map[item['idx']] = reward
+
+    # Rank correct tier → [0.0, 1.0]
+    rank_and_reward(correct_tier, 0.0, 1.0)
+
+    # Rank wrong tier → [-1.0, -0.01]  (leave gap to avoid ambiguity with correct tier)
+    rank_and_reward(wrong_tier, -1.0, -0.01)
+
+    # Build final reward list in original order
+    rewards = [reward_map[idx] for idx in range(len(completions))]
+
+    return rewards
+
+
+def dapo_structure_balanced(prompts, completions, answer, **kwargs):
+    """
+    Balanced structure-based DAPO reward with strict format requirements.
+
+    Format contract:
+    - PLAN: section for problem analysis
+    - WORK: section for step-by-step reasoning
+    - ANSWER: section with \\boxed{final_answer}
+
+    Key improvements over dapo_diverse_stable:
+    - Strict \\boxed{} requirement (like ppo_binary)
+    - Clean -1.0 to 1.0 range (symmetric)
+    - No overlapping penalties
+    - Structure quality modulates correct rewards
+    - Wrong answers have clear negative signal
+
+    Reward range: [-1.0, 1.0]
+
+    Reward structure:
+    ================
+    CORRECT ANSWERS (base 0.7):
+      + Structure quality bonus: 0.0 to 0.3 (based on PLAN/WORK/ANSWER presence)
+      + Work depth bonus: 0.0 to 0.1 (substantial reasoning in WORK section)
+      Subtotal before penalties: 0.7 to 1.1
+
+    WRONG ANSWERS:
+      - Extractable but wrong: -0.5 base
+      - No extractable \\boxed{}: -0.7 base
+
+    PENALTIES (non-overlapping, apply to all):
+      - Refusal detected: reward = -1.0 (terminal)
+      - Repetition: up to -0.3 (cheap n-gram detection)
+      - Poor structure: up to -0.2 (if struct_score < 0.4)
+      - Extreme length: -0.2 (< 80 chars OR > 5000 chars)
+
+    Final range after clamping: [-1.0, 1.0]
+
+    Args:
+        prompts: List of prompt strings
+        completions: List of completion strings
+        answer: List of ground truth answers
+        **kwargs: Additional fields (dataset_source, etc.)
+
+    Returns:
+        List of rewards in range [-1.0, 1.0]
+    """
+    rewards = []
+
+    dataset_source = kwargs.get("dataset_source", [])
+    if not isinstance(dataset_source, list):
+        dataset_source = [dataset_source] * len(completions)
+
+    # Handle TRL behavior with custom rollout_func
+    num_generations = len(completions) // len(answer) if len(answer) > 0 else 1
+
+    for idx, completion in enumerate(completions):
+        prompt_idx = idx // num_generations
+        correct_answer = answer[prompt_idx]
+        text = _extract_completion_text(completion)
+
+        # STRICT \\boxed{} extraction (like ppo_binary)
+        extracted, _ = extract_answer_GSM8K(text)
+        is_correct = compare_answers(extracted, str(correct_answer))
+
+        # Structure analysis
+        struct_score, sections = _structure_score_plan_work_answer(text)
+        work_len = len(sections.get("work", ""))
+        total_len = len(text)
+
+        # Failure mode detection
+        refusal = bool(re.search(r"\b(as an ai|i can't|i cannot|sorry|unable to)\b", text.lower()))
+        repeat_pen = _cheap_repeat_penalty(text)
+
+        # ========= BASE REWARD (correctness is primary) =========
+        if is_correct:
+            # Correct answer: 0.7 base
+            reward = 0.7
+
+            # Structure quality bonus (0.0 to 0.3)
+            # Rewards PLAN/WORK/ANSWER format compliance
+            reward += 0.3 * struct_score
+
+            # Work depth bonus (0.0 to 0.1)
+            # Rewards substantial reasoning, saturates at 300 chars
+            if work_len > 0:
+                depth_factor = min(work_len / 300.0, 1.0)
+                reward += 0.1 * depth_factor
+        else:
+            # Wrong answer: different base depending on extraction
+            if extracted is None:
+                reward = -0.7  # No extractable \\boxed{} answer
+            else:
+                reward = -0.5  # Wrong but extractable answer
+
+        # ========= PENALTIES (non-overlapping, apply to all) =========
+
+        # Critical: Refusal is terminal failure
+        if refusal:
+            reward = -1.0
+            rewards.append(reward)
+            continue  # Skip other penalties
+
+        # Repetition penalty (capped)
+        if repeat_pen > 0:
+            reward -= min(0.3, repeat_pen)
+
+        # Poor structure penalty (only if very bad)
+        if struct_score < 0.4:
+            # Smooth penalty: worse structure = larger penalty
+            structure_penalty = (0.4 - struct_score) * 0.5  # max 0.2
+            reward -= structure_penalty
+
+        # Extreme length penalty (non-overlapping conditions)
+        if total_len < 80:
+            reward -= 0.2
+        elif total_len > 5000:
+            reward -= 0.2
+
+        # ========= CLAMP TO RANGE =========
+        reward = max(-1.0, min(1.0, reward))
+        rewards.append(reward)
+
+    return rewards
 
 
 def _get_dapo_R1_dense():
@@ -1002,6 +1304,8 @@ REWARD_FUNCTIONS = {
     # "grpo_reflection": grpo_reward_reflection, # TODO: Implement GRPO reward for self reflection
     "dapo_diverse": dapo_diverse,
     "dapo_diverse_stable": dapo_diverse_stable,
+    "dapo_structure_balanced": dapo_structure_balanced,  # Clean structure-based with -1 to 1 range
+    "dapo_rank_stratified": dapo_rank_stratified,  # Ranking-based with correctness stratification
 }
 
 

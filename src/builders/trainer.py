@@ -7,6 +7,51 @@ from typing import Any, Dict, List, Optional
 from vllm import SamplingParams
 
 
+def _apply_lora(model, peft_cfg: dict):
+    """Wrap model with LoRA adapters from a peft config dict.
+
+    Expected peft_cfg keys (all optional beyond defaults):
+        r                : int   - LoRA rank (default 16)
+        lora_alpha       : int   - scaling factor (default 32)
+        target_modules   : list  - module names to adapt (default None → auto)
+        lora_dropout     : float - dropout on LoRA layers (default 0.05)
+        bias             : str   - "none" | "all" | "lora_only" (default "none")
+        task_type        : str   - PEFT task type (default "CAUSAL_LM")
+    """
+    from peft import LoraConfig, get_peft_model, TaskType
+
+    task_type_str = peft_cfg.get("task_type", "CAUSAL_LM")
+    task_type = getattr(TaskType, task_type_str, TaskType.CAUSAL_LM)
+
+    use_dora = peft_cfg.get("use_dora", False)
+
+    lora_config = LoraConfig(
+        r=peft_cfg.get("r", 16),
+        lora_alpha=peft_cfg.get("lora_alpha", 32),
+        target_modules=peft_cfg.get("target_modules", None),
+        lora_dropout=peft_cfg.get("lora_dropout", 0.05),
+        bias=peft_cfg.get("bias", "none"),
+        task_type=task_type,
+        use_dora=use_dora,
+    )
+
+    model = get_peft_model(model, lora_config)
+
+    # Required when gradient checkpointing is active so gradients flow into adapters
+    model.enable_input_require_grads()
+
+    method = "DoRA" if use_dora else "LoRA"
+    trainable, total = model.get_nb_trainable_parameters()
+    print(f"[PEFT] {method} applied — trainable params: {trainable:,} / {total:,} "
+          f"({100 * trainable / total:.2f}%)")
+    print(f"[PEFT] {method} config: r={lora_config.r}, alpha={lora_config.lora_alpha}, "
+          f"dropout={lora_config.lora_dropout}, bias={lora_config.bias}")
+    if lora_config.target_modules:
+        print(f"[PEFT] Target modules: {list(lora_config.target_modules)}")
+
+    return model
+
+
 class DataCollatorForCausalLMWithLabels:
     def __init__(self, tokenizer, pad_to_multiple_of: Optional[int] = 8):
         self.tokenizer = tokenizer
@@ -134,7 +179,7 @@ def build_trl_dpo_trainer(model, tokenizer, dataset, training_cfg, wandb_cfg, re
 
 
 @register("trainer", "trl_grpo")
-def build_trl_grpo_trainer(model, tokenizer, dataset, training_cfg, grpo_cfg, wandb_cfg, reward_funcs):
+def build_trl_grpo_trainer(model, tokenizer, dataset, training_cfg, grpo_cfg, wandb_cfg, reward_funcs, peft_cfg=None):
     wandb.init(
         project=wandb_cfg["project"],
         entity=wandb_cfg["entity"],
@@ -151,9 +196,12 @@ def build_trl_grpo_trainer(model, tokenizer, dataset, training_cfg, grpo_cfg, wa
     
     training_cfg = {**training_cfg}
     training_cfg["report_to"] = ["wandb"]
-    
+
     training_cfg.pop("beta", None)
-    
+
+    if peft_cfg and peft_cfg.get("enabled", False):
+        model = _apply_lora(model, peft_cfg)
+
     config = GRPOConfig(
         **training_cfg,
         num_generations=grpo_cfg.get("num_generations", 4),
@@ -163,6 +211,7 @@ def build_trl_grpo_trainer(model, tokenizer, dataset, training_cfg, grpo_cfg, wa
         scale_rewards=grpo_cfg.get("scale_rewards", "group"),
         loss_type=grpo_cfg.get("loss_type", "dapo"),
         epsilon=grpo_cfg.get("epsilon", 0.2),
+        epsilon_high=grpo_cfg.get("epsilon_high", None),
         temperature=grpo_cfg.get("temperature", 0.7),
         top_k=grpo_cfg.get("top_k", 0),
         top_p=grpo_cfg.get("top_p", 1.0),
@@ -174,7 +223,7 @@ def build_trl_grpo_trainer(model, tokenizer, dataset, training_cfg, grpo_cfg, wa
         vllm_max_model_length=grpo_cfg.get("vllm_max_model_length", None),
         vllm_enable_sleep_mode=grpo_cfg.get("vllm_enable_sleep_mode", False),
     )
-    
+
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
@@ -187,7 +236,7 @@ def build_trl_grpo_trainer(model, tokenizer, dataset, training_cfg, grpo_cfg, wa
     return trainer
 
 @register("trainer", "trl_grpo_diverse")
-def build_trl_grpo_diverse_trainer(model, tokenizer, dataset, training_cfg, grpo_cfg, wandb_cfg, reward_funcs):
+def build_trl_grpo_diverse_trainer(model, tokenizer, dataset, training_cfg, grpo_cfg, wandb_cfg, reward_funcs, peft_cfg=None):
     """
     Build GRPO trainer with diverse sampling support
 
@@ -246,6 +295,9 @@ def build_trl_grpo_diverse_trainer(model, tokenizer, dataset, training_cfg, grpo
 
     training_cfg.pop("beta", None)
 
+    if peft_cfg and peft_cfg.get("enabled", False):
+        model = _apply_lora(model, peft_cfg)
+
     config = GRPOConfig(
         **training_cfg,
         num_generations=grpo_cfg.get("num_generations", 4),
@@ -255,6 +307,7 @@ def build_trl_grpo_diverse_trainer(model, tokenizer, dataset, training_cfg, grpo
         scale_rewards=grpo_cfg.get("scale_rewards", "group"),
         loss_type=grpo_cfg.get("loss_type", "dapo"),
         epsilon=grpo_cfg.get("epsilon", 0.2),
+        epsilon_high=grpo_cfg.get("epsilon_high", None),
         temperature=grpo_cfg.get("temperature", 0.7),
         top_k=grpo_cfg.get("top_k", 0),
         top_p=grpo_cfg.get("top_p", 1.0),

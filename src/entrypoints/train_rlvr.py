@@ -67,6 +67,20 @@ def main(exp_name: str):
     trainer_type = "trl_grpo_diverse" if diverse_enabled else "trl_grpo"
     print(f"[RLVR] Using trainer type: {trainer_type}")
 
+    peft_cfg = getattr(cfg, 'peft', None) or {}
+    peft_enabled = peft_cfg.get('enabled', False)
+    if peft_enabled:
+        print(f"[RLVR] PEFT/LoRA: ENABLED")
+        print(f"  - r: {peft_cfg.get('r', 16)}")
+        print(f"  - lora_alpha: {peft_cfg.get('lora_alpha', 32)}")
+        print(f"  - lora_dropout: {peft_cfg.get('lora_dropout', 0.05)}")
+        print(f"  - target_modules: {peft_cfg.get('target_modules', 'auto')}")
+        print(f"  - bias: {peft_cfg.get('bias', 'none')}")
+        print()
+    else:
+        print(f"[RLVR] PEFT/LoRA: DISABLED (full fine-tuning)")
+        print()
+
     trainer = build(
         "trainer",
         type=trainer_type,
@@ -77,6 +91,7 @@ def main(exp_name: str):
         grpo_cfg=grpo_cfg,
         wandb_cfg=cfg.wandb,
         reward_funcs=reward_fn,
+        peft_cfg=peft_cfg,
     )
 
     output_dir = cfg.training['output_dir']

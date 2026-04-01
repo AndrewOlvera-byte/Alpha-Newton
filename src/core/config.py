@@ -53,6 +53,8 @@ class Config:
     wandb: Dict[str, Any]
     grpo: Dict[str, Any] = None  # RLVR/GRPO specific config
     topk_eval: Dict[str, Any] = None  # Top-K checkpoint callback config
+    peft: Dict[str, Any] = None  # PEFT/LoRA config
+    robotics: Dict[str, Any] = None  # Robotics BC/RL config
 
     @classmethod
     def load(cls, path: str | Path, base_configs: List[str | Path] = None):
@@ -72,7 +74,7 @@ class Config:
 
         merged = interpolate_variables(merged)
 
-        known_fields = {'run', 'model', 'tokenizer', 'data', 'training', 'wandb', 'grpo', 'topk_eval'}
+        known_fields = {'run', 'model', 'tokenizer', 'data', 'training', 'wandb', 'grpo', 'topk_eval', 'peft', 'robotics'}
         filtered = {k: v for k, v in merged.items() if k in known_fields}
 
         return cls(**filtered)
@@ -81,6 +83,7 @@ class Config:
     def from_experiment(cls, exp_name: str):
         common_path = Path("configs/base/common.yaml")
         rlvr_path = Path("configs/base/rlvr.yaml")
+        robotics_path = Path("configs/base/robotics.yaml")
         exp_path = Path("configs/exp") / f"{exp_name}.yaml"
 
         with open(exp_path, "r") as f:
@@ -91,5 +94,7 @@ class Config:
         base_configs = [common_path]
         if mode == "rlvr" and rlvr_path.exists():
             base_configs.append(rlvr_path)
+        elif mode == "bc" and robotics_path.exists():
+            base_configs.append(robotics_path)
 
         return cls.load(exp_path, base_configs=base_configs)

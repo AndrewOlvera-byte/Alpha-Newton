@@ -13,6 +13,9 @@ services:
               count: all
               capabilities: [gpu]
 
+    # Shared memory for PyTorch DataLoader workers (default 64MB is too small)
+    shm_size: "16gb"
+
     # Mount project directory for live code changes
     volumes:
       - .:/workspace

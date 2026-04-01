@@ -1,0 +1,78 @@
+run:
+  name: "qwen3_600M_p1_dapo_K8_noKL"
+  mode: "rlvr"
+
+model:
+  type: "hf_causal"
+  id: "outputs/qwen_600M_sft_deepthought_math_optimal"
+  dtype: "bfloat16"
+  gradient_checkpointing: true
+
+tokenizer:
+  type: "hf"
+  id: "Qwen/Qwen3-0.6B-Base"
+
+data:
+  type: "rlvr_allenai"
+  source: "hf"
+  train_path: "allenai/RLVR-GSM"
+  eval_path: null
+  name: null
+  max_prompt_len: 384
+  num_proc: 12
+
+grpo:
+  reward_function: "ppo_binary"
+  num_generations: 8
+  max_prompt_length: 384
+  max_completion_length: 400
+  beta: 0.0
+  scale_rewards: "group"
+  loss_type: "dapo"
+  epsilon: 0.10
+  epsilon_high: 0.28
+  temperature: 0.9
+  top_p: 1.0
+  top_k: 50
+  use_vllm: true
+  vllm_mode: "colocate"
+  vllm_gpu_memory_utilization: 0.5
+  vllm_enable_sleep_mode: true
+
+training:
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 16
+
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+
+  learning_rate: 1.0e-5
+  lr_scheduler_type: "constant_with_warmup"
+  warmup_steps: 50
+  max_steps: 780
+
+  logging_steps: 1
+  save_strategy: "no"
+
+  bf16: true
+
+  output_dir: "outputs/qwen3_600M_p1_dapo_K8_noKL"
+
+wandb:
+  tags: ["qwen3-0.6b", "rlvr", "dapo", "gsm8k", "p1", "8-gen", "no-kl", "asymmetric-clip"]
+
+topk_eval:
+  enabled: true
+  mode: "gsm"
+  k: 10
+  eval_dataset_path: "held_out/gsm_eval_v2.jsonl"
+  eval_every_n_steps: 10
+  eval_batch_size: 32
+  source_type: "local"
+  reward_function: "ppo_binary"
+  difficulty_weights:
+    level1: 1.0
+    level2: 1.5
+    level3: 2.0

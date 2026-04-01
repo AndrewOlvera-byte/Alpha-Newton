@@ -1,0 +1,103 @@
+run:
+  name: "bc_lift_ph"
+  mode: "bc"
+
+# ─────────────────────────────────────────────
+# Dataset
+# ─────────────────────────────────────────────
+data:
+  type: "robomimic_bc"
+  data_dir: "data/robomimic"
+  tasks:
+    - "lift"
+  history_length: 3
+  obs_keys:
+    low_dim:
+      - "robot0_eef_pos"       # 3  — end-effector position
+      - "robot0_eef_quat"      # 4  — end-effector quaternion
+      - "robot0_gripper_qpos"  # 2  — gripper joint positions
+      - "object-state"         # 10 — cube pos(3) + cube quat(4) + gripper_to_cube(3)
+    image:
+      - "agentview_image"
+      - "robot0_eye_in_hand_image"
+  eval_ratio: 0.1
+  hdf5_filter_key: null
+
+# ─────────────────────────────────────────────
+# Architecture
+# ─────────────────────────────────────────────
+robotics:
+  architecture:
+    type: "vla_flow_matching"
+
+    # ── Causal Transformer Decoder ──────────────
+    d_model: 384              # must match DINOv2 ViT-S/14 hidden dim (384)
+    n_transformer_layers: 6
+    n_transformer_heads: 6    # d_head = 384/6 = 64
+    d_ff: 1536                # 4× d_model
+    dropout: 0.1
+    encoder_hidden_dim: 128   # hidden dim for state/action MLP encoders
+
+    # ── DiT Flow-Matching Action Head ───────────
+    d_dit: 256
+    n_dit_layers: 4
+    n_dit_heads: 4            # d_head = 256/4 = 64
+    d_dit_ff: 1024            # 4× d_dit
+
+    # ── Task dimensions ─────────────────────────
+    action_dim: 7             # [dx,dy,dz, droll,dpitch,dyaw, gripper]
+    obs_dim: 19               # eef_pos(3)+eef_quat(4)+gripper(2)+object(10)
+    n_cameras: 2
+    history_length: 3
+
+    # ── Vision (DINOv2 ViT-S/14, frozen) ────────
+    vit_model: "facebook/dinov2-small"
+    vit_img_size: 224
+    freeze_vit: true
+    # Pool 256 raw patches → 64 per camera.
+    # Sequence: 2*64+2=130 tokens/frame → 3*130+1=391 total.
+    # Set to 0 to use all 256 patches (higher fidelity, ~4× slower).
+    vis_tokens_per_camera: 64
+
+    # ── Flow matching ────────────────────────────
+    num_flow_steps: 10        # Euler ODE steps at inference
+
+    # ── Training optimisations ───────────────────
+    gradient_checkpointing: false   # enable to trade compute for memory on large batches
+
+# ─────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────
+training:
+  per_device_train_batch_size: 64
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  warmup_steps: 500
+  max_steps: 50000
+  max_grad_norm: 1.0
+  logging_steps: 50
+  save_steps: 5000
+  eval_steps: 2500
+  # Precision: bf16=true is the default. Set fp8=true to enable torchao FP8
+  # training on the transformer/DiT Linear layers (requires sm_89+ GPU).
+  # FP8 and bf16 coexist: autocast runs bf16 for non-linear ops, FP8 handles
+  # the heavy QKV/FFN matmuls via ROWWISE_WITH_GW_HP dynamic scaling.
+  bf16: true
+  fp8: false
+  torch_compile: false
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+  gradient_checkpointing: false
+  output_dir: "outputs/bc_lift_ph"
+
+# ─────────────────────────────────────────────
+# Wandb
+# ─────────────────────────────────────────────
+wandb:
+  project: "robotics-bc"
+  entity: "andrewolvera"
+  run_name: "bc_lift_ph"
+  tags: ["bc", "lift", "flow_matching", "dinov2"]

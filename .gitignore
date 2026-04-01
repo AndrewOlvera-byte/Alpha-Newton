@@ -4,3 +4,6 @@
 /outputs
 /wandb
 *.jsonl
+/data
+/papers
+/tools

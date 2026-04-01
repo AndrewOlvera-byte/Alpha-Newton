@@ -210,12 +210,12 @@ class BaseTopKCheckpointCallback(TrainerCallback):
 
                 outputs = eval_model.generate(
                     **inputs,
-                    max_new_tokens=400,  # Reduced from 768 (GSM8K rarely needs more)
-                    do_sample=False,  # Greedy decoding for deterministic eval
+                    max_new_tokens=512,
+                    do_sample=False,           # Greedy — deterministic for stable checkpoint ranking
+                    repetition_penalty=1.1,    # Prevents greedy repetition loops (Qwen3 greedy degrades)
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
-                    use_cache=True,  # Enable KV cache for efficiency
-                    early_stopping=True,  # Stop at EOS token
+                    use_cache=True,
                 )
 
                 for j, output_ids in enumerate(outputs):

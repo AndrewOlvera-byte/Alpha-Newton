@@ -1,0 +1,37 @@
+# Math eval for paper: GSM8K full test set (1,319 examples) — HuggingFace backend
+#
+# Use this for final paper-reported numbers when you need HF generate parity.
+# Advantages over math_paper_gsm.yaml (vLLM):
+#   - No vLLM ~3% systematic gap vs your HF-generate training callback
+#   - Fully reproducible with standard transformers (no vLLM install required)
+#   - Results are directly comparable to other HF-evaluated papers
+#
+# Qwen3 greedy note: Qwen team explicitly recommends against greedy for Qwen3
+# (can cause repetition loops, especially in thinking/CoT models). Using their
+# recommended non-thinking params: temp=0.7, top_p=0.8, top_k=20.
+# Document this choice in your paper's experimental setup section.
+# If comparing against greedy-reported baselines, also run math_small.yaml
+# (greedy) and report both with appropriate notation.
+
+suite:
+  name: "math_paper_hf"
+
+runner:
+  backend: "lm_eval"
+  model: "hf"
+
+  tasks: ["gsm8k"]
+
+  num_fewshot: 0  # 0-shot (standard for reporting)
+  batch_size: 64  # Single GPU sweet spot — adjust down if OOM
+
+  apply_chat_template: true
+  gen_kwargs:
+    do_sample: true
+    temperature: 0.7   # Qwen3 non-thinking recommended
+    top_p: 0.8         # Qwen3 non-thinking recommended
+    top_k: 20          # Qwen3 non-thinking recommended
+    max_new_tokens: 512
+
+output:
+  path: null  # Defaults to outputs/<run.name>/eval/math_paper_hf/

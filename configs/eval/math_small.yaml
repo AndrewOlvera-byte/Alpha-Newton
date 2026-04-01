@@ -1,4 +1,5 @@
-# Math eval suite (small): GSM8K only
+# Math eval suite (small): GSM8K only — fast dev/sanity check
+# For paper-quality reporting use math_paper_hf.yaml (HF) or math_paper_gsm.yaml (vLLM)
 
 suite:
   name: "math_small"
@@ -7,18 +8,16 @@ runner:
   backend: "lm_eval"
   model: "hf"
 
-  # Accepts task aliases; entrypoint maps them to lm-eval task IDs
   tasks: ["gsm8k"]
 
   num_fewshot: 0
-  batch_size: 16
+  batch_size: 64  # Was 16 — 4x fewer batches, ~4x faster (~10 min on single GPU)
 
-  # Deterministic generation for comparable benchmark numbers
   apply_chat_template: true
   gen_kwargs:
     do_sample: false
     temperature: 0.0
+    max_new_tokens: 512  # Cap generation — GSM8K answers are short, prevents runaway decoding
 
 output:
-  # If null, defaults to outputs/<run.name>/eval/<suite>.json
   path: null

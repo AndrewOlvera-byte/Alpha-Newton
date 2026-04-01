@@ -11,3 +11,14 @@ peft>=0.8.0
 bitsandbytes>=0.41.0
 gradio>=4.0.0
 vllm==0.11.2  # Highest version supported by TRL
+
+# FP8 training (requires PyTorch 2.9+, sm_89/sm_90/sm_120)
+torchao>=0.17.0
+
+# Robotics BC / RL
+h5py>=3.0.0
+robosuite>=1.5.0
+robomimic>=0.3.0
+imageio>=2.20.0
+imageio-ffmpeg>=0.4.0
+opencv-python>=4.5.0

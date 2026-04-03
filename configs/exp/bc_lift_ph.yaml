@@ -20,6 +20,7 @@ data:
     image:
       - "agentview_image"
       - "robot0_eye_in_hand_image"
+  action_chunk_size: 8      # must match architecture.action_chunk_size
   eval_ratio: 0.1
   hdf5_filter_key: null
 
@@ -35,7 +36,7 @@ robotics:
     n_transformer_layers: 6
     n_transformer_heads: 6    # d_head = 384/6 = 64
     d_ff: 1536                # 4× d_model
-    dropout: 0.1
+    dropout: 0.15
     encoder_hidden_dim: 128   # hidden dim for state/action MLP encoders
 
     # ── DiT Flow-Matching Action Head ───────────
@@ -54,13 +55,19 @@ robotics:
     vit_model: "facebook/dinov2-small"
     vit_img_size: 224
     freeze_vit: true
-    # Pool 256 raw patches → 64 per camera.
+    # Pool 256 raw patches → 64 per camera via attention pooling.
     # Sequence: 2*64+2=130 tokens/frame → 3*130+1=391 total.
     # Set to 0 to use all 256 patches (higher fidelity, ~4× slower).
     vis_tokens_per_camera: 64
+    vis_pool_type: "attention"   # "attention" (Perceiver-style) or "avg"
 
     # ── Flow matching ────────────────────────────
     num_flow_steps: 10        # Euler ODE steps at inference
+
+    # ── Action chunking (Diffusion Policy style) ─
+    # Predict K future actions; DiT attends across the chunk.
+    # Execute first action, discard rest. K=1 = single-step (original).
+    action_chunk_size: 8
 
     # ── Training optimisations ───────────────────
     gradient_checkpointing: false   # enable to trade compute for memory on large batches
@@ -72,14 +79,14 @@ training:
   per_device_train_batch_size: 64
   per_device_eval_batch_size: 64
   gradient_accumulation_steps: 1
-  learning_rate: 1.0e-4
-  weight_decay: 1.0e-5
-  warmup_steps: 500
-  max_steps: 50000
+  learning_rate: 8.0e-5        # slightly lower — cosine decay from here avoids sharp early overfit
+  weight_decay: 4.0e-4         # stronger L2 regularization for 200-demo regime
+  warmup_steps: 1000           # longer warmup for stability with aug diversity
+  max_steps: 80000             # 4× aug → 4× data diversity, more steps warranted
   max_grad_norm: 1.0
   logging_steps: 50
-  save_steps: 5000
-  eval_steps: 2500
+  save_steps: 2000
+  eval_steps: 1000             # frequent eval to catch overfitting early
   # Precision: bf16=true is the default. Set fp8=true to enable torchao FP8
   # training on the transformer/DiT Linear layers (requires sm_89+ GPU).
   # FP8 and bf16 coexist: autocast runs bf16 for non-linear ops, FP8 handles
@@ -90,7 +97,6 @@ training:
   dataloader_num_workers: 4
   dataloader_pin_memory: true
   dataloader_prefetch_factor: 2
-  gradient_checkpointing: false
   output_dir: "outputs/bc_lift_ph"
 
 # ─────────────────────────────────────────────

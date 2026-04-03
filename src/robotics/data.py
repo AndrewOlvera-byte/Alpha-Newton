@@ -304,6 +304,7 @@ class RobomimicBCDataset(Dataset):
         obs_keys_image: List[str],
         history_length: int = 3,
         norm_stats=None,  # NormStats instance or None
+        action_chunk_size: int = 1,
     ):
         self.hdf5_path = hdf5_path
         self.demo_keys = sorted(demo_keys)
@@ -311,6 +312,7 @@ class RobomimicBCDataset(Dataset):
         self.obs_keys_image = [k for k in obs_keys_image if k]
         self.history_length = history_length
         self.norm_stats = norm_stats
+        self.action_chunk_size = action_chunk_size
 
         self._index = []
         self._demo_lengths = {}
@@ -373,9 +375,15 @@ class RobomimicBCDataset(Dataset):
         for img_key in self.obs_keys_image:
             feat_key = self._feature_keys.get(img_key)
             if feat_key is not None:
-                # Precomputed ViT features: [T, n_patches, feat_dim]
+                # Precomputed ViT features.
+                # Shape [T, n_patches, d] (no aug) or [T, N_aug, n_patches, d] (with aug).
                 feat_all = demo_grp[f"obs/{feat_key}"]
-                feat_stack = np.stack([feat_all[hi] for hi in hist_indices])  # [H, n_patches, d]
+                feat_stack = np.stack([feat_all[hi] for hi in hist_indices])  # [H, ...]
+                if feat_stack.ndim == 4:
+                    # Has aug dimension [H, N_aug, n_patches, d] — sample one view randomly
+                    n_aug = feat_stack.shape[1]
+                    aug_idx = np.random.randint(0, n_aug)
+                    feat_stack = feat_stack[:, aug_idx]  # [H, n_patches, d]
                 images[img_key] = torch.from_numpy(feat_stack.astype(np.float32))
             else:
                 # Raw images: [T, H, W, C] → [H, C, H, W] in [0, 1]
@@ -395,8 +403,15 @@ class RobomimicBCDataset(Dataset):
                 prev_actions.append(demo_grp["actions"][pa_t].astype(np.float32))
         prev_actions = np.stack(prev_actions)
 
-        # --- Target action at t ---
-        action = demo_grp["actions"][t].astype(np.float32)
+        # --- Target action(s) at t — supports action chunking ---
+        K = self.action_chunk_size
+        T = self._demo_lengths[demo_key]
+        if K > 1:
+            # Grab K future actions, pad with last action if near end of demo
+            action_indices = [min(t + k, T - 1) for k in range(K)]
+            action = np.stack([demo_grp["actions"][ai] for ai in action_indices]).astype(np.float32)  # [K, action_dim]
+        else:
+            action = demo_grp["actions"][t].astype(np.float32)
 
         # --- Normalization ---
         if self.norm_stats is not None:
@@ -421,6 +436,7 @@ def build_robomimic_bc_dataset(
     hdf5_filter_key: Optional[str] = None,
     eval_ratio: float = 0.1,
     norm_stats=None,  # NormStats instance (computed by trainer, then injected)
+    action_chunk_size: int = 1,
     **kwargs,
 ) -> Dict[str, Any]:
     """Build robomimic BC dataset with per-timestep history windows.
@@ -466,6 +482,7 @@ def build_robomimic_bc_dataset(
             obs_keys_image=obs_keys_image,
             history_length=history_length,
             norm_stats=norm_stats,
+            action_chunk_size=action_chunk_size,
         )
         all_train.append(RobomimicBCDataset(hdf5_path=hdf5_path, demo_keys=train_demos, **common))
         all_eval.append(RobomimicBCDataset(hdf5_path=hdf5_path, demo_keys=eval_demos, **common))

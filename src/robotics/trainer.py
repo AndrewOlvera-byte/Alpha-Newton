@@ -208,33 +208,43 @@ class BCTrainer:
             return
 
         print("[Trainer] Computing normalization statistics from training data...")
-        # Compute per-file and merge (weighted by demo count)
-        import numpy as np
-        all_actions = []
-        all_states = []
-        import h5py
-        for hdf5_path, demo_keys in demo_info:
-            with h5py.File(hdf5_path, "r") as f:
-                for dk in demo_keys:
-                    all_actions.append(f[f"data/{dk}/actions"][:])
-                    parts = []
-                    for key in obs_keys_low_dim:
-                        obs = f[f"data/{dk}/obs/{key}"][:]
-                        if obs.ndim == 1:
-                            obs = obs[:, None]
-                        parts.append(obs)
-                    all_states.append(np.concatenate(parts, axis=-1))
+        # Merge all demos across files into a single NormStats via NormStats.compute.
+        # This uses the same outlier-clipping logic as the standalone script.
+        import h5py, numpy as np
 
-        all_actions = np.concatenate(all_actions, axis=0)
-        all_states = np.concatenate(all_states, axis=0)
+        if len(demo_info) == 1:
+            hdf5_path, demo_keys = demo_info[0]
+            self.norm_stats = NormStats.compute(hdf5_path, demo_keys, obs_keys_low_dim)
+        else:
+            # Multi-task: concatenate all demos into a temporary view by writing a
+            # combined array, then computing stats. Simpler: collect arrays directly.
+            all_actions, all_states = [], []
+            for hdf5_path, demo_keys in demo_info:
+                with h5py.File(hdf5_path, "r") as f:
+                    for dk in demo_keys:
+                        all_actions.append(f[f"data/{dk}/actions"][:])
+                        parts = []
+                        for key in obs_keys_low_dim:
+                            obs = f[f"data/{dk}/obs/{key}"][:]
+                            if obs.ndim == 1:
+                                obs = obs[:, None]
+                            parts.append(obs)
+                        all_states.append(np.concatenate(parts, axis=-1))
+            all_actions = np.concatenate(all_actions, axis=0)
+            all_states = np.concatenate(all_states, axis=0)
+            # Apply the same 1% outlier clipping as NormStats.compute
+            min_std, clip_p = 1e-3, 1.0
+            for arr in [all_actions, all_states]:
+                lo = np.percentile(arr, clip_p, axis=0)
+                hi = np.percentile(arr, 100.0 - clip_p, axis=0)
+                np.clip(arr, lo, hi, out=arr)
+            self.norm_stats = NormStats(
+                action_mean=all_actions.mean(0).tolist(),
+                action_std=np.maximum(all_actions.std(0), min_std).tolist(),
+                state_mean=all_states.mean(0).tolist(),
+                state_std=np.maximum(all_states.std(0), min_std).tolist(),
+            )
 
-        min_std = 1e-3
-        self.norm_stats = NormStats(
-            action_mean=all_actions.mean(0).tolist(),
-            action_std=np.maximum(all_actions.std(0), min_std).tolist(),
-            state_mean=all_states.mean(0).tolist(),
-            state_std=np.maximum(all_states.std(0), min_std).tolist(),
-        )
         self.norm_stats.save(stats_path)
         print(f"[Trainer] Norm stats computed and saved to {stats_path}")
         self._inject_norm_stats()
@@ -306,6 +316,52 @@ class BCTrainer:
         if self._wandb and self._wandb.run:
             self._wandb.log(metrics, step=step)
 
+    # ------------------------------------------------------------------
+    # Optimization dynamics helpers
+    # ------------------------------------------------------------------
+
+    def _grad_norm(self, params) -> float:
+        """Total L2 grad norm across a param iterable (pre-clip)."""
+        total = 0.0
+        for p in params:
+            if p.grad is not None:
+                total += p.grad.data.norm(2).item() ** 2
+        return total ** 0.5
+
+    def _param_norm(self, params) -> float:
+        """Total L2 weight norm across a param iterable."""
+        total = 0.0
+        for p in params:
+            total += p.data.float().norm(2).item() ** 2
+        return total ** 0.5
+
+    def _named_module_params(self):
+        """Return {group_name: [params]} for the key trainable sub-modules."""
+        m = self.model if not hasattr(self.model, "_orig_mod") else self.model._orig_mod
+        groups = {
+            "transformer": list(m.transformer.parameters()),
+            "dit_head": list(m.dit_head.parameters()),
+            "readout_proj": list(m.readout_proj.parameters()),
+        }
+        if hasattr(m, "vis_pool") and m.vis_pool is not None:
+            groups["vis_pool"] = list(m.vis_pool.parameters())
+        return groups
+
+    @staticmethod
+    def _fmt_eta(seconds: float) -> str:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        if h > 0:
+            return f"{h}h{m:02d}m"
+        if m > 0:
+            return f"{m}m{s:02d}s"
+        return f"{s}s"
+
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+
     def train(self):
         """Main training loop."""
         self._init_wandb()
@@ -325,11 +381,19 @@ class BCTrainer:
 
         self.model.train()
         train_iter = iter(self.train_loader)
-        step_losses = []
+
+        # Rolling buffers for the current logging window
+        step_losses: list = []
+        step_grad_norms: list = []
+        # Per-sample (loss, t) for flow-timestep bucketing
+        _window_t: list = []          # list of [B] tensors
+        _window_lps: list = []        # list of [B] tensors (loss_per_sample)
+
         t0 = time.time()
+        t_last_log = t0
 
         while self.global_step < self.max_steps:
-            # Get batch (cycle through dataloader)
+            # ── Get batch ──────────────────────────────────────────────
             try:
                 batch = next(train_iter)
             except StopIteration:
@@ -338,7 +402,7 @@ class BCTrainer:
 
             batch = _move_batch_to_device(batch, self.device)
 
-            # Forward pass with mixed precision
+            # ── Forward ────────────────────────────────────────────────
             with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_bf16):
                 output = self.model(batch)
                 loss = output["loss"] / self.grad_accum_steps
@@ -346,39 +410,100 @@ class BCTrainer:
             loss.backward()
             step_losses.append(output["loss"].item())
 
-            # Gradient step (with accumulation)
+            # Accumulate per-sample diagnostics for t-bucketing
+            if "_t" in output:
+                _window_t.append(output["_t"].cpu())
+                _window_lps.append(output["_loss_per_sample"].cpu())
+
+            # ── Optimizer step ─────────────────────────────────────────
             if (self.global_step + 1) % self.grad_accum_steps == 0 or self.global_step == self.max_steps - 1:
+                # Capture grad norm BEFORE clipping
+                trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+                grad_norm = self._grad_norm(trainable_params)
+                step_grad_norms.append(grad_norm)
+
                 if self.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in self.model.parameters() if p.requires_grad],
-                        self.max_grad_norm,
-                    )
+                    torch.nn.utils.clip_grad_norm_(trainable_params, self.max_grad_norm)
+
                 self.optimizer.step()
                 self.scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
-
             self.global_step += 1
 
-            # Logging
+            # ── Logging ────────────────────────────────────────────────
             if self.global_step % self.logging_steps == 0:
-                avg_loss = sum(step_losses[-self.logging_steps:]) / min(len(step_losses), self.logging_steps)
+                window = min(len(step_losses), self.logging_steps)
+                avg_loss = sum(step_losses[-window:]) / window
+                loss_std = float(torch.tensor(step_losses[-window:]).std()) if window > 1 else 0.0
+                avg_gnorm = sum(step_grad_norms[-window:]) / max(1, len(step_grad_norms[-window:]))
+                grad_clipped_frac = sum(
+                    1 for g in step_grad_norms[-window:] if g > self.max_grad_norm
+                ) / max(1, len(step_grad_norms[-window:]))
+
                 elapsed = time.time() - t0
                 steps_per_sec = self.global_step / elapsed
+                remaining_steps = self.max_steps - self.global_step
+                eta_sec = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0
                 lr_now = self.scheduler.get_last_lr()[0]
-                print(f"[Step {self.global_step}/{self.max_steps}] "
-                      f"loss={avg_loss:.4f} lr={lr_now:.2e} "
-                      f"steps/s={steps_per_sec:.1f}")
+
+                # Flow-timestep loss bucketing [0,.25), [.25,.5), [.5,.75), [.75,1]
+                t_bucket_metrics = {}
+                if _window_t:
+                    all_t = torch.cat(_window_t)          # [N]
+                    all_lps = torch.cat(_window_lps)      # [N]
+                    bucket_edges = [0.0, 0.25, 0.5, 0.75, 1.01]
+                    for i in range(4):
+                        lo, hi = bucket_edges[i], bucket_edges[i + 1]
+                        mask = (all_t >= lo) & (all_t < hi)
+                        if mask.any():
+                            t_bucket_metrics[f"train/loss_t{int(lo*100):02d}_{int(bucket_edges[i+1]*100):02d}"] = \
+                                all_lps[mask].mean().item()
+                    _window_t.clear()
+                    _window_lps.clear()
+
+                print(
+                    f"[{self.global_step:>6}/{self.max_steps}] "
+                    f"loss={avg_loss:.4f}±{loss_std:.4f} "
+                    f"gnorm={avg_gnorm:.3f} "
+                    f"clip={grad_clipped_frac*100:.0f}% "
+                    f"lr={lr_now:.2e} "
+                    f"{steps_per_sec:.1f}it/s "
+                    f"ETA={self._fmt_eta(eta_sec)}"
+                )
+
                 self._log({
                     "train/loss": avg_loss,
+                    "train/loss_std": loss_std,
+                    "train/grad_norm": avg_gnorm,
+                    "train/grad_clip_frac": grad_clipped_frac,
                     "train/lr": lr_now,
                     "train/steps_per_sec": steps_per_sec,
+                    **t_bucket_metrics,
                 }, self.global_step)
 
-            # Evaluation
+                # ── Per-module grad & param norms (every 5× logging interval) ──
+                if self.global_step % (self.logging_steps * 5) == 0:
+                    module_metrics = {}
+                    for name, params in self._named_module_params().items():
+                        gnorm = self._grad_norm(params)
+                        pnorm = self._param_norm(params)
+                        module_metrics[f"grad_norm/{name}"] = gnorm
+                        module_metrics[f"param_norm/{name}"] = pnorm
+                    self._log(module_metrics, self.global_step)
+
+            # ── Evaluation ─────────────────────────────────────────────
             if self.global_step % self.eval_steps == 0:
-                eval_loss = self.evaluate()
-                self._log({"eval/loss": eval_loss}, self.global_step)
+                # Use recent training loss for gap metric
+                recent_train_loss = sum(step_losses[-self.logging_steps:]) / min(len(step_losses), self.logging_steps)
+                eval_metrics = self.evaluate()
+                eval_loss = eval_metrics["loss"]
+
+                self._log({
+                    "eval/loss": eval_loss,
+                    "eval/train_gap": eval_loss - recent_train_loss,
+                    **{f"eval/{k}": v for k, v in eval_metrics.items() if k != "loss"},
+                }, self.global_step)
 
                 if eval_loss < self.best_eval_loss:
                     self.best_eval_loss = eval_loss
@@ -387,23 +512,30 @@ class BCTrainer:
 
                 self.model.train()
 
-            # Checkpoint
+            # ── Checkpoint ─────────────────────────────────────────────
             if self.global_step % self.save_steps == 0:
                 self._save_checkpoint(f"checkpoint-{self.global_step}")
 
         # Final save
         self._save_checkpoint("final")
-        print(f"\n[Trainer] Training complete. Output: {self.output_dir}")
+        elapsed_total = time.time() - t0
+        print(f"\n[Trainer] Training complete in {self._fmt_eta(elapsed_total)}. Output: {self.output_dir}")
 
         if self._wandb and self._wandb.run:
             self._wandb.finish()
 
     @torch.no_grad()
-    def evaluate(self) -> float:
-        """Run evaluation, return average loss."""
+    def evaluate(self) -> dict:
+        """Run evaluation. Returns dict of metrics including loss, action diversity, t-bucket losses."""
         self.model.eval()
         total_loss = 0.0
         n_batches = 0
+        all_t = []
+        all_lps = []
+
+        # For action sample diversity: run predict twice on the first batch with different noise
+        first_batch = None
+        action_sample_std = None
 
         for batch in self.eval_loader:
             batch = _move_batch_to_device(batch, self.device)
@@ -412,9 +544,50 @@ class BCTrainer:
             total_loss += output["loss"].item()
             n_batches += 1
 
+            if "_t" in output:
+                all_t.append(output["_t"].cpu())
+                all_lps.append(output["_loss_per_sample"].cpu())
+
+            if first_batch is None:
+                first_batch = batch
+
+        # Action diversity: sample the policy N times on the same obs, measure output std.
+        # High std = diverse/stochastic policy. Near-zero = collapsed/deterministic.
+        if first_batch is not None:
+            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_bf16):
+                n_samples = 8
+                samples = torch.stack([
+                    self.model.predict(first_batch).float() for _ in range(n_samples)
+                ], dim=0)  # [n_samples, B, action_dim]
+            # Mean per-dim std across batch — "how much does the output vary across noise seeds?"
+            action_sample_std = samples.std(dim=0).mean().item()
+
         avg_loss = total_loss / max(1, n_batches)
-        print(f"[Eval @ {self.global_step}] loss={avg_loss:.4f} ({n_batches} batches)")
-        return avg_loss
+
+        metrics = {"loss": avg_loss}
+
+        if action_sample_std is not None:
+            metrics["action_sample_std"] = action_sample_std
+
+        # t-bucket losses at eval
+        if all_t:
+            cat_t = torch.cat(all_t)
+            cat_lps = torch.cat(all_lps)
+            bucket_edges = [0.0, 0.25, 0.5, 0.75, 1.01]
+            for i in range(4):
+                lo, hi = bucket_edges[i], bucket_edges[i + 1]
+                mask = (cat_t >= lo) & (cat_t < hi)
+                if mask.any():
+                    key = f"loss_t{int(lo*100):02d}_{int(bucket_edges[i+1]*100):02d}"
+                    metrics[key] = cat_lps[mask].mean().item()
+
+        print(
+            f"[Eval @ {self.global_step}] "
+            f"loss={avg_loss:.4f} "
+            f"action_std={action_sample_std:.4f} "
+            f"({n_batches} batches)"
+        )
+        return metrics
 
     def _save_checkpoint(self, name: str):
         """Save model + optimizer + scheduler state."""

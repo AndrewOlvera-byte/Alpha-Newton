@@ -83,9 +83,13 @@ class DiTBlock(nn.Module):
 
 
 class DiTActionHead(nn.Module):
-    """DiT-based action head with flow matching.
+    """DiT-based action head with flow matching and action chunking.
 
-    Takes a noisy action + conditioning → predicts velocity field.
+    Supports action_chunk_size > 1: each chunk position becomes a token
+    in the DiT sequence, enabling meaningful self-attention across the
+    temporal action horizon (following Diffusion Policy / π0 best practice).
+
+    When action_chunk_size=1, falls back to single-token behavior.
     """
 
     def __init__(
@@ -97,13 +101,23 @@ class DiTActionHead(nn.Module):
         d_ff: int,
         cond_dim: int,
         dropout: float = 0.0,
+        action_chunk_size: int = 1,
     ):
         super().__init__()
         self.action_dim = action_dim
         self.d_model = d_model
+        self.action_chunk_size = action_chunk_size
 
-        # Project noisy action to token
+        # Project each action in the chunk to a token
         self.action_proj = nn.Linear(action_dim, d_model)
+
+        # Learnable temporal position embeddings for chunk positions
+        if action_chunk_size > 1:
+            self.chunk_pos_emb = nn.Parameter(
+                torch.randn(1, action_chunk_size, d_model) * 0.02
+            )
+        else:
+            self.chunk_pos_emb = None
 
         # Timestep embedding
         self.t_emb = SinusoidalTimestepEmbedding(cond_dim)
@@ -120,7 +134,7 @@ class DiTActionHead(nn.Module):
             for _ in range(n_layers)
         ])
 
-        # Final projection: token → velocity
+        # Final projection: token → velocity (per chunk position)
         self.final_adaln = AdaLN(d_model, cond_dim)
         self.out_proj = nn.Linear(d_model, action_dim)
         nn.init.zeros_(self.out_proj.weight)
@@ -134,24 +148,37 @@ class DiTActionHead(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            noisy_action: [B, action_dim]
+            noisy_action: [B, K, action_dim] or [B, action_dim] (K=chunk size)
             timestep: [B] in [0, 1]
             conditioning: [B, cond_dim] from transformer readout
         Returns:
-            velocity: [B, action_dim]
+            velocity: same shape as noisy_action
         """
+        squeezed = False
+        if noisy_action.ndim == 2:
+            noisy_action = noisy_action.unsqueeze(1)  # [B, 1, action_dim]
+            squeezed = True
+
         # Fuse conditioning with timestep embedding
         t_emb = self.t_emb(timestep)
         cond = self.cond_fuse(torch.cat([conditioning, t_emb], dim=-1))
 
-        # Project action to token: [B, 1, d_model]
-        x = self.action_proj(noisy_action).unsqueeze(1)
+        # Project each action step to a token: [B, K, d_model]
+        x = self.action_proj(noisy_action)
 
-        # DiT blocks
+        # Add temporal position embeddings for chunk positions
+        if self.chunk_pos_emb is not None:
+            x = x + self.chunk_pos_emb
+
+        # DiT blocks — K tokens attend to each other
         for block in self.blocks:
             x = block(x, cond)
 
-        # Final projection to velocity
+        # Final projection to velocity: [B, K, action_dim]
         x = self.final_adaln(x, cond)
-        velocity = self.out_proj(x.squeeze(1))
+        velocity = self.out_proj(x)
+
+        if squeezed:
+            velocity = velocity.squeeze(1)
+
         return velocity

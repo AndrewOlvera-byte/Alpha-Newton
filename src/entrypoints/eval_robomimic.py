@@ -90,6 +90,7 @@ def run_episode(
     device: torch.device,
     num_flow_steps: int = 10,
     norm_stats: NormStats = None,
+    ema_alpha: float = 0.6,
 ):
     """Run single evaluation episode. Returns (success, total_reward, frames, ep_len)."""
     obs = env.reset()
@@ -97,7 +98,10 @@ def run_episode(
 
     total_reward = 0.0
     frames = []
-    action_np = np.zeros(history_buffer.action_dim, dtype=np.float32)
+    prev_action_norm_np = np.zeros(history_buffer.action_dim, dtype=np.float32)
+    ema_action_np = None  # EMA-smoothed action in normalized space
+
+    amp_ctx = torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
 
     for step in range(max_steps):
         state, images = extract_obs(obs, obs_keys_low_dim, obs_keys_image)
@@ -106,17 +110,27 @@ def run_episode(
         if "agentview_image" in images:
             frames.append(images["agentview_image"].copy())
 
-        # Normalize state and previous action before pushing to buffer
+        # Normalize state before pushing to buffer
         state_norm = norm_stats.normalize_state(state) if norm_stats else state
-        prev_action_norm = norm_stats.normalize_action(action_np) if (norm_stats and step > 0) else action_np
-        prev_action_in = prev_action_norm if step > 0 else None
+        prev_action_in = prev_action_norm_np if step > 0 else None
 
         history_buffer.push(images, state_norm, prev_action_in)
 
-        # Get model prediction (outputs normalized action)
+        # Get model prediction (outputs normalized action) — match training bf16 precision
         batch = history_buffer.get_batch(device=device)
-        action_norm = model.predict(batch, num_steps=num_flow_steps)
-        action_norm_np = action_norm.cpu().numpy().squeeze(0)
+        with amp_ctx:
+            action_norm = model.predict(batch, num_steps=num_flow_steps)
+        action_norm_np = action_norm.float().cpu().numpy().squeeze(0)
+
+        # EMA temporal smoothing: reduces jitter on single-step execution
+        if ema_action_np is None:
+            ema_action_np = action_norm_np.copy()
+        else:
+            ema_action_np = ema_alpha * action_norm_np + (1.0 - ema_alpha) * ema_action_np
+        action_norm_np = ema_action_np
+
+        # Keep normalized output for next step's prev_action (no round-trip)
+        prev_action_norm_np = action_norm_np.copy()
 
         # Denormalize → raw action space
         action_np = norm_stats.denormalize_action(action_norm_np) if norm_stats else action_norm_np
@@ -128,7 +142,7 @@ def run_episode(
         obs, reward, done, info = env.step(action_np)
         total_reward += reward
 
-        if env.is_success()["task"]:
+        if env._check_success():
             return True, total_reward, frames, step + 1
 
     return False, total_reward, frames, max_steps
@@ -150,6 +164,7 @@ def evaluate(
     output_dir: str = "outputs/eval",
     wandb_cfg: dict = None,
     norm_stats: NormStats = None,
+    ema_alpha: float = 0.6,
 ):
     """Run full evaluation."""
     if device is None:
@@ -195,6 +210,7 @@ def evaluate(
             obs_keys_low_dim, obs_keys_image,
             max_steps, device, num_flow_steps,
             norm_stats=norm_stats,
+            ema_alpha=ema_alpha,
         )
         successes.append(success)
         rewards.append(ep_reward)
@@ -252,6 +268,25 @@ def evaluate(
     }
 
 
+def _ensure_display():
+    """Start a virtual framebuffer if no display is available (headless Docker)."""
+    if os.environ.get("DISPLAY"):
+        return
+    try:
+        import subprocess
+        disp = ":99"
+        subprocess.Popen(
+            ["Xvfb", disp, "-screen", "0", "1024x768x24"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = disp
+        time.sleep(0.5)
+    except FileNotFoundError:
+        print("[Eval] WARNING: Xvfb not found — rendering may fail. "
+              "Install with: apt-get install -y xvfb")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate BC policy on robomimic tasks")
     parser.add_argument("--exp", type=str, required=True, help="Experiment config name")
@@ -261,7 +296,11 @@ def main():
     parser.add_argument("--flow-steps", type=int, default=10)
     parser.add_argument("--save-video", action="store_true")
     parser.add_argument("--output-dir", type=str, default="outputs/eval")
+    parser.add_argument("--ema-alpha", type=float, default=0.6,
+                        help="EMA smoothing coefficient for action temporal filtering (0=no smoothing)")
     args = parser.parse_args()
+
+    _ensure_display()
 
     cfg = Config.from_experiment(args.exp)
     robotics_cfg = cfg.robotics or {}
@@ -306,10 +345,12 @@ def main():
             history_length=arch_cfg.get("history_length", 3),
             action_dim=arch_cfg.get("action_dim", 7),
             num_flow_steps=args.flow_steps,
+            camera_size=84,  # match training: features extracted from 84px → ViT bilinear upsample to 224
             save_video=args.save_video,
             output_dir=args.output_dir,
             wandb_cfg=cfg.wandb,
             norm_stats=norm_stats,
+            ema_alpha=args.ema_alpha,
         )
 
 

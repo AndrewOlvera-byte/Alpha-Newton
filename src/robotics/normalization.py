@@ -51,14 +51,18 @@ class NormStats:
         demo_keys: List[str],
         obs_keys_low_dim: List[str],
         min_std: float = _MIN_STD,
+        clip_percentile: float = 1.0,
     ) -> "NormStats":
-        """Compute mean/std from training demos.
+        """Compute mean/std from training demos with outlier clipping.
 
         Args:
             hdf5_path: Path to robomimic HDF5 file
             demo_keys: List of demo keys to include (train split only)
             obs_keys_low_dim: Ordered list of low-dim obs keys (must match dataset construction)
             min_std: Floor for std — prevents divide-by-zero on constant dims
+            clip_percentile: Clip values outside [p, 100-p] percentile before computing
+                             stats. 1.0 clips bottom/top 1% — prevents outliers from
+                             skewing mean/std. Set to 0.0 to disable.
         """
         with h5py.File(hdf5_path, "r") as f:
             # Collect actions
@@ -76,6 +80,15 @@ class NormStats:
                     obs = obs[:, None]
                 state_parts.append(obs)
             state = np.concatenate(state_parts, axis=-1)  # [N, state_dim]
+
+        # Clip per-dimension outliers before computing stats
+        if clip_percentile > 0.0:
+            lo_a = np.percentile(actions, clip_percentile, axis=0)
+            hi_a = np.percentile(actions, 100.0 - clip_percentile, axis=0)
+            actions = np.clip(actions, lo_a, hi_a)
+            lo_s = np.percentile(state, clip_percentile, axis=0)
+            hi_s = np.percentile(state, 100.0 - clip_percentile, axis=0)
+            state = np.clip(state, lo_s, hi_s)
 
         action_mean = actions.mean(0).tolist()
         action_std = np.maximum(actions.std(0), min_std).tolist()

@@ -288,6 +288,7 @@ class RobomimicBCDataset(Dataset):
         state:        [H, state_dim]             float32  (normalized if norm_stats provided)
         prev_actions: [H, action_dim]            float32  (normalized if norm_stats provided)
         action:       [action_dim]               float32  (normalized target)
+        task_id:      scalar int64               task index (0-indexed, for task embedding)
 
     Early timesteps pad by repeating the first observation.
 
@@ -305,6 +306,7 @@ class RobomimicBCDataset(Dataset):
         history_length: int = 3,
         norm_stats=None,  # NormStats instance or None
         action_chunk_size: int = 1,
+        task_id: int = 0,  # integer task index — embedded by the model for multi-task conditioning
     ):
         self.hdf5_path = hdf5_path
         self.demo_keys = sorted(demo_keys)
@@ -313,6 +315,7 @@ class RobomimicBCDataset(Dataset):
         self.history_length = history_length
         self.norm_stats = norm_stats
         self.action_chunk_size = action_chunk_size
+        self.task_id = task_id
 
         self._index = []
         self._demo_lengths = {}
@@ -424,6 +427,7 @@ class RobomimicBCDataset(Dataset):
             "state": torch.from_numpy(state),
             "prev_actions": torch.from_numpy(prev_actions),
             "action": torch.from_numpy(action),
+            "task_id": torch.tensor(self.task_id, dtype=torch.long),
         }
 
 
@@ -458,7 +462,7 @@ def build_robomimic_bc_dataset(
     all_eval = []
     train_demo_info = []  # list of (hdf5_path, demo_keys) for norm stats
 
-    for task in tasks:
+    for i, task in enumerate(tasks):
         hdf5_path = os.path.join(data_dir, task, "ph", hdf5_name)
         if not os.path.exists(hdf5_path):
             raise FileNotFoundError(
@@ -473,7 +477,7 @@ def build_robomimic_bc_dataset(
         eval_demos = demo_keys[len(demo_keys) - n_eval :]
         train_demo_info.append((hdf5_path, train_demos))
 
-        print(f"[Robomimic BC] {task}/ph: {len(demo_keys)} demos "
+        print(f"[Robomimic BC] {task}/ph (id={i}): {len(demo_keys)} demos "
               f"(train={len(train_demos)}, eval={len(eval_demos)}), "
               f"history={history_length}")
 
@@ -483,6 +487,7 @@ def build_robomimic_bc_dataset(
             history_length=history_length,
             norm_stats=norm_stats,
             action_chunk_size=action_chunk_size,
+            task_id=i,  # 0-indexed — matches n_tasks in architecture config
         )
         all_train.append(RobomimicBCDataset(hdf5_path=hdf5_path, demo_keys=train_demos, **common))
         all_eval.append(RobomimicBCDataset(hdf5_path=hdf5_path, demo_keys=eval_demos, **common))
@@ -495,9 +500,11 @@ def build_robomimic_bc_dataset(
         eval_ds = ConcatDataset(all_eval)
 
     print(f"[Robomimic BC] Total: train={len(train_ds)}, eval={len(eval_ds)} samples")
+    print(f"[Robomimic BC] Task map: { {i: t for i, t in enumerate(tasks)} }")
     return {
         "train": train_ds,
         "eval": eval_ds,
         "_train_demo_info": train_demo_info,
         "_obs_keys_low_dim": obs_keys_low_dim,
+        "_task_names": list(tasks),  # index → task name (for logging/inference)
     }

@@ -113,7 +113,7 @@ class NormStats:
         )
 
     # ------------------------------------------------------------------
-    # Save / load
+    # Save / load — JSON (human-readable backup)
     # ------------------------------------------------------------------
 
     def save(self, path: str):
@@ -125,6 +125,45 @@ class NormStats:
         with open(path, "r") as f:
             data = json.load(f)
         return cls(**data)
+
+    # ------------------------------------------------------------------
+    # Save / load — HDF5 (primary cache, colocated with data for RL handoff)
+    #
+    # Stats are written to a "norm_stats/" group inside the dataset's own
+    # HDF5 file.  This keeps normalization colocated with the data so an
+    # RL run only needs the HDF5 path — no separate output directory to
+    # track down.  The write happens during BCTrainer.__init__ (before any
+    # DataLoader workers fork), so there is no concurrent-access concern.
+    # ------------------------------------------------------------------
+
+    def save_to_hdf5(self, hdf5_path: str, n_train_demos: int = 0) -> None:
+        """Write stats to norm_stats/ group in the dataset HDF5. Idempotent."""
+        with h5py.File(hdf5_path, "a") as f:
+            if "norm_stats" in f:
+                del f["norm_stats"]
+            grp = f.create_group("norm_stats")
+            grp.create_dataset("action_mean", data=np.array(self.action_mean, dtype=np.float32))
+            grp.create_dataset("action_std",  data=np.array(self.action_std,  dtype=np.float32))
+            grp.create_dataset("state_mean",  data=np.array(self.state_mean,  dtype=np.float32))
+            grp.create_dataset("state_std",   data=np.array(self.state_std,   dtype=np.float32))
+            grp.attrs["n_train_demos"] = n_train_demos
+
+    @classmethod
+    def load_from_hdf5(cls, hdf5_path: str) -> "NormStats":
+        with h5py.File(hdf5_path, "r") as f:
+            grp = f["norm_stats"]
+            return cls(
+                action_mean=grp["action_mean"][:].tolist(),
+                action_std=grp["action_std"][:].tolist(),
+                state_mean=grp["state_mean"][:].tolist(),
+                state_std=grp["state_std"][:].tolist(),
+            )
+
+    @classmethod
+    def exists_in_hdf5(cls, hdf5_path: str) -> bool:
+        """Return True if norm_stats/ group is present in the HDF5."""
+        with h5py.File(hdf5_path, "r") as f:
+            return "norm_stats" in f
 
     # ------------------------------------------------------------------
     # Normalize / denormalize (numpy or torch)

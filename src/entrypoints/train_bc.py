@@ -68,6 +68,9 @@ def test_dataset(cfg: Config):
             "prev_actions": batch["prev_actions"][:1].to(device),
             "action": batch["action"][:1].to(device),
         }
+        # Include task_id so task embeddings are exercised (multi-task models).
+        if "task_id" in batch:
+            test_batch["task_id"] = batch["task_id"][:1].to(device)
 
         print("Testing forward pass...")
         with torch.no_grad():

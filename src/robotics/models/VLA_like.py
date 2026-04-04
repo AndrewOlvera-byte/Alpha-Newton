@@ -81,6 +81,11 @@ class VLAPolicy(nn.Module):
         obs_dim: int = 19,
         n_cameras: int = 2,
         history_length: int = 3,
+        # Multi-task: number of distinct tasks. When > 1, a learned task token is
+        # prepended to the causal transformer sequence (so every frame can attend
+        # to it) and a separate task embedding biases the DiT conditioning vector.
+        # Set n_tasks=1 (default) for single-task — adds zero overhead.
+        n_tasks: int = 1,
         # ViT params
         vit_model: str = "facebook/dinov2-small",
         vit_img_size: int = 224,
@@ -184,8 +189,26 @@ class VLAPolicy(nn.Module):
         n_vision = n_cameras * self.n_patches
         tokens_per_group = n_vision + 2  # vision + state + action
         self.tokens_per_group = tokens_per_group
-        self.total_tokens = tokens_per_group * history_length + 1  # +1 READ
-        self.group_sizes = [tokens_per_group] * history_length + [1]
+        self.n_tasks = n_tasks
+
+        # Task embeddings — only allocated when n_tasks > 1.
+        # task_emb:     [n_tasks, d_model] — task token prepended to the causal
+        #               transformer sequence as group 0. Every subsequent group
+        #               can attend back to it via the block-causal mask, giving
+        #               the full history a shared task context signal.
+        # task_emb_dit: [n_tasks, d_dit]  — additive bias to the DiT conditioning
+        #               vector, so the flow-matching action head is also task-aware.
+        if n_tasks > 1:
+            self.task_emb = nn.Embedding(n_tasks, d_model)
+            self.task_emb_dit = nn.Embedding(n_tasks, d_dit)
+            nn.init.normal_(self.task_emb.weight, std=0.02)
+            nn.init.normal_(self.task_emb_dit.weight, std=0.02)
+            # Task token is group 0; history groups 1..H+1; readout is last group.
+            self.group_sizes = [1] + [tokens_per_group] * history_length + [1]
+            self.total_tokens = 1 + tokens_per_group * history_length + 1
+        else:
+            self.group_sizes = [tokens_per_group] * history_length + [1]
+            self.total_tokens = tokens_per_group * history_length + 1
 
         # Cache attention mask (registered as buffer, moves with model)
         mask = build_block_causal_mask(self.group_sizes, device=torch.device("cpu"))
@@ -267,6 +290,12 @@ class VLAPolicy(nn.Module):
         # Flatten to sequence: [B, H * tokens_per_group, d_model]
         sequence = timestep_tokens.reshape(B, H * self.tokens_per_group, self.d_model)
 
+        # Prepend task token (multi-task mode only).
+        # Placed at position 0 so every history frame can attend back to it.
+        if self.n_tasks > 1 and "task_id" in batch:
+            task_token = self.task_emb(batch["task_id"]).unsqueeze(1)  # [B, 1, d_model]
+            sequence = torch.cat([task_token, sequence], dim=1)
+
         # Append [READ] token
         readout = self.readout_token.expand(B, -1, -1)
         sequence = torch.cat([sequence, readout], dim=1)
@@ -280,6 +309,11 @@ class VLAPolicy(nn.Module):
         # --- Extract [READ] token → conditioning ---
         readout_out = sequence[:, -1]  # [B, d_model]
         conditioning = self.readout_proj(readout_out)  # [B, cond_dim]
+
+        # Task-conditioned bias to DiT action head.
+        # Additive injection (not concatenation) keeps d_dit fixed regardless of n_tasks.
+        if self.n_tasks > 1 and "task_id" in batch:
+            conditioning = conditioning + self.task_emb_dit(batch["task_id"])
 
         return conditioning
 

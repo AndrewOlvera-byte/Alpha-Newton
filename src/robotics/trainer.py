@@ -14,14 +14,70 @@ from __future__ import annotations
 
 import os
 import math
+import random
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 from src.core.registry import register
+
+
+class TaskBalancedBatchSampler(Sampler):
+    """Yields complete batches with exactly spt = batch_size // n_tasks samples
+    from each task.  Implemented as a BatchSampler (yields lists of indices) so
+    the DataLoader never crosses a round boundary — the guarantee is exact.
+
+    Works with ConcatDataset where each component dataset corresponds to one task.
+    Each epoch independently shuffles within each task before interleaving.
+    Falls back cleanly for single-task datasets (equivalent to random batching).
+
+    Note: effective batch size = spt * n_tasks which may be slightly less than
+    the requested batch_size when batch_size is not divisible by n_tasks.
+    e.g. batch_size=128, n_tasks=3 → spt=42, effective_bs=126.  The <2%
+    difference is negligible for LR scaling purposes.
+    """
+
+    def __init__(self, dataset, batch_size: int):
+        datasets = list(getattr(dataset, "datasets", [dataset]))
+        self.n_tasks = len(datasets)
+        self.spt = batch_size // self.n_tasks  # samples per task per batch
+
+        # Absolute index range for each task within the ConcatDataset
+        self._task_ranges: List[tuple] = []
+        offset = 0
+        for ds in datasets:
+            n = len(ds)
+            self._task_ranges.append((offset, offset + n))
+            offset += n
+
+        # Limit to the smallest task so all tasks contribute equally.
+        min_task_n = min(hi - lo for lo, hi in self._task_ranges)
+        self._n_batches = min_task_n // self.spt
+        self.effective_batch_size = self.spt * self.n_tasks
+
+    def __len__(self) -> int:
+        return self._n_batches
+
+    def __iter__(self):
+        # Independently shuffle each task's index pool for this epoch
+        per_task = []
+        for lo, hi in self._task_ranges:
+            pool = list(range(lo, hi))
+            random.shuffle(pool)
+            per_task.append(pool)
+
+        # Each iteration yields one complete batch list.
+        # Shuffling within the batch mixes tasks so they're not contiguous.
+        for b in range(self._n_batches):
+            batch = []
+            start = b * self.spt
+            for task_pool in per_task:
+                batch.extend(task_pool[start: start + self.spt])
+            random.shuffle(batch)
+            yield batch
 
 
 def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -59,6 +115,10 @@ class BCTrainer:
         self.wandb_cfg = wandb_cfg or {}
         self.norm_stats = norm_stats
         self._dataset_meta = dataset_meta or {}
+        # {0: "lift", 1: "can", ...} — used to label per-task wandb metrics readably
+        self._task_names: Dict[int, str] = {
+            i: name for i, name in enumerate(self._dataset_meta.get("_task_names", []))
+        }
 
         # Device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -154,15 +214,34 @@ class BCTrainer:
             worker_kwargs["prefetch_factor"] = self.prefetch_factor
             worker_kwargs["persistent_workers"] = True
 
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            drop_last=True,
-            **worker_kwargs,
-        )
+        # Use TaskBalancedBatchSampler for multi-task (ConcatDataset) to guarantee
+        # exactly spt = batch_size // n_tasks samples from each task per batch.
+        # Implemented as a batch_sampler so the DataLoader never crosses a round
+        # boundary — the guarantee is exact, not approximate.
+        _n_task_components = len(getattr(self.train_dataset, "datasets", [None]))
+        if _n_task_components > 1:
+            _batch_sampler = TaskBalancedBatchSampler(self.train_dataset, batch_size=self.batch_size)
+            print(f"[Trainer] TaskBalancedBatchSampler: {_n_task_components} tasks, "
+                  f"{_batch_sampler.spt} samples/task/batch "
+                  f"(effective bs={_batch_sampler.effective_batch_size}), "
+                  f"{_batch_sampler._n_batches} batches/epoch")
+            self.train_loader = DataLoader(
+                self.train_dataset,
+                batch_sampler=_batch_sampler,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                **worker_kwargs,
+            )
+        else:
+            self.train_loader = DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                drop_last=True,
+                **worker_kwargs,
+            )
         self.eval_loader = DataLoader(
             self.eval_dataset,
             batch_size=self.eval_batch_size,
@@ -177,6 +256,11 @@ class BCTrainer:
         self.global_step = 0
         self.best_eval_loss = float("inf")
 
+        # Early stopping: stop when eval loss fails to improve for `patience` consecutive
+        # evaluations. patience=0 disables early stopping.
+        self.patience = training_cfg.get("early_stopping_patience", 0)
+        self._es_counter = 0  # consecutive evals without improvement
+
         os.makedirs(self.output_dir, exist_ok=True)
 
         # Norm stats: compute from training data if not provided
@@ -187,77 +271,103 @@ class BCTrainer:
             self._inject_norm_stats()
 
     def _maybe_compute_norm_stats(self):
-        """Compute or load normalization statistics from training data."""
+        """Compute or load per-task normalization statistics.
+
+        Priority for each task's stats:
+          1. norm_stats/ group in the task's own HDF5  (primary — survives across runs)
+          2. norm_stats_{task}.json in output_dir       (fallback if HDF5 was regenerated)
+          3. Compute from scratch, then write both
+
+        Per-task (not global) normalization is critical for multi-task BC:
+        each task has a different action distribution and needs its own reference
+        frame.  The policy's task embedding disambiguates, so the model can learn
+        separate normalized output spaces per task without confusion.
+
+        Storing stats in the HDF5 collocates normalization with data, making the
+        RL handoff clean — the RL script only needs the HDF5 path, not the BC
+        output directory.
+        """
         from src.robotics.normalization import NormStats
 
-        stats_path = os.path.join(self.output_dir, "norm_stats.json")
-
-        # Load from existing file if present
-        if os.path.exists(stats_path):
-            self.norm_stats = NormStats.load(stats_path)
-            print(f"[Trainer] Loaded norm stats from {stats_path}")
-            self._inject_norm_stats()
-            return
-
-        # Compute from training data
         demo_info = self._dataset_meta.get("_train_demo_info")
         obs_keys_low_dim = self._dataset_meta.get("_obs_keys_low_dim", [])
 
         if not demo_info or not obs_keys_low_dim:
-            print("[Trainer] No dataset metadata — skipping norm stats (set norm_stats manually).")
+            print("[Trainer] No dataset metadata — skipping norm stats.")
             return
 
-        print("[Trainer] Computing normalization statistics from training data...")
-        # Merge all demos across files into a single NormStats via NormStats.compute.
-        # This uses the same outlier-clipping logic as the standalone script.
-        import h5py, numpy as np
+        is_multitask = len(demo_info) > 1
 
-        if len(demo_info) == 1:
+        if not is_multitask:
+            # ── Single-task (backward-compatible path) ──────────────────
             hdf5_path, demo_keys = demo_info[0]
-            self.norm_stats = NormStats.compute(hdf5_path, demo_keys, obs_keys_low_dim)
-        else:
-            # Multi-task: concatenate all demos into a temporary view by writing a
-            # combined array, then computing stats. Simpler: collect arrays directly.
-            all_actions, all_states = [], []
-            for hdf5_path, demo_keys in demo_info:
-                with h5py.File(hdf5_path, "r") as f:
-                    for dk in demo_keys:
-                        all_actions.append(f[f"data/{dk}/actions"][:])
-                        parts = []
-                        for key in obs_keys_low_dim:
-                            obs = f[f"data/{dk}/obs/{key}"][:]
-                            if obs.ndim == 1:
-                                obs = obs[:, None]
-                            parts.append(obs)
-                        all_states.append(np.concatenate(parts, axis=-1))
-            all_actions = np.concatenate(all_actions, axis=0)
-            all_states = np.concatenate(all_states, axis=0)
-            # Apply the same 1% outlier clipping as NormStats.compute
-            min_std, clip_p = 1e-3, 1.0
-            for arr in [all_actions, all_states]:
-                lo = np.percentile(arr, clip_p, axis=0)
-                hi = np.percentile(arr, 100.0 - clip_p, axis=0)
-                np.clip(arr, lo, hi, out=arr)
-            self.norm_stats = NormStats(
-                action_mean=all_actions.mean(0).tolist(),
-                action_std=np.maximum(all_actions.std(0), min_std).tolist(),
-                state_mean=all_states.mean(0).tolist(),
-                state_std=np.maximum(all_states.std(0), min_std).tolist(),
-            )
+            json_path = os.path.join(self.output_dir, "norm_stats.json")
 
-        self.norm_stats.save(stats_path)
-        print(f"[Trainer] Norm stats computed and saved to {stats_path}")
+            if NormStats.exists_in_hdf5(hdf5_path):
+                self.norm_stats = NormStats.load_from_hdf5(hdf5_path)
+                print(f"[NormStats] Loaded from {hdf5_path} (HDF5 cache)")
+            elif os.path.exists(json_path):
+                self.norm_stats = NormStats.load(json_path)
+                print(f"[NormStats] Loaded from {json_path}")
+            else:
+                print("[NormStats] Computing for single task...")
+                self.norm_stats = NormStats.compute(hdf5_path, demo_keys, obs_keys_low_dim)
+                self.norm_stats.save_to_hdf5(hdf5_path, n_train_demos=len(demo_keys))
+                self.norm_stats.save(json_path)
+                print(f"[NormStats] Saved to HDF5 and {json_path}")
+
+            self._inject_norm_stats()
+            return
+
+        # ── Multi-task: compute independently per task ───────────────────
+        # Global stats would blend task distributions (lift=vertical,
+        # can=horizontal, square=rotational), producing a biased reference.
+        # Each task normalizes in its own action/state space.
+        print("[NormStats] Multi-task mode — computing per-task statistics:")
+        task_stats: Dict[int, NormStats] = {}
+
+        for task_id, (hdf5_path, demo_keys) in enumerate(demo_info):
+            task_name = self._task_names.get(task_id, str(task_id))
+            json_path = os.path.join(self.output_dir, f"norm_stats_{task_name}.json")
+
+            if NormStats.exists_in_hdf5(hdf5_path):
+                ns = NormStats.load_from_hdf5(hdf5_path)
+                print(f"  [{task_name}] Loaded from HDF5 cache")
+            elif os.path.exists(json_path):
+                ns = NormStats.load(json_path)
+                print(f"  [{task_name}] Loaded from {json_path}")
+            else:
+                print(f"  [{task_name}] Computing from {len(demo_keys)} train demos...")
+                ns = NormStats.compute(hdf5_path, demo_keys, obs_keys_low_dim)
+                ns.save_to_hdf5(hdf5_path, n_train_demos=len(demo_keys))
+                ns.save(json_path)
+                print(f"  [{task_name}] Saved to HDF5 and {json_path}")
+
+            task_stats[task_id] = ns
+
+        self.norm_stats = task_stats
         self._inject_norm_stats()
 
     def _inject_norm_stats(self):
-        """Propagate norm stats to datasets so workers see them."""
+        """Propagate norm stats into each dataset so DataLoader workers see them.
+
+        For multi-task (self.norm_stats is a dict), each task dataset gets its
+        own NormStats keyed by task_id.  For single-task, all datasets receive
+        the same NormStats (backward-compatible).
+
+        Workers are forked on the first iter() call in train(), which happens
+        after this method completes — so the injected stats are visible to workers.
+        """
         if self.norm_stats is None:
             return
-        # Inject into dataset instances (handles ConcatDataset too)
         for ds in [self.train_dataset, self.eval_dataset]:
-            datasets = ds.datasets if hasattr(ds, "datasets") else [ds]
-            for d in datasets:
-                d.norm_stats = self.norm_stats
+            sub_datasets = ds.datasets if hasattr(ds, "datasets") else [ds]
+            for d in sub_datasets:
+                if isinstance(self.norm_stats, dict):
+                    # Per-task: look up by the dataset's own task_id
+                    d.norm_stats = self.norm_stats.get(d.task_id)
+                else:
+                    d.norm_stats = self.norm_stats
 
     def _init_wandb(self):
         """Initialize wandb, prompting for API key if not set."""
@@ -345,6 +455,8 @@ class BCTrainer:
         }
         if hasattr(m, "vis_pool") and m.vis_pool is not None:
             groups["vis_pool"] = list(m.vis_pool.parameters())
+        if hasattr(m, "task_emb"):
+            groups["task_emb"] = list(m.task_emb.parameters()) + list(m.task_emb_dit.parameters())
         return groups
 
     @staticmethod
@@ -391,6 +503,7 @@ class BCTrainer:
 
         t0 = time.time()
         t_last_log = t0
+        _stop_early = False
 
         while self.global_step < self.max_steps:
             # ── Get batch ──────────────────────────────────────────────
@@ -499,18 +612,36 @@ class BCTrainer:
                 eval_metrics = self.evaluate()
                 eval_loss = eval_metrics["loss"]
 
+                # Remap task_{id}_* keys to task_{name}_* for readability in wandb
+                def _remap(k: str, v: float):
+                    for tid, tname in self._task_names.items():
+                        k = k.replace(f"task_{tid}_", f"task_{tname}_")
+                    return k, v
+
+                remapped = dict(_remap(k, v) for k, v in eval_metrics.items() if k != "loss")
                 self._log({
                     "eval/loss": eval_loss,
                     "eval/train_gap": eval_loss - recent_train_loss,
-                    **{f"eval/{k}": v for k, v in eval_metrics.items() if k != "loss"},
+                    **{f"eval/{k}": v for k, v in remapped.items()},
                 }, self.global_step)
 
                 if eval_loss < self.best_eval_loss:
                     self.best_eval_loss = eval_loss
+                    self._es_counter = 0
                     self._save_checkpoint("best")
                     print(f"[Eval] New best: {eval_loss:.4f}")
+                elif self.patience > 0:
+                    self._es_counter += 1
+                    print(f"[EarlyStopping] No improvement {self._es_counter}/{self.patience}")
+                    if self._es_counter >= self.patience:
+                        print(f"[EarlyStopping] Patience exhausted — stopping training.")
+                        _stop_early = True
 
+                self._log({"eval/es_counter": self._es_counter}, self.global_step)
                 self.model.train()
+                if _stop_early:
+                    self._save_checkpoint("early_stop")
+                    break
 
             # ── Checkpoint ─────────────────────────────────────────────
             if self.global_step % self.save_steps == 0:
@@ -526,21 +657,33 @@ class BCTrainer:
 
     @torch.no_grad()
     def evaluate(self) -> dict:
-        """Run evaluation. Returns dict of metrics including loss, action diversity, t-bucket losses."""
+        """Evaluate over the full eval set.
+
+        Returns metrics including:
+          - loss: mean flow-matching loss across all tasks
+          - task_{id}_loss: per-task mean loss (key diagnostic for multi-task overfit)
+          - action_sample_std / task_{id}_action_std: output diversity per task
+          - loss_t{lo}_{hi}: t-bucket losses
+        """
         self.model.eval()
+
         total_loss = 0.0
         n_batches = 0
-        all_t = []
-        all_lps = []
+        all_t: list = []
+        all_lps: list = []
 
-        # For action sample diversity: run predict twice on the first batch with different noise
-        first_batch = None
-        action_sample_std = None
+        # Per-task loss accumulation: {task_id: [per-sample losses]}
+        task_lps: Dict[int, list] = {}
+        # One representative batch per task for diversity sampling.
+        # eval_loader is unshuffled (tasks arrive in blocks) so the first batch
+        # seen for each task_id is a clean representative.
+        task_batches: Dict[int, dict] = {}
 
         for batch in self.eval_loader:
             batch = _move_batch_to_device(batch, self.device)
             with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_bf16):
                 output = self.model(batch)
+
             total_loss += output["loss"].item()
             n_batches += 1
 
@@ -548,28 +691,23 @@ class BCTrainer:
                 all_t.append(output["_t"].cpu())
                 all_lps.append(output["_loss_per_sample"].cpu())
 
-            if first_batch is None:
-                first_batch = batch
-
-        # Action diversity: sample the policy N times on the same obs, measure output std.
-        # High std = diverse/stochastic policy. Near-zero = collapsed/deterministic.
-        if first_batch is not None:
-            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_bf16):
-                n_samples = 8
-                samples = torch.stack([
-                    self.model.predict(first_batch).float() for _ in range(n_samples)
-                ], dim=0)  # [n_samples, B, action_dim]
-            # Mean per-dim std across batch — "how much does the output vary across noise seeds?"
-            action_sample_std = samples.std(dim=0).mean().item()
+            # Accumulate per-task losses and capture representative batches
+            if "task_id" in batch and "_loss_per_sample" in output:
+                lps = output["_loss_per_sample"].cpu()
+                for i, tid in enumerate(batch["task_id"].cpu().tolist()):
+                    tid = int(tid)
+                    task_lps.setdefault(tid, []).append(lps[i].item())
+                    if tid not in task_batches:
+                        task_batches[tid] = batch
 
         avg_loss = total_loss / max(1, n_batches)
+        metrics: Dict[str, float] = {"loss": avg_loss}
 
-        metrics = {"loss": avg_loss}
+        # ── Per-task mean loss ──────────────────────────────────────────
+        for tid, losses in sorted(task_lps.items()):
+            metrics[f"task_{tid}_loss"] = sum(losses) / len(losses)
 
-        if action_sample_std is not None:
-            metrics["action_sample_std"] = action_sample_std
-
-        # t-bucket losses at eval
+        # ── Flow-timestep loss buckets ──────────────────────────────────
         if all_t:
             cat_t = torch.cat(all_t)
             cat_lps = torch.cat(all_lps)
@@ -578,13 +716,36 @@ class BCTrainer:
                 lo, hi = bucket_edges[i], bucket_edges[i + 1]
                 mask = (cat_t >= lo) & (cat_t < hi)
                 if mask.any():
-                    key = f"loss_t{int(lo*100):02d}_{int(bucket_edges[i+1]*100):02d}"
-                    metrics[key] = cat_lps[mask].mean().item()
+                    metrics[f"loss_t{int(lo*100):02d}_{int(bucket_edges[i+1]*100):02d}"] = \
+                        cat_lps[mask].mean().item()
 
+        # ── Action diversity per task ───────────────────────────────────
+        # Sample the policy n_samples times on the same obs with different noise.
+        # High std = stochastic/diverse policy. Near-zero = mode-collapsed.
+        diversity_batches = task_batches if task_batches else {"0": next(iter(self.eval_loader))}
+        all_stds = []
+        n_samples = 8
+        with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_bf16):
+            for tid, tb in diversity_batches.items():
+                if not isinstance(tb, dict):
+                    tb = _move_batch_to_device(tb, self.device)
+                samples = torch.stack([
+                    self.model.predict(tb).float() for _ in range(n_samples)
+                ], dim=0)  # [n_samples, B, action_dim]
+                std = samples.std(dim=0).mean().item()
+                all_stds.append(std)
+                metrics[f"task_{tid}_action_std"] = std
+        metrics["action_sample_std"] = sum(all_stds) / max(1, len(all_stds))
+
+        task_loss_str = "  ".join(
+            f"t{k}={v:.4f}" for k, v in metrics.items()
+            if k.startswith("task_") and k.endswith("_loss")
+        )
         print(
             f"[Eval @ {self.global_step}] "
-            f"loss={avg_loss:.4f} "
-            f"action_std={action_sample_std:.4f} "
+            f"loss={avg_loss:.4f}  "
+            + (f"{task_loss_str}  " if task_loss_str else "")
+            + f"action_std={metrics['action_sample_std']:.4f}  "
             f"({n_batches} batches)"
         )
         return metrics
@@ -607,8 +768,14 @@ class BCTrainer:
             "best_eval_loss": self.best_eval_loss,
         }, os.path.join(path, "training_state.pt"))
 
-        # Save norm stats alongside checkpoint
-        if self.norm_stats is not None:
+        # Save norm stats alongside checkpoint (human-readable backup).
+        # Primary cache is already in the HDF5 files; these JSONs exist for
+        # quick inspection and as a fallback if HDF5s are regenerated.
+        if isinstance(self.norm_stats, dict):
+            for task_id, ns in self.norm_stats.items():
+                task_name = self._task_names.get(task_id, str(task_id))
+                ns.save(os.path.join(path, f"norm_stats_{task_name}.json"))
+        elif self.norm_stats is not None:
             self.norm_stats.save(os.path.join(path, "norm_stats.json"))
 
         print(f"[Save] {path}")
@@ -674,6 +841,7 @@ def build_bc_trainer(
     dataset_meta = {
         "_train_demo_info": dataset.get("_train_demo_info"),
         "_obs_keys_low_dim": dataset.get("_obs_keys_low_dim"),
+        "_task_names": dataset.get("_task_names", []),
     }
     return BCTrainer(
         model=model,

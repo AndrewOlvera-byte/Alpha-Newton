@@ -30,6 +30,14 @@ import urllib.request
 
 # Robomimic dataset URLs for PH (proficient human) variants
 # These are the official URLs from the robomimic project
+#
+# Compatibility notes:
+#   lift / can / square: single-arm, action_dim=7, obs_dim=19 — compatible with
+#                        bc_multitask_ph.yaml (n_tasks=3).
+#   transport:           bimanual (2 robots), action_dim=14, obs_dim varies.
+#                        Download and render as normal; training config requires
+#                        separate arch settings (action_dim=14, different obs_keys).
+#   tool_hang:           single-arm but much larger obs_dim — same caveat.
 DATASET_URLS = {
     "lift": {
         "low_dim": "http://downloads.cs.stanford.edu/downloads/rt_benchmark/lift/ph/low_dim_v141.hdf5",
@@ -39,6 +47,12 @@ DATASET_URLS = {
     },
     "square": {
         "low_dim": "http://downloads.cs.stanford.edu/downloads/rt_benchmark/square/ph/low_dim_v141.hdf5",
+    },
+    "transport": {
+        "low_dim": "http://downloads.cs.stanford.edu/downloads/rt_benchmark/transport/ph/low_dim_v141.hdf5",
+    },
+    "tool_hang": {
+        "low_dim": "http://downloads.cs.stanford.edu/downloads/rt_benchmark/tool_hang/ph/low_dim_v141.hdf5",
     },
 }
 
@@ -141,9 +155,11 @@ def main():
     parser.add_argument(
         "--tasks",
         nargs="+",
-        choices=["lift", "can", "square"],
+        choices=["lift", "can", "square", "transport", "tool_hang"],
         default=["lift"],
-        help="Tasks to download (default: lift)",
+        help="Tasks to download (default: lift). "
+             "For bc_multitask_ph training use: lift can square. "
+             "transport and tool_hang have different action/obs dims and need separate configs.",
     )
     parser.add_argument(
         "--data-dir",

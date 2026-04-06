@@ -53,11 +53,13 @@ class HistoryBuffer:
         action_dim: int,
         task_id: int = 0,
         norm_stats=None,  # NormStats instance for this task, or None
+        target_state_dim: int = None,  # pad state to this dim after normalization (multi-task)
     ):
         self.history_length = history_length
         self.action_dim = action_dim
         self.task_id = task_id
         self.norm_stats = norm_stats
+        self.target_state_dim = target_state_dim
 
         self._images: deque = deque(maxlen=history_length)
         self._states: deque = deque(maxlen=history_length)
@@ -121,6 +123,10 @@ class HistoryBuffer:
         state_np = np.stack(states_list).astype(np.float32)  # [H, state_dim]
         if self.norm_stats is not None:
             state_np = self.norm_stats.normalize_state(state_np)
+        # Pad to target_state_dim after normalization (mirrors training dataset behavior)
+        if self.target_state_dim is not None and state_np.shape[-1] < self.target_state_dim:
+            pad = np.zeros((state_np.shape[0], self.target_state_dim - state_np.shape[-1]), dtype=np.float32)
+            state_np = np.concatenate([state_np, pad], axis=-1)
 
         # ── Prev actions: [H, action_dim] ─────────────────────────────
         prev_actions_np = np.stack(actions_list).astype(np.float32)  # [H, action_dim]

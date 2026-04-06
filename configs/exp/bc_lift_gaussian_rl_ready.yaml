@@ -1,0 +1,81 @@
+run:
+  name: "bc_lift_gaussian_rl_ready"
+  mode: "bc"
+
+data:
+  type: "robomimic_bc"
+  data_dir: "data/robomimic"
+  tasks:
+    - "lift"
+  history_length: 3
+  image_size: 160
+  feature_aug_train_mode: "canonical"
+  feature_aug_eval_mode: "canonical"
+  obs_keys:
+    low_dim:
+      - "robot0_eef_pos"
+      - "robot0_eef_quat"
+      - "robot0_gripper_qpos"
+      - "object-state"
+    image:
+      - "agentview_image"
+      - "robot0_eye_in_hand_image"
+  action_chunk_size: 1
+  eval_ratio: 0.1
+  hdf5_filter_key: null
+
+robotics:
+  architecture:
+    type: "vla_gaussian_bc"
+    d_model: 256
+    n_transformer_layers: 4
+    n_transformer_heads: 4
+    d_ff: 1024
+    dropout: 0.10
+    encoder_hidden_dim: 96
+    controller_hidden_dim: 512
+    controller_cross_attention_heads: 4
+    controller_ff_dim: 1024
+    log_std_min: -5.0
+    log_std_max: 1.0
+    action_dim: 7
+    obs_dim: 19
+    n_cameras: 2
+    history_length: 3
+    vit_model: "facebook/dinov2-small"
+    vit_img_size: 224
+    freeze_vit: true
+    vis_tokens_per_camera: 32
+    vis_pool_type: "avg"
+    action_chunk_size: 1
+    gradient_checkpointing: false
+
+training:
+  per_device_train_batch_size: 64
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  weight_decay: 5.0e-4
+  warmup_steps: 200
+  max_steps: 3000
+  max_grad_norm: 5.0
+  logging_steps: 25
+  save_steps: 200
+  eval_steps: 100
+  early_stopping_patience: 12
+  selection_metric: "eval_loss"
+  rollout_eval:
+    enabled: false
+  bf16: true
+  fp8: false
+  torch_compile: false
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+  output_dir: "outputs/bc_lift_gaussian_rl_ready"
+
+wandb:
+  project: "robotics-bc"
+  entity: "andrewolvera"
+  run_name: "bc_lift_gaussian_rl_ready"
+  tags: ["bc", "lift", "rl_handoff", "gaussian_head", "cross_attention_controller", "mean_inference", "no_feature_aug"]

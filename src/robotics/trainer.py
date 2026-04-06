@@ -119,6 +119,9 @@ class BCTrainer:
         self._task_names: Dict[int, str] = {
             i: name for i, name in enumerate(self._dataset_meta.get("_task_names", []))
         }
+        self._obs_keys_low_dim: List[str] = list(self._dataset_meta.get("_obs_keys_low_dim", []) or [])
+        self._obs_keys_image: List[str] = list(self._dataset_meta.get("_obs_keys_image", []) or [])
+        self._image_size: int = int(self._dataset_meta.get("_image_size", 84) or 84)
 
         # Device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -140,6 +143,29 @@ class BCTrainer:
         self.num_workers = training_cfg.get("dataloader_num_workers", 4)
         self.pin_memory = training_cfg.get("dataloader_pin_memory", True)
         self.prefetch_factor = training_cfg.get("dataloader_prefetch_factor", 2)
+        self.selection_metric = training_cfg.get("selection_metric", "eval_loss")
+
+        rollout_cfg = training_cfg.get("rollout_eval", {}) or {}
+        self.rollout_eval_enabled = bool(rollout_cfg.get("enabled", False))
+        self.rollout_eval_episodes = int(rollout_cfg.get("episodes", 10))
+        self.rollout_eval_max_steps = int(rollout_cfg.get("max_steps", 400))
+        self.rollout_eval_every = int(rollout_cfg.get("every_steps", self.eval_steps))
+        self.rollout_eval_seed = int(rollout_cfg.get("seed", 7))
+        self.rollout_eval_ema_alpha = float(rollout_cfg.get("ema_alpha", 0.4))
+        self.rollout_eval_flow_steps = int(
+            rollout_cfg.get(
+                "flow_steps",
+                self.robotics_cfg.get("architecture", {}).get("num_flow_steps", 10),
+            )
+        )
+        self.rollout_eval_target_task = rollout_cfg.get("target_task")
+        if self.rollout_eval_enabled and self.selection_metric == "rollout_success":
+            print(
+                f"[Trainer] Rollout model selection enabled: "
+                f"task={self.rollout_eval_target_task or 'first_task'} "
+                f"episodes={self.rollout_eval_episodes} "
+                f"every={self.rollout_eval_every} steps"
+            )
 
         # Mixed precision
         self.use_bf16 = training_cfg.get("bf16", True)
@@ -255,6 +281,8 @@ class BCTrainer:
         # State
         self.global_step = 0
         self.best_eval_loss = float("inf")
+        self.best_rollout_success = float("-inf")
+        self.best_rollout_reward = float("-inf")
 
         # Early stopping: stop when eval loss fails to improve for `patience` consecutive
         # evaluations. patience=0 disables early stopping.
@@ -426,6 +454,74 @@ class BCTrainer:
         if self._wandb and self._wandb.run:
             self._wandb.log(metrics, step=step)
 
+    def _seed_everything(self, seed: int):
+        random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    def _resolve_rollout_task(self) -> tuple[Optional[int], Optional[str]]:
+        if not self._task_names:
+            return None, None
+        if self.rollout_eval_target_task is None:
+            return 0, self._task_names.get(0)
+        for task_id, task_name in self._task_names.items():
+            if task_name == self.rollout_eval_target_task:
+                return task_id, task_name
+        raise ValueError(
+            f"rollout_eval.target_task={self.rollout_eval_target_task!r} "
+            f"not found in tasks {list(self._task_names.values())}"
+        )
+
+    @torch.no_grad()
+    def _evaluate_rollouts(self) -> Dict[str, float]:
+        if not self.rollout_eval_enabled:
+            return {}
+
+        task_id, task_name = self._resolve_rollout_task()
+        if task_id is None or task_name is None:
+            return {}
+
+        from src.entrypoints.eval_robomimic import _ensure_display, evaluate as evaluate_rollouts
+
+        _ensure_display()
+        self._seed_everything(self.rollout_eval_seed)
+
+        norm_stats = None
+        if isinstance(self.norm_stats, dict):
+            norm_stats = self.norm_stats.get(task_id)
+        else:
+            norm_stats = self.norm_stats
+
+        result = evaluate_rollouts(
+            model=self.model,
+            task_name=task_name,
+            task_id=task_id,
+            obs_keys_low_dim=self._obs_keys_low_dim,
+            obs_keys_image=self._obs_keys_image,
+            num_episodes=self.rollout_eval_episodes,
+            max_steps=self.rollout_eval_max_steps,
+            history_length=self.robotics_cfg.get("architecture", {}).get("history_length", 3),
+            action_dim=self.robotics_cfg.get("architecture", {}).get("action_dim", 7),
+            device=self.device,
+            num_flow_steps=self.rollout_eval_flow_steps,
+            camera_size=self._image_size,
+            save_video=False,
+            output_dir=os.path.join(self.output_dir, "rollout_eval"),
+            wandb_cfg=self.wandb_cfg,
+            norm_stats=norm_stats,
+            ema_alpha=self.rollout_eval_ema_alpha,
+            obs_dim=self.robotics_cfg.get("architecture", {}).get("obs_dim"),
+            seed=self.rollout_eval_seed,
+        )
+
+        return {
+            "task_id": float(task_id),
+            "success_rate": float(result["success_rate"]),
+            "avg_reward": float(result["avg_reward"]),
+            "avg_length": float(result["avg_length"]),
+        }
+
     # ------------------------------------------------------------------
     # Optimization dynamics helpers
     # ------------------------------------------------------------------
@@ -448,15 +544,46 @@ class BCTrainer:
     def _named_module_params(self):
         """Return {group_name: [params]} for the key trainable sub-modules."""
         m = self.model if not hasattr(self.model, "_orig_mod") else self.model._orig_mod
-        groups = {
-            "transformer": list(m.transformer.parameters()),
-            "dit_head": list(m.dit_head.parameters()),
-            "readout_proj": list(m.readout_proj.parameters()),
-        }
-        if hasattr(m, "vis_pool") and m.vis_pool is not None:
-            groups["vis_pool"] = list(m.vis_pool.parameters())
-        if hasattr(m, "task_emb"):
-            groups["task_emb"] = list(m.task_emb.parameters()) + list(m.task_emb_dit.parameters())
+        backbone = getattr(m, "backbone", None)
+        groups = {}
+
+        transformer_mod = getattr(m, "transformer", None)
+        if transformer_mod is None and backbone is not None:
+            transformer_mod = getattr(backbone, "transformer", None)
+        if transformer_mod is not None:
+            groups["transformer"] = list(transformer_mod.parameters())
+
+        readout_mod = getattr(m, "readout_proj", None)
+        if readout_mod is not None:
+            groups["readout_proj"] = list(readout_mod.parameters())
+
+        dit_head_mod = getattr(m, "dit_head", None)
+        if dit_head_mod is not None:
+            groups["dit_head"] = list(dit_head_mod.parameters())
+
+        controller_mod = getattr(m, "controller", None)
+        if controller_mod is not None:
+            groups["controller"] = list(controller_mod.parameters())
+
+        vis_pool_mod = getattr(m, "vis_pool", None)
+        if vis_pool_mod is None and backbone is not None:
+            vis_pool_mod = getattr(backbone, "vis_pool", None)
+        if vis_pool_mod is not None:
+            groups["vis_pool"] = list(vis_pool_mod.parameters())
+
+        task_emb_params = []
+        for parent in [m, backbone]:
+            if parent is None:
+                continue
+            if hasattr(parent, "task_emb"):
+                task_emb_params.extend(list(parent.task_emb.parameters()))
+            if hasattr(parent, "task_emb_dit"):
+                task_emb_params.extend(list(parent.task_emb_dit.parameters()))
+        if task_emb_params:
+            groups["task_emb"] = task_emb_params
+
+        if not groups:
+            groups["model"] = [p for p in m.parameters() if p.requires_grad]
         return groups
 
     @staticmethod
@@ -625,11 +752,40 @@ class BCTrainer:
                     **{f"eval/{k}": v for k, v in remapped.items()},
                 }, self.global_step)
 
-                if eval_loss < self.best_eval_loss:
+                rollout_metrics = {}
+                if self.rollout_eval_enabled and self.global_step % self.rollout_eval_every == 0:
+                    rollout_metrics = self._evaluate_rollouts()
+                    if rollout_metrics:
+                        self._log({
+                            "rollout/success_rate": rollout_metrics["success_rate"],
+                            "rollout/avg_reward": rollout_metrics["avg_reward"],
+                            "rollout/avg_length": rollout_metrics["avg_length"],
+                        }, self.global_step)
+
+                improved = False
+                if self.selection_metric == "rollout_success" and rollout_metrics:
+                    sr = rollout_metrics["success_rate"]
+                    reward = rollout_metrics["avg_reward"]
+                    if (
+                        sr > self.best_rollout_success
+                        or (math.isclose(sr, self.best_rollout_success) and reward > self.best_rollout_reward)
+                    ):
+                        self.best_rollout_success = sr
+                        self.best_rollout_reward = reward
+                        self.best_eval_loss = min(self.best_eval_loss, eval_loss)
+                        improved = True
+                        print(
+                            f"[Eval] New best rollout: SR={sr:.1f}% "
+                            f"reward={reward:.3f} eval_loss={eval_loss:.4f}"
+                        )
+                elif eval_loss < self.best_eval_loss:
                     self.best_eval_loss = eval_loss
+                    improved = True
+                    print(f"[Eval] New best: {eval_loss:.4f}")
+
+                if improved:
                     self._es_counter = 0
                     self._save_checkpoint("best")
-                    print(f"[Eval] New best: {eval_loss:.4f}")
                 elif self.patience > 0:
                     self._es_counter += 1
                     print(f"[EarlyStopping] No improvement {self._es_counter}/{self.patience}")
@@ -766,6 +922,8 @@ class BCTrainer:
             "scheduler": self.scheduler.state_dict(),
             "step": self.global_step,
             "best_eval_loss": self.best_eval_loss,
+            "best_rollout_success": self.best_rollout_success,
+            "best_rollout_reward": self.best_rollout_reward,
         }, os.path.join(path, "training_state.pt"))
 
         # Save norm stats alongside checkpoint (human-readable backup).
@@ -824,6 +982,8 @@ class BCTrainer:
             self.scheduler.load_state_dict(state["scheduler"])
             self.global_step = state["step"]
             self.best_eval_loss = state.get("best_eval_loss", float("inf"))
+            self.best_rollout_success = state.get("best_rollout_success", float("-inf"))
+            self.best_rollout_reward = state.get("best_rollout_reward", float("-inf"))
 
         print(f"[Resume] Loaded checkpoint from {path} (step {self.global_step})")
 
@@ -841,6 +1001,8 @@ def build_bc_trainer(
     dataset_meta = {
         "_train_demo_info": dataset.get("_train_demo_info"),
         "_obs_keys_low_dim": dataset.get("_obs_keys_low_dim"),
+        "_obs_keys_image": dataset.get("_obs_keys_image"),
+        "_image_size": dataset.get("_image_size"),
         "_task_names": dataset.get("_task_names", []),
     }
     return BCTrainer(

@@ -3,14 +3,15 @@ Evaluate a trained BC policy on robomimic tasks via robosuite rollouts.
 
 Usage:
     python -m src.entrypoints.eval_robomimic \
-        --exp bc_lift_ph \
-        --checkpoint outputs/bc_lift_ph/best/model.pt \
+        --exp bc_multitask_ph \
+        --checkpoint outputs/bc_multitask_ph/best/model.pt \
         --episodes 50 \
         --save-video
 """
 import argparse
 import json
 import os
+import random
 import time
 
 import numpy as np
@@ -22,15 +23,31 @@ from src.robotics.models.HistoryBuffer import HistoryBuffer
 
 import src.robotics.data
 import src.robotics.models.VLA_like
+import src.robotics.models.VLA_MLP
+import src.robotics.models.VLA_Gaussian
 from src.robotics.normalization import NormStats
+
+
+# Robomimic config task names → robosuite environment names
+_ROBOSUITE_ENV_MAP = {
+    "lift":      "Lift",
+    "can":       "PickPlaceCan",
+    "square":    "NutAssemblySquare",
+    "stack":     "Stack",
+    "door":      "Door",
+    "wipe":      "Wipe",
+    "tool_hang": "ToolHang",
+    "transport": "TwoArmTransport",
+}
 
 
 def create_eval_env(task_name: str, camera_names: list, camera_size: int = 84, render_video: bool = False):
     """Create robosuite env for policy evaluation."""
     import robosuite as suite
 
+    robosuite_name = _ROBOSUITE_ENV_MAP.get(task_name.lower(), task_name.capitalize())
     env = suite.make(
-        task_name.capitalize(),
+        robosuite_name,
         robots=["Panda"],
         has_renderer=False,
         has_offscreen_renderer=True,
@@ -52,10 +69,6 @@ def extract_obs(env_obs: dict, obs_keys_low_dim: list, obs_keys_image: list):
     # Low-dim state
     state_parts = []
     for key in obs_keys_low_dim:
-        # robosuite uses different key names than HDF5
-        # Map common names
-        if key == "object-state" and key not in env_obs:
-            key = "object-state"
         if key in env_obs:
             val = env_obs[key]
             if isinstance(val, np.ndarray):
@@ -67,11 +80,9 @@ def extract_obs(env_obs: dict, obs_keys_low_dim: list, obs_keys_image: list):
     # Images: {cam_name: [H, W, C] uint8}
     images = {}
     for key in obs_keys_image:
-        # HDF5 key "agentview_image" corresponds to env obs "agentview_image"
         if key in env_obs:
             images[key] = env_obs[key]
         else:
-            # Try without _image suffix
             cam = key.replace("_image", "")
             img_key = f"{cam}_image"
             if img_key in env_obs:
@@ -91,6 +102,7 @@ def run_episode(
     num_flow_steps: int = 10,
     norm_stats: NormStats = None,
     ema_alpha: float = 0.6,
+    obs_dim: int = None,
 ):
     """Run single evaluation episode. Returns (success, total_reward, frames, ep_len)."""
     obs = env.reset()
@@ -98,8 +110,7 @@ def run_episode(
 
     total_reward = 0.0
     frames = []
-    prev_action_norm_np = np.zeros(history_buffer.action_dim, dtype=np.float32)
-    ema_action_np = None  # EMA-smoothed action in normalized space
+    ema_action_norm = None  # EMA-smoothed action in normalized space
 
     amp_ctx = torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
 
@@ -110,11 +121,8 @@ def run_episode(
         if "agentview_image" in images:
             frames.append(images["agentview_image"].copy())
 
-        # Normalize state before pushing to buffer
-        state_norm = norm_stats.normalize_state(state) if norm_stats else state
-        prev_action_in = prev_action_norm_np if step > 0 else None
-
-        history_buffer.push(images, state_norm, prev_action_in)
+        # Push raw state — buffer normalizes then pads to obs_dim internally
+        history_buffer.push(images, state)
 
         # Get model prediction (outputs normalized action) — match training bf16 precision
         batch = history_buffer.get_batch(device=device)
@@ -122,21 +130,20 @@ def run_episode(
             action_norm = model.predict(batch, num_steps=num_flow_steps)
         action_norm_np = action_norm.float().cpu().numpy().squeeze(0)
 
-        # EMA temporal smoothing: reduces jitter on single-step execution
-        if ema_action_np is None:
-            ema_action_np = action_norm_np.copy()
+        # EMA temporal smoothing in normalized space: reduces jitter on single-step execution
+        if ema_action_norm is None:
+            ema_action_norm = action_norm_np.copy()
         else:
-            ema_action_np = ema_alpha * action_norm_np + (1.0 - ema_alpha) * ema_action_np
-        action_norm_np = ema_action_np
-
-        # Keep normalized output for next step's prev_action (no round-trip)
-        prev_action_norm_np = action_norm_np.copy()
+            ema_action_norm = ema_alpha * action_norm_np + (1.0 - ema_alpha) * ema_action_norm
 
         # Denormalize → raw action space
-        action_np = norm_stats.denormalize_action(action_norm_np) if norm_stats else action_norm_np
+        action_np = norm_stats.denormalize_action(ema_action_norm) if norm_stats else ema_action_norm
 
         # Clip to valid env range
         action_np = np.clip(action_np, -1.0, 1.0)
+
+        # Record executed raw action so buffer uses it as prev_action next step
+        history_buffer.record_action(action_np)
 
         # Step environment
         obs, reward, done, info = env.step(action_np)
@@ -148,9 +155,27 @@ def run_episode(
     return False, total_reward, frames, max_steps
 
 
+def load_task_norm_stats(ckpt_dir: str, task_name: str) -> NormStats | None:
+    """Load per-task norm stats, checking checkpoint dir for norm_stats_{task}.json."""
+    candidates = [
+        os.path.join(ckpt_dir, f"norm_stats_{task_name}.json"),
+        os.path.join(os.path.dirname(ckpt_dir), f"norm_stats_{task_name}.json"),
+        os.path.join(ckpt_dir, "norm_stats.json"),
+        os.path.join(os.path.dirname(ckpt_dir), "norm_stats.json"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            stats = NormStats.load(path)
+            print(f"[Norm] {task_name}: loaded from {path}")
+            return stats
+    print(f"[Norm] WARNING: No norm_stats found for task '{task_name}' — actions will NOT be denormalized.")
+    return None
+
+
 def evaluate(
     model: torch.nn.Module,
     task_name: str,
+    task_id: int,
     obs_keys_low_dim: list,
     obs_keys_image: list,
     num_episodes: int = 50,
@@ -165,10 +190,19 @@ def evaluate(
     wandb_cfg: dict = None,
     norm_stats: NormStats = None,
     ema_alpha: float = 0.6,
+    obs_dim: int = None,
+    seed: int | None = None,
 ):
-    """Run full evaluation."""
+    """Run full evaluation for one task."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
     model = model.to(device)
     model.eval()
@@ -176,28 +210,19 @@ def evaluate(
     # Camera names from image obs keys (strip _image suffix for robosuite env)
     camera_names = [k.replace("_image", "") for k in obs_keys_image if k]
 
-    print(f"[Eval] Task: {task_name}")
+    print(f"\n[Eval] Task: {task_name} (task_id={task_id})")
     print(f"[Eval] Episodes: {num_episodes} | Max steps: {max_steps}")
-    print(f"[Eval] Cameras: {camera_names} | History: {history_length}")
+    print(f"[Eval] Cameras: {camera_names} | History: {history_length} | Camera size: {camera_size}")
     print(f"[Eval] Device: {device} | Flow steps: {num_flow_steps}")
 
     env = create_eval_env(task_name, camera_names, camera_size)
-    history_buffer = HistoryBuffer(history_length, action_dim)
-
-    # Wandb
-    wandb_run = None
-    if wandb_cfg and wandb_cfg.get("project"):
-        try:
-            import wandb
-            if wandb.api.api_key:
-                wandb_run = wandb.init(
-                    project=wandb_cfg["project"],
-                    entity=wandb_cfg.get("entity"),
-                    name=f"eval_{task_name}",
-                    tags=wandb_cfg.get("tags", []) + ["eval"],
-                )
-        except Exception:
-            pass
+    # Pass norm_stats + task_id to buffer — it normalizes then pads state internally
+    history_buffer = HistoryBuffer(
+        history_length, action_dim,
+        task_id=task_id,
+        norm_stats=norm_stats,
+        target_state_dim=obs_dim,
+    )
 
     successes = []
     rewards = []
@@ -211,6 +236,7 @@ def evaluate(
             max_steps, device, num_flow_steps,
             norm_stats=norm_stats,
             ema_alpha=ema_alpha,
+            obs_dim=obs_dim,
         )
         successes.append(success)
         rewards.append(ep_reward)
@@ -226,7 +252,6 @@ def evaluate(
 
     env.close()
 
-    # Final metrics
     success_rate = sum(successes) / len(successes) * 100
     avg_reward = np.mean(rewards)
     avg_len = np.mean(episode_lengths)
@@ -236,30 +261,17 @@ def evaluate(
     print(f"  Avg Reward:   {avg_reward:.3f}")
     print(f"  Avg Length:   {avg_len:.0f}")
 
-    if wandb_run:
-        import wandb
-        wandb.log({
-            f"eval/{task_name}/success_rate": success_rate,
-            f"eval/{task_name}/avg_reward": avg_reward,
-            f"eval/{task_name}/avg_length": avg_len,
-        })
-
     # Save video
     if save_video and all_frames:
         os.makedirs(output_dir, exist_ok=True)
         try:
             import imageio
-            for i, frames in enumerate(all_frames):
+            for i, ep_frames in enumerate(all_frames):
                 video_path = os.path.join(output_dir, f"{task_name}_ep{i}.mp4")
-                imageio.mimwrite(video_path, frames, fps=20)
+                imageio.mimwrite(video_path, ep_frames, fps=20)
                 print(f"  Video saved: {video_path}")
-                if wandb_run:
-                    wandb.log({f"eval/{task_name}/video_{i}": wandb.Video(video_path, fps=20)})
         except ImportError:
             print("  [warn] imageio not installed — skipping video save")
-
-    if wandb_run:
-        wandb.finish()
 
     return {
         "success_rate": success_rate,
@@ -298,6 +310,8 @@ def main():
     parser.add_argument("--output-dir", type=str, default="outputs/eval")
     parser.add_argument("--ema-alpha", type=float, default=0.6,
                         help="EMA smoothing coefficient for action temporal filtering (0=no smoothing)")
+    parser.add_argument("--seed", type=int, default=7,
+                        help="Deterministic evaluation seed")
     args = parser.parse_args()
 
     _ensure_display()
@@ -315,18 +329,7 @@ def main():
     model.load_state_dict(state_dict)
     print(f"[Checkpoint] Loaded: {args.checkpoint}")
 
-    # Load norm stats — check checkpoint dir, then output_dir root
-    norm_stats = None
-    for stats_path in [
-        os.path.join(ckpt_dir, "norm_stats.json"),
-        os.path.join(os.path.dirname(ckpt_dir), "norm_stats.json"),
-    ]:
-        if os.path.exists(stats_path):
-            norm_stats = NormStats.load(stats_path)
-            print(f"[Norm] Loaded stats from {stats_path}")
-            break
-    if norm_stats is None:
-        print("[Norm] WARNING: No norm_stats.json found — actions will NOT be denormalized.")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     obs_keys = cfg.data.get("obs_keys", {})
     obs_keys_low_dim = obs_keys.get("low_dim", [])
@@ -334,24 +337,38 @@ def main():
 
     tasks = cfg.data.get("tasks", ["lift"])
 
-    for task in tasks:
-        evaluate(
+    all_results = {}
+    for task_id, task in enumerate(tasks):
+        norm_stats = load_task_norm_stats(ckpt_dir, task)
+        result = evaluate(
             model=model,
             task_name=task,
+            task_id=task_id,
             obs_keys_low_dim=obs_keys_low_dim,
             obs_keys_image=obs_keys_image,
             num_episodes=args.episodes,
             max_steps=args.max_steps,
             history_length=arch_cfg.get("history_length", 3),
             action_dim=arch_cfg.get("action_dim", 7),
+            device=device,
             num_flow_steps=args.flow_steps,
-            camera_size=84,  # match training: features extracted from 84px → ViT bilinear upsample to 224
+            camera_size=cfg.data.get("image_size", 84),
             save_video=args.save_video,
             output_dir=args.output_dir,
             wandb_cfg=cfg.wandb,
             norm_stats=norm_stats,
             ema_alpha=args.ema_alpha,
+            obs_dim=arch_cfg.get("obs_dim"),
+            seed=args.seed,
         )
+        all_results[task] = result
+
+    # Summary across all tasks
+    if len(all_results) > 1:
+        mean_sr = np.mean([r["success_rate"] for r in all_results.values()])
+        print(f"\n[Summary] Mean success rate across {len(tasks)} tasks: {mean_sr:.1f}%")
+        for task, r in all_results.items():
+            print(f"  {task}: {r['success_rate']:.1f}%")
 
 
 if __name__ == "__main__":

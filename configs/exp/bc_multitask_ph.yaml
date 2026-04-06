@@ -5,7 +5,7 @@ run:
 # ─────────────────────────────────────────────
 # Dataset
 # ─────────────────────────────────────────────
-# 3 tasks (lift=0, can=1, square=2) — all single-arm, action_dim=7, obs_dim=19.
+# 3 tasks (lift=0, can=1, square=2) — all single-arm, action_dim=7, obs_dim=23.
 # Combined ~600 demos vs 200 for single-task, providing 3× more scene diversity
 # to fight overfitting without changing the architecture dimensions.
 #
@@ -64,7 +64,7 @@ robotics:
 
     # ── Task dimensions ─────────────────────────
     action_dim: 7             # [dx,dy,dz, droll,dpitch,dyaw, gripper]
-    obs_dim: 19               # eef_pos(3)+eef_quat(4)+gripper(2)+object(10)
+    obs_dim: 23               # eef_pos(3)+eef_quat(4)+gripper(2)+object-state(max=14 for can/square; lift=10 padded)
     n_cameras: 2
     history_length: 3
 

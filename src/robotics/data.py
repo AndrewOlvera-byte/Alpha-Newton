@@ -304,18 +304,24 @@ class RobomimicBCDataset(Dataset):
         obs_keys_low_dim: List[str],
         obs_keys_image: List[str],
         history_length: int = 3,
+        image_size: int = 84,
         norm_stats=None,  # NormStats instance or None
         action_chunk_size: int = 1,
         task_id: int = 0,  # integer task index — embedded by the model for multi-task conditioning
+        target_state_dim: Optional[int] = None,  # pad state to this dim for multi-task batching
+        feature_aug_mode: str = "random",  # "random" for train, "canonical" for eval
     ):
         self.hdf5_path = hdf5_path
         self.demo_keys = sorted(demo_keys)
         self.obs_keys_low_dim = obs_keys_low_dim
         self.obs_keys_image = [k for k in obs_keys_image if k]
         self.history_length = history_length
+        self.image_size = image_size
         self.norm_stats = norm_stats
         self.action_chunk_size = action_chunk_size
         self.task_id = task_id
+        self.target_state_dim = target_state_dim
+        self.feature_aug_mode = feature_aug_mode
 
         self._index = []
         self._demo_lengths = {}
@@ -340,6 +346,16 @@ class RobomimicBCDataset(Dataset):
                         print(f"[Dataset] Using precomputed features: {feat_key}")
                     else:
                         self._feature_keys[img_key] = None
+
+                # Compute actual state dim for this task
+                obs_grp = f[f"data/{first_dk}/obs"]
+                self.state_dim = sum(
+                    obs_grp[key].shape[-1] if obs_grp[key].ndim > 1 else 1
+                    for key in self.obs_keys_low_dim
+                    if key in obs_grp
+                )
+            else:
+                self.state_dim = 0
 
         self._hdf5_file = None
 
@@ -383,9 +399,14 @@ class RobomimicBCDataset(Dataset):
                 feat_all = demo_grp[f"obs/{feat_key}"]
                 feat_stack = np.stack([feat_all[hi] for hi in hist_indices])  # [H, ...]
                 if feat_stack.ndim == 4:
-                    # Has aug dimension [H, N_aug, n_patches, d] — sample one view randomly
+                    # Has aug dimension [H, N_aug, n_patches, d].
+                    # Train uses random augmented views; eval uses the canonical
+                    # first view to keep checkpoint selection deterministic.
                     n_aug = feat_stack.shape[1]
-                    aug_idx = np.random.randint(0, n_aug)
+                    if self.feature_aug_mode == "canonical":
+                        aug_idx = 0
+                    else:
+                        aug_idx = np.random.randint(0, n_aug)
                     feat_stack = feat_stack[:, aug_idx]  # [H, n_patches, d]
                 images[img_key] = torch.from_numpy(feat_stack.astype(np.float32))
             else:
@@ -422,11 +443,16 @@ class RobomimicBCDataset(Dataset):
             action = self.norm_stats.normalize_action(action)
             prev_actions = self.norm_stats.normalize_action(prev_actions)
 
+        # --- Pad state to target_state_dim for multi-task batching ---
+        if self.target_state_dim is not None and state.shape[-1] < self.target_state_dim:
+            pad = np.zeros((state.shape[0], self.target_state_dim - state.shape[-1]), dtype=np.float32)
+            state = np.concatenate([state, pad], axis=-1)
+
         return {
-            "images": images,
-            "state": torch.from_numpy(state),
-            "prev_actions": torch.from_numpy(prev_actions),
-            "action": torch.from_numpy(action),
+            "images": {k: v.clone() for k, v in images.items()},
+            "state": torch.from_numpy(state).clone(),
+            "prev_actions": torch.from_numpy(prev_actions).clone(),
+            "action": torch.from_numpy(action).clone(),
             "task_id": torch.tensor(self.task_id, dtype=torch.long),
         }
 
@@ -437,10 +463,13 @@ def build_robomimic_bc_dataset(
     tasks: List[str],
     obs_keys: Dict[str, List[str]],
     history_length: int = 3,
+    image_size: int = 84,
     hdf5_filter_key: Optional[str] = None,
     eval_ratio: float = 0.1,
     norm_stats=None,  # NormStats instance (computed by trainer, then injected)
     action_chunk_size: int = 1,
+    feature_aug_train_mode: str = "random",
+    feature_aug_eval_mode: str = "canonical",
     **kwargs,
 ) -> Dict[str, Any]:
     """Build robomimic BC dataset with per-timestep history windows.
@@ -485,12 +514,47 @@ def build_robomimic_bc_dataset(
             obs_keys_low_dim=obs_keys_low_dim,
             obs_keys_image=obs_keys_image,
             history_length=history_length,
+            image_size=image_size,
             norm_stats=norm_stats,
             action_chunk_size=action_chunk_size,
             task_id=i,  # 0-indexed — matches n_tasks in architecture config
         )
-        all_train.append(RobomimicBCDataset(hdf5_path=hdf5_path, demo_keys=train_demos, **common))
-        all_eval.append(RobomimicBCDataset(hdf5_path=hdf5_path, demo_keys=eval_demos, **common))
+        all_train.append(RobomimicBCDataset(
+            hdf5_path=hdf5_path,
+            demo_keys=train_demos,
+            feature_aug_mode=feature_aug_train_mode,
+            **common,
+        ))
+        all_eval.append(RobomimicBCDataset(
+            hdf5_path=hdf5_path,
+            demo_keys=eval_demos,
+            feature_aug_mode=feature_aug_eval_mode,
+            **common,
+        ))
+
+    # For multi-task: tasks may have different object-state dims (e.g. lift=10, can/square=14).
+    # Pad all state tensors to the max state_dim so the default collate can stack them.
+    if len(tasks) > 1:
+        max_state_dim = max(ds.state_dim for ds in all_train)
+        for ds in all_train + all_eval:
+            ds.target_state_dim = max_state_dim
+        print(f"[Robomimic BC] Multi-task state dims: "
+              f"{ {tasks[i]: ds.state_dim for i, ds in enumerate(all_train)} } → padded to {max_state_dim}")
+
+    # For multi-task: enforce consistent feature strategy across all task datasets.
+    # If any task is missing precomputed features for a camera, fall back to raw images
+    # for that camera in ALL tasks — otherwise mixed [H,256,384] vs [H,3,84,84] tensors
+    # in the same batch cause "Trying to resize storage that is not resizable" in collate.
+    all_ds = all_train + all_eval
+    if len(tasks) > 1 and obs_keys_image:
+        for img_key in obs_keys_image:
+            has_features = [ds._feature_keys.get(img_key) is not None for ds in all_train]
+            if any(has_features) and not all(has_features):
+                missing = [tasks[i] for i, ok in enumerate(has_features) if not ok]
+                print(f"[Robomimic BC] WARNING: precomputed features missing for "
+                      f"'{img_key}' in tasks {missing}. Falling back to raw images for all tasks.")
+                for ds in all_ds:
+                    ds._feature_keys[img_key] = None
 
     if len(tasks) == 1:
         train_ds, eval_ds = all_train[0], all_eval[0]
@@ -506,5 +570,7 @@ def build_robomimic_bc_dataset(
         "eval": eval_ds,
         "_train_demo_info": train_demo_info,
         "_obs_keys_low_dim": obs_keys_low_dim,
+        "_obs_keys_image": obs_keys_image,
+        "_image_size": image_size,
         "_task_names": list(tasks),  # index → task name (for logging/inference)
     }

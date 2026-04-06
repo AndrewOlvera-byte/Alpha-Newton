@@ -15,6 +15,8 @@ from src.core.registry import build
 import src.robotics.data
 import src.robotics.trainer
 import src.robotics.models.VLA_like
+import src.robotics.models.VLA_MLP
+import src.robotics.models.VLA_Gaussian
 
 
 def test_dataset(cfg: Config):
@@ -95,6 +97,7 @@ def main(exp_name: str, test_only: bool = False):
     print(f"[Config] Run:   {cfg.run['name']}")
     print(f"[Config] Mode:  {cfg.run['mode']}")
     print(f"[Config] Tasks: {cfg.data.get('tasks', [])}")
+    print(f"[Config] Image size: {cfg.data.get('image_size', 'unset')}")
     print(f"[Config] Output: {cfg.training['output_dir']}")
     print()
 

@@ -131,7 +131,7 @@ def run_episode(
         action_norm_np = action_norm.float().cpu().numpy().squeeze(0)
 
         # EMA temporal smoothing in normalized space: reduces jitter on single-step execution
-        if ema_action_norm is None:
+        if ema_action_norm is None or ema_alpha <= 0.0:
             ema_action_norm = action_norm_np.copy()
         else:
             ema_action_norm = ema_alpha * action_norm_np + (1.0 - ema_alpha) * ema_action_norm
@@ -142,12 +142,12 @@ def run_episode(
         # Clip to valid env range
         action_np = np.clip(action_np, -1.0, 1.0)
 
-        # Record executed raw action so buffer uses it as prev_action next step
-        history_buffer.record_action(action_np)
-
         # Step environment
         obs, reward, done, info = env.step(action_np)
         total_reward += reward
+
+        # Record executed raw action so buffer uses it as prev_action next step
+        history_buffer.record_action(action_np)
 
         if env._check_success():
             return True, total_reward, frames, step + 1
@@ -309,7 +309,7 @@ def main():
     parser.add_argument("--save-video", action="store_true")
     parser.add_argument("--output-dir", type=str, default="outputs/eval")
     parser.add_argument("--ema-alpha", type=float, default=0.6,
-                        help="EMA smoothing coefficient for action temporal filtering (0=no smoothing)")
+                        help="EMA current-action coefficient for temporal filtering (0 disables smoothing)")
     parser.add_argument("--seed", type=int, default=7,
                         help="Deterministic evaluation seed")
     args = parser.parse_args()

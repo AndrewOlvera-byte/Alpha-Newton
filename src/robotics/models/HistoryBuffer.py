@@ -64,12 +64,14 @@ class HistoryBuffer:
         self._images: deque = deque(maxlen=history_length)
         self._states: deque = deque(maxlen=history_length)
         self._prev_actions: deque = deque(maxlen=history_length)
+        self._last_action: Optional[np.ndarray] = None
         self._step = 0
 
     def reset(self):
         self._images.clear()
         self._states.clear()
         self._prev_actions.clear()
+        self._last_action = None
         self._step = 0
 
     def push(self, obs_images: Dict[str, np.ndarray], obs_state: np.ndarray):
@@ -79,13 +81,13 @@ class HistoryBuffer:
         Call record_action() after each env step to register the executed action.
         """
         prev_action = (
-            list(self._prev_actions)[-1]
-            if self._prev_actions
+            self._last_action
+            if self._last_action is not None
             else np.zeros(self.action_dim, dtype=np.float32)
         )
         self._images.append(obs_images)
         self._states.append(obs_state.astype(np.float32))
-        self._prev_actions.append(prev_action)
+        self._prev_actions.append(prev_action.astype(np.float32))
         self._step += 1
 
     def record_action(self, raw_action: np.ndarray):
@@ -94,12 +96,9 @@ class HistoryBuffer:
         Call this AFTER env.step() with the raw (world-space) action.
         The buffer stores it raw; normalization happens in get_batch().
         """
-        if self._prev_actions:
-            # Replace the last entry (which was the stale prev from push())
-            actions_list = list(self._prev_actions)
-            actions_list[-1] = raw_action.astype(np.float32)
-            self._prev_actions.clear()
-            self._prev_actions.extend(actions_list)
+        self._last_action = raw_action.astype(np.float32)
+
+    push_action = record_action
 
     def get_batch(self, device: Optional[torch.device] = None) -> dict:
         """Build a model-ready batch dict with B=1, normalized if norm_stats set.

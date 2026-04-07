@@ -357,6 +357,9 @@ class RobomimicBCDataset(Dataset):
             else:
                 self.state_dim = 0
 
+            if first_dk:
+                self._warn_if_constant_demo(f, first_dk)
+
         self._hdf5_file = None
 
     def __len__(self):
@@ -369,6 +372,38 @@ class RobomimicBCDataset(Dataset):
     def __del__(self):
         if self._hdf5_file is not None:
             self._hdf5_file.close()
+
+    def _warn_if_constant_demo(self, f: h5py.File, demo_key: str) -> None:
+        """Warn if a rendered demo appears time-constant despite varying actions."""
+        demo_grp = f[f"data/{demo_key}"]
+        if demo_grp["actions"].shape[0] < 2:
+            return
+        action_delta = np.abs(np.diff(demo_grp["actions"][:], axis=0)).mean()
+        if action_delta < 1e-6:
+            return
+
+        checks = []
+        for key in self.obs_keys_low_dim:
+            obs_path = f"obs/{key}"
+            if obs_path in demo_grp:
+                arr = demo_grp[obs_path][:]
+                checks.append((key, float(np.abs(np.diff(arr.astype(np.float32), axis=0)).mean())))
+        for img_key in self.obs_keys_image:
+            feat_key = self._feature_keys.get(img_key)
+            obs_path = f"obs/{feat_key or img_key}"
+            if obs_path in demo_grp:
+                arr = demo_grp[obs_path][:]
+                checks.append((feat_key or img_key, float(np.abs(np.diff(arr.astype(np.float32), axis=0)).mean())))
+
+        if checks and all(delta < 1e-6 for _, delta in checks):
+            checked = ", ".join(name for name, _ in checks)
+            print(
+                f"[Dataset] WARNING: {self.hdf5_path} {demo_key} has varying actions "
+                f"but time-constant observations/features ({checked}). If this is a "
+                f"rendered robomimic image dataset, regenerate it with "
+                f"`python scripts/render_images.py --dataset ... --overwrite` and "
+                f"then rerun `scripts/precompute_features.py`."
+            )
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         self._open()

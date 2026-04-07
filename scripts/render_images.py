@@ -46,12 +46,16 @@ def create_env(env_meta, camera_names, camera_size):
     return env
 
 
-def render_dataset(dataset_path, output_name, camera_names, camera_size, n_demos=None, compress=True):
+def render_dataset(dataset_path, output_name, camera_names, camera_size, n_demos=None, compress=True, overwrite=False):
     """Replay sim states and render camera images into a new HDF5."""
     output_path = os.path.join(os.path.dirname(dataset_path), output_name)
     if os.path.exists(output_path):
-        print(f"[skip] Output already exists: {output_path}")
-        return output_path
+        if overwrite:
+            print(f"[overwrite] Removing existing output: {output_path}")
+            os.remove(output_path)
+        else:
+            print(f"[skip] Output already exists: {output_path}")
+            return output_path
 
     f_in = h5py.File(dataset_path, "r")
     env_meta = json.loads(f_in["data"].attrs["env_args"])
@@ -94,7 +98,10 @@ def render_dataset(dataset_path, output_name, camera_names, camera_size, n_demos
             env.sim.forward()
 
             # Get observation dict from env
-            obs = env._get_observations()
+            # Manually setting sim state does not advance robosuite's observable
+            # cache. Force an update or every rendered timestep can reuse the
+            # previous/reset observation.
+            obs = env._get_observations(force_update=True)
 
             # Capture camera images
             for cam in camera_names:
@@ -188,6 +195,7 @@ def main():
     parser.add_argument("--size", type=int, default=84, help="Image resolution")
     parser.add_argument("--n", type=int, default=None, help="Process only first N demos")
     parser.add_argument("--no-compress", action="store_true")
+    parser.add_argument("--overwrite", action="store_true", help="Replace output image HDF5 if it already exists")
     args = parser.parse_args()
 
     render_dataset(
@@ -197,6 +205,7 @@ def main():
         camera_size=args.size,
         n_demos=args.n,
         compress=not args.no_compress,
+        overwrite=args.overwrite,
     )
 
 

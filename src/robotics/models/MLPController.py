@@ -46,10 +46,12 @@ class MLPController(nn.Module):
         d_ff: int = 1024,
         dropout: float = 0.1,
         action_chunk_size: int = 1,
+        predict_log_var: bool = False,
     ):
         super().__init__()
         self.action_dim = action_dim
         self.action_chunk_size = action_chunk_size
+        self.predict_log_var = predict_log_var
         self.cross_attention = IntentCrossAttention(d_model, n_heads, d_ff, dropout=dropout)
         self.trunk = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -64,8 +66,16 @@ class MLPController(nn.Module):
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
+        if predict_log_var:
+            self.log_var_head = nn.Linear(hidden_dim, action_chunk_size * action_dim)
+            nn.init.zeros_(self.log_var_head.weight)
+            nn.init.constant_(self.log_var_head.bias, -1.0)  # start with low variance
+
     def forward(self, sequence_tokens: torch.Tensor, intent_token: torch.Tensor) -> torch.Tensor:
         fused = self.cross_attention(sequence_tokens, intent_token)
         hidden = self.trunk(fused)
-        action = self.output(hidden)
-        return action.view(action.shape[0], self.action_chunk_size, self.action_dim)
+        mu = self.output(hidden).view(hidden.shape[0], self.action_chunk_size, self.action_dim)
+        if self.predict_log_var:
+            log_var = self.log_var_head(hidden).view(hidden.shape[0], self.action_chunk_size, self.action_dim)
+            return mu, log_var
+        return mu

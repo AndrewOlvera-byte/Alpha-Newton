@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.core.registry import register
+from src.robotics.loss import gaussian_nll_loss
 from src.robotics.models.IntentBCBase import VisionIntentBCBackbone
 from src.robotics.models.MLPController import MLPController
 
@@ -36,10 +37,12 @@ class VLAMLPPolicy(nn.Module):
         controller_hidden_dim: int = 512,
         controller_cross_attention_heads: int = 4,
         controller_ff_dim: int = 1024,
+        bc_loss_type: str = "mse",
         **kwargs,
     ):
         super().__init__()
         self.action_chunk_size = action_chunk_size
+        self.bc_loss_type = bc_loss_type
         self.backbone = VisionIntentBCBackbone(
             d_model=d_model,
             n_transformer_layers=n_transformer_layers,
@@ -67,6 +70,7 @@ class VLAMLPPolicy(nn.Module):
             d_ff=controller_ff_dim,
             dropout=dropout,
             action_chunk_size=action_chunk_size,
+            predict_log_var=(bc_loss_type == "gnll"),
         )
 
     def _target_to_chunk(self, target_action: torch.Tensor) -> torch.Tensor:
@@ -76,17 +80,28 @@ class VLAMLPPolicy(nn.Module):
 
     def forward(self, batch: dict) -> dict:
         encoded = self.backbone(batch)
-        pred_action = self.controller(encoded["decoded_sequence"], encoded["intent_token"])
+        ctrl_out = self.controller(encoded["decoded_sequence"], encoded["intent_token"])
         target_action = self._target_to_chunk(batch["action"])
-        loss_per_sample = F.mse_loss(pred_action, target_action, reduction="none").mean(dim=(-1, -2))
-        return {"loss": loss_per_sample.mean(), "_loss_per_sample": loss_per_sample.detach()}
+
+        if self.bc_loss_type == "gnll":
+            pred_mu, pred_log_var = ctrl_out
+            loss, loss_per_sample = gaussian_nll_loss(pred_mu, pred_log_var, target_action)
+        else:
+            loss_per_sample = F.mse_loss(ctrl_out, target_action, reduction="none").mean(dim=(-1, -2))
+            loss = loss_per_sample.mean()
+            loss_per_sample = loss_per_sample.detach()
+
+        return {"loss": loss, "_loss_per_sample": loss_per_sample}
 
     @torch.no_grad()
     def predict(self, batch: dict, num_steps: int = None) -> torch.Tensor:
         del num_steps
         encoded = self.backbone(batch)
-        action = self.controller(encoded["decoded_sequence"], encoded["intent_token"])
-        return action[:, 0].clamp(-5.0, 5.0)
+        ctrl_out = self.controller(encoded["decoded_sequence"], encoded["intent_token"])
+        if self.bc_loss_type == "gnll":
+            mu, _ = ctrl_out
+            return mu[:, 0].clamp(-5.0, 5.0)
+        return ctrl_out[:, 0].clamp(-5.0, 5.0)
 
 
 @register("architecture", "vla_mlp_bc")

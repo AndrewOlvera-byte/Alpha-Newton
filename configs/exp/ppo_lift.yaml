@@ -1,0 +1,76 @@
+run:
+  name: "ppo_lift_from_bc"
+  mode: "bc"
+
+data:
+  type: "robomimic_bc"
+  data_dir: "data/robomimic"
+  tasks:
+    - "lift"
+  history_length: 3
+  image_size: 160
+  obs_keys:
+    low_dim:
+      - "robot0_eef_pos"
+      - "robot0_eef_quat"
+      - "robot0_gripper_qpos"
+      - "object-state"
+    image:
+      - "agentview_image"
+      - "robot0_eye_in_hand_image"
+
+robotics:
+  architecture:
+    type: "vla_mlp_bc"
+    d_model: 384
+    n_transformer_layers: 6
+    n_transformer_heads: 6
+    d_ff: 1536
+    dropout: 0.1
+    encoder_hidden_dim: 128
+    controller_hidden_dim: 768
+    controller_cross_attention_heads: 6
+    controller_ff_dim: 1536
+    action_dim: 7
+    obs_dim: 23
+    n_cameras: 2
+    history_length: 3
+    n_tasks: 1
+    vit_model: "facebook/dinov2-small"
+    vit_img_size: 224
+    freeze_vit: true
+    vis_tokens_per_camera: 32
+    vis_pool_type: "avg"
+    action_chunk_size: 1
+    gradient_checkpointing: false
+    bc_loss_type: "gnll"
+
+  ppo:
+    n_envs: 8
+    n_steps: 256
+    ppo_epochs: 4
+    minibatch_size: 64
+    clip_eps: 0.2
+    vf_coeff: 0.5
+    ent_coeff: 0.01
+    gamma: 0.99
+    gae_lambda: 0.95
+    actor_lr: 1.0e-5
+    critic_lr: 1.0e-4
+    max_iterations: 500
+    horizon: 400
+    reward_shaping: true
+    value_hidden_dim: 512
+
+training:
+  max_grad_norm: 0.5
+  bf16: true
+  logging_steps: 1
+  save_steps: 50
+  output_dir: "outputs/ppo_lift_from_bc"
+
+wandb:
+  project: "robotics-ppo"
+  entity: "andrewolvera"
+  run_name: "ppo_lift_from_bc"
+  tags: ["ppo", "lift", "bc_finetune", "gnll"]

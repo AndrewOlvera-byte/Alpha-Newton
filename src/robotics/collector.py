@@ -6,7 +6,7 @@ GPU memory; conversion to float32 happens lazily per minibatch.
 """
 from __future__ import annotations
 
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Optional
 
 import numpy as np
 import torch
@@ -144,61 +144,79 @@ def collect_rollouts(
     rollout_buffer: RolloutBuffer,
     n_steps: int,
     device: torch.device,
+    task_id_per_env: Optional[List[int]] = None,
+    task_name_per_env: Optional[List[str]] = None,
 ) -> dict:
     """Collect n_steps of experience from all parallel environments.
 
-    Returns dict with rollout statistics.
+    Expects a ``MultiTaskVecEnv``-style API: step returns
+    ``(List[obs], rewards, terms, truncs, List[info])`` with per-env
+    observation dicts (so tasks can have differing native state dims).
+
+    When ``task_id_per_env`` / ``task_name_per_env`` are provided, per-task
+    episode stats are returned under ``per_task`` (keyed by task name if
+    given, else by task id).
     """
     n_envs = len(history_buffers)
-    episode_rewards = []
-    episode_lengths = []
-    episode_successes = []
-    current_rewards = np.zeros(n_envs)
+    current_rewards = np.zeros(n_envs, dtype=np.float32)
     current_lengths = np.zeros(n_envs, dtype=int)
 
-    # Get current obs from vec_env (already reset)
-    # We track obs externally since vec_env auto-resets
+    global_rewards: List[float] = []
+    global_lengths: List[int] = []
+    global_successes: List[bool] = []
+    per_task: Dict[object, Dict[str, list]] = {}
+
+    def _task_key(i: int):
+        if task_name_per_env is not None:
+            return task_name_per_env[i]
+        if task_id_per_env is not None:
+            return task_id_per_env[i]
+        return None
+
     amp_ctx = torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
 
     for step in range(n_steps):
-        # Build batched input from all history buffers
+        # Build batched input from all history buffers (each carries its own
+        # task_id + norm_stats, so the stacked batch already respects tasks).
         batches = [hb.get_batch(device=device) for hb in history_buffers]
         batch = _stack_batches(batches, device)
 
-        # Get action, log_prob, value from actor-critic
         with amp_ctx, torch.no_grad():
             actions, log_probs, values = actor_critic.act(batch)
 
         actions_np = actions.float().cpu().numpy()  # [N, action_dim]
 
-        # Step all environments
         obs_list, rewards, terminateds, truncateds, infos = vec_env.step(actions_np)
-
         dones = np.logical_or(terminateds, truncateds)
 
-        # Store transition
         rollout_buffer.insert(step, batch, actions, log_probs, values, rewards, dones)
 
-        # Track episode stats
         current_rewards += rewards
         current_lengths += 1
 
         for i in range(n_envs):
+            info_i = infos[i] if isinstance(infos, list) else {}
             if dones[i]:
-                episode_rewards.append(current_rewards[i])
-                episode_lengths.append(current_lengths[i])
-                episode_successes.append(infos["success"][i] if "success" in infos else False)
+                succ = bool(info_i.get("success", False))
+                global_rewards.append(float(current_rewards[i]))
+                global_lengths.append(int(current_lengths[i]))
+                global_successes.append(succ)
+                key = _task_key(i)
+                if key is not None:
+                    stats = per_task.setdefault(
+                        key, {"rewards": [], "lengths": [], "successes": []}
+                    )
+                    stats["rewards"].append(float(current_rewards[i]))
+                    stats["lengths"].append(int(current_lengths[i]))
+                    stats["successes"].append(succ)
                 current_rewards[i] = 0.0
                 current_lengths[i] = 0
                 history_buffers[i].reset()
 
-            # Push new observation to history buffer
-            state_i = obs_list["state"][i]
-            images_i = {cam: obs_list["images"][cam][i] for cam in obs_list["images"]}
-            history_buffers[i].push(images_i, state_i)
-
-            # Record the raw action that was executed (for prev_actions in history)
-            raw_action = infos["raw_action"][i] if "raw_action" in infos else actions_np[i]
+            # Push next observation (per-env dict from MultiTaskVecEnv)
+            o = obs_list[i]
+            history_buffers[i].push(o["images"], o["state"])
+            raw_action = info_i.get("raw_action", actions_np[i])
             history_buffers[i].record_action(raw_action)
 
     # Bootstrap value for GAE
@@ -207,12 +225,23 @@ def collect_rollouts(
     with amp_ctx, torch.no_grad():
         _, _, last_values = actor_critic.act(batch)
 
+    per_task_summary = {
+        k: {
+            "mean_reward": float(np.mean(v["rewards"])) if v["rewards"] else 0.0,
+            "mean_length": float(np.mean(v["lengths"])) if v["lengths"] else 0.0,
+            "success_rate": float(np.mean(v["successes"])) if v["successes"] else 0.0,
+            "n_episodes": len(v["rewards"]),
+        }
+        for k, v in per_task.items()
+    }
+
     return {
         "last_values": last_values,
-        "mean_reward": np.mean(episode_rewards) if episode_rewards else 0.0,
-        "mean_length": np.mean(episode_lengths) if episode_lengths else 0.0,
-        "success_rate": np.mean(episode_successes) if episode_successes else 0.0,
-        "n_episodes": len(episode_rewards),
+        "mean_reward": float(np.mean(global_rewards)) if global_rewards else 0.0,
+        "mean_length": float(np.mean(global_lengths)) if global_lengths else 0.0,
+        "success_rate": float(np.mean(global_successes)) if global_successes else 0.0,
+        "n_episodes": len(global_rewards),
+        "per_task": per_task_summary,
     }
 
 

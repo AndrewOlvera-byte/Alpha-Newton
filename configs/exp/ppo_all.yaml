@@ -1,0 +1,113 @@
+run:
+  name: "ppo_all_from_bc"
+  mode: "bc"
+
+# Launch with:
+#   python -m src.entrypoints.train_ppo \
+#     --exp ppo_all \
+#     --bc-checkpoint outputs/bc_multitask_mlp_rl_ready_medium_gnll_all/best/model.pt
+#
+# Multi-task PPO: the trainer allocates `n_envs` across tasks by `task_weights`
+# using largest-remainder, giving every positive-weight task ≥1 env (so
+# downweighted tasks still produce gradient signal and resist forgetting).
+# With n_envs=20 and the weights below → [lift=1, can=1, square=2, tool_hang=16]
+# = ~80% of rollout transitions on the hardest task.
+
+data:
+  type: "robomimic_bc"
+  data_dir: "data/robomimic"
+  # Each task declares its rollout mixture weight (normalized internally).
+  # Largest-remainder allocation guarantees every positive-weight task ≥1 env.
+  # Current mix targets the two hardest tasks (both 0% after BC):
+  #   n_envs=20 → [lift=2, can=2, square=8, tool_hang=8]
+  tasks:
+    - name: lift
+      weight: 0.10
+    - name: can
+      weight: 0.10
+    - name: square
+      weight: 0.40
+    - name: tool_hang
+      weight: 0.40
+  history_length: 3
+  image_size: 160
+  obs_keys:
+    low_dim:
+      - "robot0_eef_pos"
+      - "robot0_eef_quat"
+      - "robot0_gripper_qpos"
+      - "object-state"
+    image:
+      - "agentview_image"
+      - "robot0_eye_in_hand_image"
+
+robotics:
+  architecture:
+    type: "vla_mlp_bc"
+    d_model: 384
+    n_transformer_layers: 6
+    n_transformer_heads: 6
+    d_ff: 1536
+    dropout: 0.15
+    encoder_hidden_dim: 128
+    controller_hidden_dim: 768
+    controller_cross_attention_heads: 6
+    controller_ff_dim: 1536
+    action_dim: 7
+    obs_dim: 53
+    n_cameras: 2
+    history_length: 3
+    n_tasks: 4
+    vit_model: "facebook/dinov2-small"
+    vit_img_size: 224
+    freeze_vit: true
+    vis_tokens_per_camera: 32
+    vis_pool_type: "avg"
+    action_chunk_size: 1
+    gradient_checkpointing: true   # trade compute for memory — ~2× backward activation savings
+    bc_loss_type: "gnll"
+
+  ppo:
+    # Sized for a 16 GB VRAM card, left-running unattended:
+    #  - n_envs=16 cleanly partitions into [2,2,6,6] under the weights below
+    #  - n_steps=192 shrinks rollout-buffer CPU image tensor to ~2.2 GB
+    #  - minibatch_size=32 halves peak ViT activation memory vs 64
+    # These are the "sleep-safe" defaults; bump back up if you watch a live run.
+    n_envs: 16
+    n_steps: 192
+    ppo_epochs: 4
+    minibatch_size: 32
+    clip_eps: 0.2
+    vf_coeff: 0.5
+    ent_coeff: 0.01
+    gamma: 0.99
+    gae_lambda: 0.95
+    actor_lr: 1.0e-5
+    critic_lr: 1.0e-4
+    max_iterations: 500
+    horizon: 400              # default horizon — overridden per task below
+    reward_shaping: true
+    # Reward function — looked up in src/robotics/rewards.py REWARD_FUNCTIONS.
+    # dense_multitask_v1 = per-task dense shaping + unified success/time schema.
+    reward_fn: "dense_multitask_v1"
+    value_hidden_dim: 512
+    # Weights now live on the task entries in `data.tasks` above.
+    # tool_hang + square need longer horizons to reach success states.
+    task_horizons:
+      lift: 400
+      can: 400
+      square: 500
+      tool_hang: 700
+
+training:
+  max_grad_norm: 0.5
+  bf16: true
+  logging_steps: 1
+  save_steps: 50
+  output_dir: "outputs/ppo_all_from_bc"
+
+wandb:
+  project: "robotics-ppo"
+  entity: "andrewolvera"
+  run_name: "ppo_all_from_bc"
+  tags: ["ppo", "multitask", "lift", "can", "square", "tool_hang", "bc_finetune", "gnll"]

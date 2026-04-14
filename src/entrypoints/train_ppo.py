@@ -50,8 +50,10 @@ def test(cfg: Config, bc_checkpoint: str):
     from src.robotics.models.HistoryBuffer import HistoryBuffer
 
     arch_cfg = cfg.robotics.get("architecture", {})
-    tasks = cfg.data.get("tasks", ["lift"])
-    task_name = tasks[0]
+    raw_tasks = cfg.data.get("tasks", ["lift"])
+    # Normalize string|dict task entries (see main() for the full parser).
+    first = raw_tasks[0]
+    task_name = first if isinstance(first, str) else first["name"]
 
     ckpt_dir = os.path.dirname(bc_checkpoint)
     norm_stats = _load_norm_stats(ckpt_dir, task_name)
@@ -135,18 +137,45 @@ def main(exp_name: str, bc_checkpoint: str, test_only: bool = False):
     # Load components
     arch_cfg = cfg.robotics.get("architecture", {})
     ppo_cfg = cfg.robotics.get("ppo", {})
-    tasks = cfg.data.get("tasks", ["lift"])
-    task_name = tasks[0]
-    task_id = 0
+    raw_tasks = cfg.data.get("tasks", ["lift"])
+
+    # `tasks` can be either:
+    #   - a list of strings (BC-style): ["lift", "can", ...]
+    #   - a list of dicts with name + optional weight (PPO-style):
+    #       [{name: lift, weight: 0.1}, ...]
+    # The task order defines task_id — must match the BC training order so
+    # task embeddings stay aligned with the pretrained checkpoint.
+    task_names: list = []
+    task_weights: list = []
+    for entry in raw_tasks:
+        if isinstance(entry, str):
+            task_names.append(entry)
+            task_weights.append(None)
+        elif isinstance(entry, dict):
+            task_names.append(entry["name"])
+            task_weights.append(entry.get("weight"))
+        else:
+            raise ValueError(f"Unrecognized task entry: {entry!r}")
+    if all(w is None for w in task_weights):
+        task_weights = None  # trainer falls back to uniform
+    else:
+        task_weights = [float(w) if w is not None else 0.0 for w in task_weights]
+    tasks = task_names
 
     ckpt_dir = os.path.dirname(bc_checkpoint)
-    norm_stats = _load_norm_stats(ckpt_dir, task_name)
+
+    # Load norm_stats for every task in the mixture.
+    norm_stats_by_task = {t: _load_norm_stats(ckpt_dir, t) for t in tasks}
+    task_ids = list(range(len(tasks)))
 
     actor_critic = VLAMLPActorCritic.from_bc_checkpoint(
         bc_checkpoint, arch_cfg, value_hidden_dim=ppo_cfg.get("value_hidden_dim", 512)
     )
 
     obs_keys = cfg.data.get("obs_keys", {})
+
+    raw_horizons = ppo_cfg.get("task_horizons") or {}
+    task_horizons = {str(k): int(v) for k, v in raw_horizons.items()}
 
     trainer = build(
         "trainer",
@@ -155,9 +184,11 @@ def main(exp_name: str, bc_checkpoint: str, test_only: bool = False):
         training_cfg=cfg.training,
         robotics_cfg=cfg.robotics,
         wandb_cfg=cfg.wandb,
-        norm_stats=norm_stats,
-        task_name=task_name,
-        task_id=task_id,
+        task_names=tasks,
+        task_ids=task_ids,
+        task_weights=task_weights,
+        norm_stats_by_task=norm_stats_by_task,
+        task_horizons=task_horizons,
         obs_keys_low_dim=obs_keys.get("low_dim", []),
         obs_keys_image=obs_keys.get("image", []),
         camera_size=cfg.data.get("image_size", 160),

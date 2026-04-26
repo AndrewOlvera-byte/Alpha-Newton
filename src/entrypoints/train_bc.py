@@ -124,9 +124,10 @@ def main(exp_name: str, test_only: bool = False):
 
     model = build("architecture", **arch_cfg)
 
+    trainer_type = cfg.training.get("trainer_type", "bc_flow_matching_robosuite")
     trainer = build(
         "trainer",
-        type="bc_flow_matching",
+        type=trainer_type,
         model=model,
         dataset=dataset,
         training_cfg=cfg.training,

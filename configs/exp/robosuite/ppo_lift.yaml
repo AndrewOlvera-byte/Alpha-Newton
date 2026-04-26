@@ -1,9 +1,9 @@
 run:
   name: "ppo_lift_from_bc"
-  mode: "bc"
+  mode: "ppo"
 
 data:
-  type: "robomimic_bc"
+  type: "robomimic_bc_robosuite"
   data_dir: "data/robomimic"
   tasks:
     - "lift"
@@ -63,6 +63,7 @@ robotics:
     value_hidden_dim: 512
 
 training:
+  trainer_type: "ppo_robosuite"
   max_grad_norm: 0.5
   bf16: true
   logging_steps: 1

@@ -1,10 +1,4 @@
-"""
-Robomimic PH (Proficient Human) dataset builder.
-
-Registered as data type "robomimic_ph" in the registry.
-Loads HDF5 demos from robomimic, extracts low-dim state + images + actions,
-and returns torch-ready train/eval splits.
-"""
+"""Robosuite imitation-learning datasets backed by robomimic HDF5 files."""
 from __future__ import annotations
 
 import os
@@ -51,7 +45,6 @@ class RobomimicDataset(Dataset):
         self.image_size = image_size
         self.hdf5_normalize_obs = hdf5_normalize_obs
 
-        # Build index: list of (demo_key, start_idx) for each valid window
         self._index = []
         self._demo_lengths = {}
 
@@ -63,7 +56,6 @@ class RobomimicDataset(Dataset):
                 for t in range(T):
                     self._index.append((dk, t))
 
-        # Lazy-opened file handle (opened on first __getitem__)
         self._hdf5_file = None
 
     def __len__(self):
@@ -83,12 +75,10 @@ class RobomimicDataset(Dataset):
         demo_grp = self._hdf5_file[f"data/{demo_key}"]
         T = self._demo_lengths[demo_key]
 
-        # Determine sequence range
         end_t = min(start_t + self.seq_length, T)
         actual_len = end_t - start_t
 
-        # --- Actions ---
-        actions = demo_grp["actions"][start_t:end_t]  # (actual_len, action_dim)
+        actions = demo_grp["actions"][start_t:end_t]
         if self.pad_seq_length and actual_len < self.seq_length:
             pad_len = self.seq_length - actual_len
             actions = np.concatenate(
@@ -96,7 +86,6 @@ class RobomimicDataset(Dataset):
                 axis=0,
             )
 
-        # --- Low-dim obs ---
         low_dim_parts = []
         for key in self.obs_keys_low_dim:
             obs_data = demo_grp[f"obs/{key}"][start_t:end_t]
@@ -112,21 +101,19 @@ class RobomimicDataset(Dataset):
 
         low_dim_obs = np.concatenate(low_dim_parts, axis=-1) if low_dim_parts else np.zeros((self.seq_length, 0))
 
-        # --- Image obs ---
         image_obs = {}
         for key in self.obs_keys_image:
-            img = demo_grp[f"obs/{key}"][start_t:end_t]  # (actual_len, H, W, C)
+            img = demo_grp[f"obs/{key}"][start_t:end_t]
             if self.pad_seq_length and img.shape[0] < self.seq_length:
                 pad_len = self.seq_length - img.shape[0]
                 img = np.concatenate(
                     [img, np.zeros((pad_len, *img.shape[1:]), dtype=img.dtype)],
                     axis=0,
                 )
-            # HWC -> CHW, normalize to [0, 1]
+
             img = img.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
             image_obs[key] = torch.from_numpy(img)
 
-        # Build mask for valid timesteps
         mask = np.zeros(self.seq_length if self.pad_seq_length else actual_len, dtype=np.float32)
         mask[:actual_len] = 1.0
 
@@ -150,7 +137,7 @@ def _get_demo_keys(hdf5_path: str, filter_key: Optional[str] = None) -> List[str
         return sorted(f["data"].keys())
 
 
-@register("data", "robomimic_ph")
+@register("data", "robomimic_ph_robosuite")
 def build_robomimic_ph_dataset(
     data_dir: str,
     tasks: List[str],
@@ -168,27 +155,11 @@ def build_robomimic_ph_dataset(
     dataset_keys: List[str] = None,
     **kwargs,
 ) -> Dict[str, Any]:
-    """Build robomimic PH dataset for BC training.
-
-    Args:
-        data_dir: Root directory containing task HDF5 files
-                  (e.g., data/robomimic/lift/ph/low_dim.hdf5 or image.hdf5)
-        tasks: List of task names ["lift", "can", "square"]
-        obs_keys: {"low_dim": [...], "image": [...]}
-        action_keys: Keys for action data
-        seq_length: Length of each training subsequence
-        frame_stack: Number of frames to stack (history)
-        image_size: Expected image resolution
-        eval_ratio: Fraction of demos held out for eval
-        horizon: Max episode horizon (for reference)
-
-    Returns:
-        {"train": RobomimicDataset, "eval": RobomimicDataset}
-    """
+    """Build train/eval sequence datasets from robomimic PH demos."""
     obs_keys_low_dim = obs_keys.get("low_dim", [])
     obs_keys_image = obs_keys.get("image", [])
 
-    obs_keys_image = [k for k in obs_keys_image if k]  # filter empty strings
+    obs_keys_image = [k for k in obs_keys_image if k]
     use_images = len(obs_keys_image) > 0
     hdf5_name = "image.hdf5" if use_images else "low_dim.hdf5"
 
@@ -218,7 +189,6 @@ def build_robomimic_ph_dataset(
         all_eval_demos.append((hdf5_path, eval_demos))
         hdf5_paths.append(hdf5_path)
 
-    # For single-task, return directly; multi-task uses ConcatDataset
     if len(tasks) == 1:
         hdf5_path, train_demos = all_train_demos[0]
         _, eval_demos = all_eval_demos[0]
@@ -276,10 +246,6 @@ def build_robomimic_ph_dataset(
     return {"train": train_ds, "eval": eval_ds}
 
 
-# ─────────────────────────────────────────────────────────────
-# BC History Dataset — per-timestep samples with history window
-# ─────────────────────────────────────────────────────────────
-
 class RobomimicBCDataset(Dataset):
     """Per-timestep dataset with history window for BC training.
 
@@ -292,9 +258,8 @@ class RobomimicBCDataset(Dataset):
 
     Early timesteps pad by repeating the first observation.
 
-    If precomputed ViT features exist in the HDF5 under
-    obs/{cam_key}_features, they are loaded instead of raw images,
-    bypassing the ViT entirely during training (huge throughput gain).
+    Precomputed ViT features are read from ``obs/{cam_key}_features`` when
+    present.
     """
 
     def __init__(
@@ -305,11 +270,11 @@ class RobomimicBCDataset(Dataset):
         obs_keys_image: List[str],
         history_length: int = 3,
         image_size: int = 84,
-        norm_stats=None,  # NormStats instance or None
+        norm_stats=None,
         action_chunk_size: int = 1,
-        task_id: int = 0,  # integer task index — embedded by the model for multi-task conditioning
-        target_state_dim: Optional[int] = None,  # pad state to this dim for multi-task batching
-        feature_aug_mode: str = "random",  # "random" for train, "canonical" for eval
+        task_id: int = 0,
+        target_state_dim: Optional[int] = None,
+        feature_aug_mode: str = "random",
     ):
         self.hdf5_path = hdf5_path
         self.demo_keys = sorted(demo_keys)
@@ -326,9 +291,7 @@ class RobomimicBCDataset(Dataset):
         self._index = []
         self._demo_lengths = {}
 
-        # Detect whether precomputed ViT features are available.
-        # Feature key: replace '_image' suffix with '_features'.
-        self._feature_keys = {}  # {image_key: feature_key or None}
+        self._feature_keys = {}
         with h5py.File(self.hdf5_path, "r") as f:
             for dk in self.demo_keys:
                 T = f[f"data/{dk}/actions"].shape[0]
@@ -336,7 +299,6 @@ class RobomimicBCDataset(Dataset):
                 for t in range(T):
                     self._index.append((dk, t))
 
-            # Check for precomputed features on first demo
             first_dk = self.demo_keys[0] if self.demo_keys else None
             if first_dk:
                 for img_key in self.obs_keys_image:
@@ -347,7 +309,6 @@ class RobomimicBCDataset(Dataset):
                     else:
                         self._feature_keys[img_key] = None
 
-                # Compute actual state dim for this task
                 obs_grp = f[f"data/{first_dk}/obs"]
                 self.state_dim = sum(
                     obs_grp[key].shape[-1] if obs_grp[key].ndim > 1 else 1
@@ -411,10 +372,8 @@ class RobomimicBCDataset(Dataset):
         demo_grp = self._hdf5_file[f"data/{demo_key}"]
         H = self.history_length
 
-        # History frame indices — pad early timesteps by repeating first frame
         hist_indices = [max(0, t - (H - 1 - i)) for i in range(H)]
 
-        # --- Low-dim state: [H, state_dim] ---
         low_dim_parts = []
         for key in self.obs_keys_low_dim:
             obs_all = demo_grp[f"obs/{key}"]
@@ -424,34 +383,26 @@ class RobomimicBCDataset(Dataset):
             low_dim_parts.append(parts)
         state = np.concatenate(low_dim_parts, axis=-1).astype(np.float32) if low_dim_parts else np.zeros((H, 0), dtype=np.float32)
 
-        # --- Image obs (or precomputed features): {cam: tensor} ---
         images = {}
         for img_key in self.obs_keys_image:
             feat_key = self._feature_keys.get(img_key)
             if feat_key is not None:
-                # Precomputed ViT features.
-                # Shape [T, n_patches, d] (no aug) or [T, N_aug, n_patches, d] (with aug).
                 feat_all = demo_grp[f"obs/{feat_key}"]
-                feat_stack = np.stack([feat_all[hi] for hi in hist_indices])  # [H, ...]
+                feat_stack = np.stack([feat_all[hi] for hi in hist_indices])
                 if feat_stack.ndim == 4:
-                    # Has aug dimension [H, N_aug, n_patches, d].
-                    # Train uses random augmented views; eval uses the canonical
-                    # first view to keep checkpoint selection deterministic.
                     n_aug = feat_stack.shape[1]
                     if self.feature_aug_mode == "canonical":
                         aug_idx = 0
                     else:
                         aug_idx = np.random.randint(0, n_aug)
-                    feat_stack = feat_stack[:, aug_idx]  # [H, n_patches, d]
+                    feat_stack = feat_stack[:, aug_idx]
                 images[img_key] = torch.from_numpy(feat_stack.astype(np.float32))
             else:
-                # Raw images: [T, H, W, C] → [H, C, H, W] in [0, 1]
                 img_all = demo_grp[f"obs/{img_key}"]
-                img_stack = np.stack([img_all[hi] for hi in hist_indices])  # [H, h, w, C]
+                img_stack = np.stack([img_all[hi] for hi in hist_indices])
                 img_stack = img_stack.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
                 images[img_key] = torch.from_numpy(img_stack)
 
-        # --- Previous actions: [H, action_dim] ---
         action_dim = demo_grp["actions"].shape[1]
         prev_actions = []
         for i in range(H):
@@ -462,23 +413,19 @@ class RobomimicBCDataset(Dataset):
                 prev_actions.append(demo_grp["actions"][pa_t].astype(np.float32))
         prev_actions = np.stack(prev_actions)
 
-        # --- Target action(s) at t — supports action chunking ---
         K = self.action_chunk_size
         T = self._demo_lengths[demo_key]
         if K > 1:
-            # Grab K future actions, pad with last action if near end of demo
             action_indices = [min(t + k, T - 1) for k in range(K)]
-            action = np.stack([demo_grp["actions"][ai] for ai in action_indices]).astype(np.float32)  # [K, action_dim]
+            action = np.stack([demo_grp["actions"][ai] for ai in action_indices]).astype(np.float32)
         else:
             action = demo_grp["actions"][t].astype(np.float32)
 
-        # --- Normalization ---
         if self.norm_stats is not None:
             state = self.norm_stats.normalize_state(state)
             action = self.norm_stats.normalize_action(action)
             prev_actions = self.norm_stats.normalize_action(prev_actions)
 
-        # --- Pad state to target_state_dim for multi-task batching ---
         if self.target_state_dim is not None and state.shape[-1] < self.target_state_dim:
             pad = np.zeros((state.shape[0], self.target_state_dim - state.shape[-1]), dtype=np.float32)
             state = np.concatenate([state, pad], axis=-1)
@@ -492,7 +439,7 @@ class RobomimicBCDataset(Dataset):
         }
 
 
-@register("data", "robomimic_bc")
+@register("data", "robomimic_bc_robosuite")
 def build_robomimic_bc_dataset(
     data_dir: str,
     tasks: List[str],
@@ -501,20 +448,13 @@ def build_robomimic_bc_dataset(
     image_size: int = 84,
     hdf5_filter_key: Optional[str] = None,
     eval_ratio: float = 0.1,
-    norm_stats=None,  # NormStats instance (computed by trainer, then injected)
+    norm_stats=None,
     action_chunk_size: int = 1,
     feature_aug_train_mode: str = "random",
     feature_aug_eval_mode: str = "canonical",
     **kwargs,
 ) -> Dict[str, Any]:
-    """Build robomimic BC dataset with per-timestep history windows.
-
-    Returns {
-        "train": RobomimicBCDataset,
-        "eval":  RobomimicBCDataset,
-        "train_demos": List[Tuple[hdf5_path, List[demo_keys]]],  # for norm stats
-    }.
-    """
+    """Build train/eval history-window datasets for robosuite BC."""
     obs_keys_low_dim = obs_keys.get("low_dim", [])
     obs_keys_image = obs_keys.get("image", [])
     obs_keys_image = [k for k in obs_keys_image if k]
@@ -524,7 +464,7 @@ def build_robomimic_bc_dataset(
 
     all_train = []
     all_eval = []
-    train_demo_info = []  # list of (hdf5_path, demo_keys) for norm stats
+    train_demo_info = []
 
     for i, task in enumerate(tasks):
         hdf5_path = os.path.join(data_dir, task, "ph", hdf5_name)
@@ -552,7 +492,7 @@ def build_robomimic_bc_dataset(
             image_size=image_size,
             norm_stats=norm_stats,
             action_chunk_size=action_chunk_size,
-            task_id=i,  # 0-indexed — matches n_tasks in architecture config
+            task_id=i,
         )
         all_train.append(RobomimicBCDataset(
             hdf5_path=hdf5_path,
@@ -567,19 +507,13 @@ def build_robomimic_bc_dataset(
             **common,
         ))
 
-    # For multi-task: tasks may have different object-state dims (e.g. lift=10, can/square=14).
-    # Pad all state tensors to the max state_dim so the default collate can stack them.
     if len(tasks) > 1:
         max_state_dim = max(ds.state_dim for ds in all_train)
         for ds in all_train + all_eval:
             ds.target_state_dim = max_state_dim
         print(f"[Robomimic BC] Multi-task state dims: "
-              f"{ {tasks[i]: ds.state_dim for i, ds in enumerate(all_train)} } → padded to {max_state_dim}")
+              f"{ {tasks[i]: ds.state_dim for i, ds in enumerate(all_train)} } -> padded to {max_state_dim}")
 
-    # For multi-task: enforce consistent feature strategy across all task datasets.
-    # If any task is missing precomputed features for a camera, fall back to raw images
-    # for that camera in ALL tasks — otherwise mixed [H,256,384] vs [H,3,84,84] tensors
-    # in the same batch cause "Trying to resize storage that is not resizable" in collate.
     all_ds = all_train + all_eval
     if len(tasks) > 1 and obs_keys_image:
         for img_key in obs_keys_image:
@@ -607,5 +541,5 @@ def build_robomimic_bc_dataset(
         "_obs_keys_low_dim": obs_keys_low_dim,
         "_obs_keys_image": obs_keys_image,
         "_image_size": image_size,
-        "_task_names": list(tasks),  # index → task name (for logging/inference)
+        "_task_names": list(tasks),
     }

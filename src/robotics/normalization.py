@@ -1,21 +1,4 @@
-"""
-Action and state normalization for BC training.
-
-Best practice (from Diffusion Policy, ACT, π0):
-- Compute per-dimension mean/std from training data
-- Normalize: (x - mean) / (std + eps)
-- Handle zero-variance dims by clamping std to min_std
-- Save stats to JSON alongside checkpoint for inference
-
-Usage:
-    stats = NormStats.compute(hdf5_path, demo_keys, obs_keys_low_dim)
-    stats.save("outputs/bc_lift_ph/norm_stats.json")
-    stats = NormStats.load("outputs/bc_lift_ph/norm_stats.json")
-
-    norm_action = stats.normalize_action(action)   # [B, action_dim] or [action_dim]
-    raw_action  = stats.denormalize_action(norm)
-    norm_state  = stats.normalize_state(state)
-"""
+"""Normalization statistics for robotics demonstrations."""
 from __future__ import annotations
 
 import json
@@ -26,8 +9,6 @@ import h5py
 import numpy as np
 import torch
 
-
-# Minimum std to avoid division by near-zero for nearly-constant dimensions
 _MIN_STD = 1e-3
 
 
@@ -40,10 +21,6 @@ class NormStats:
     state_mean: List[float]
     state_std: List[float]
 
-    # ------------------------------------------------------------------
-    # Compute from HDF5
-    # ------------------------------------------------------------------
-
     @classmethod
     def compute(
         cls,
@@ -53,35 +30,22 @@ class NormStats:
         min_std: float = _MIN_STD,
         clip_percentile: float = 1.0,
     ) -> "NormStats":
-        """Compute mean/std from training demos with outlier clipping.
-
-        Args:
-            hdf5_path: Path to robomimic HDF5 file
-            demo_keys: List of demo keys to include (train split only)
-            obs_keys_low_dim: Ordered list of low-dim obs keys (must match dataset construction)
-            min_std: Floor for std — prevents divide-by-zero on constant dims
-            clip_percentile: Clip values outside [p, 100-p] percentile before computing
-                             stats. 1.0 clips bottom/top 1% — prevents outliers from
-                             skewing mean/std. Set to 0.0 to disable.
-        """
+        """Compute per-dimension action and state statistics."""
         with h5py.File(hdf5_path, "r") as f:
-            # Collect actions
             actions = np.concatenate(
                 [f[f"data/{dk}/actions"][:] for dk in demo_keys], axis=0
-            )  # [N, action_dim]
+            )
 
-            # Collect state (concatenate obs keys in order)
             state_parts = []
             for key in obs_keys_low_dim:
                 obs = np.concatenate(
                     [f[f"data/{dk}/obs/{key}"][:] for dk in demo_keys], axis=0
-                )  # [N, dim] or [N]
+                )
                 if obs.ndim == 1:
                     obs = obs[:, None]
                 state_parts.append(obs)
-            state = np.concatenate(state_parts, axis=-1)  # [N, state_dim]
+            state = np.concatenate(state_parts, axis=-1)
 
-        # Clip per-dimension outliers before computing stats
         if clip_percentile > 0.0:
             lo_a = np.percentile(actions, clip_percentile, axis=0)
             hi_a = np.percentile(actions, 100.0 - clip_percentile, axis=0)
@@ -95,7 +59,6 @@ class NormStats:
         state_mean = state.mean(0).tolist()
         state_std = np.maximum(state.std(0), min_std).tolist()
 
-        # Report any clamped dims
         raw_action_std = actions.std(0)
         raw_state_std = state.std(0)
         n_clamped_a = int((raw_action_std < min_std).sum())
@@ -112,10 +75,6 @@ class NormStats:
             state_std=state_std,
         )
 
-    # ------------------------------------------------------------------
-    # Save / load — JSON (human-readable backup)
-    # ------------------------------------------------------------------
-
     def save(self, path: str):
         with open(path, "w") as f:
             json.dump(asdict(self), f, indent=2)
@@ -125,16 +84,6 @@ class NormStats:
         with open(path, "r") as f:
             data = json.load(f)
         return cls(**data)
-
-    # ------------------------------------------------------------------
-    # Save / load — HDF5 (primary cache, colocated with data for RL handoff)
-    #
-    # Stats are written to a "norm_stats/" group inside the dataset's own
-    # HDF5 file.  This keeps normalization colocated with the data so an
-    # RL run only needs the HDF5 path — no separate output directory to
-    # track down.  The write happens during BCTrainer.__init__ (before any
-    # DataLoader workers fork), so there is no concurrent-access concern.
-    # ------------------------------------------------------------------
 
     def save_to_hdf5(self, hdf5_path: str, n_train_demos: int = 0) -> None:
         """Write stats to norm_stats/ group in the dataset HDF5. Idempotent."""
@@ -164,10 +113,6 @@ class NormStats:
         """Return True if norm_stats/ group is present in the HDF5."""
         with h5py.File(hdf5_path, "r") as f:
             return "norm_stats" in f
-
-    # ------------------------------------------------------------------
-    # Normalize / denormalize (numpy or torch)
-    # ------------------------------------------------------------------
 
     def _to_arrays(self):
         """Return mean/std as numpy float32 arrays."""

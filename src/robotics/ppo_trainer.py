@@ -1,8 +1,4 @@
-"""PPO Trainer for fine-tuning BC-pretrained visuomotor policies.
-
-Registered as trainer type "ppo". Loads a BC checkpoint, wraps it
-as an actor-critic, and runs on-policy PPO in robosuite environments.
-"""
+"""Robosuite PPO trainer for BC-pretrained visuomotor policies."""
 from __future__ import annotations
 
 import copy
@@ -30,9 +26,9 @@ from src.robotics.models.HistoryBuffer import HistoryBuffer
 from src.robotics.normalization import NormStats
 
 
-@register("trainer", "ppo")
+@register("trainer", "ppo_robosuite")
 class PPOTrainer:
-    """On-policy PPO trainer for robosuite environments."""
+    """On-policy PPO trainer backed by robosuite vector environments."""
 
     def __init__(
         self,
@@ -40,11 +36,11 @@ class PPOTrainer:
         training_cfg: dict,
         robotics_cfg: dict,
         wandb_cfg: dict,
-        # Single-task interface (backward-compat)
+
         norm_stats: Optional[NormStats] = None,
         task_name: Optional[str] = None,
         task_id: int = 0,
-        # Multi-task interface — all four may be provided together
+
         task_names: Optional[list] = None,
         task_ids: Optional[list] = None,
         task_weights: Optional[list] = None,
@@ -62,7 +58,6 @@ class PPOTrainer:
         self.obs_keys_image = obs_keys_image or []
         self.camera_size = camera_size
 
-        # --- Resolve task list (single-task → wrap in 1-element lists) ---
         if task_names is None:
             if task_name is None:
                 raise ValueError("Must provide either task_name or task_names")
@@ -79,7 +74,6 @@ class PPOTrainer:
                 raise ValueError("norm_stats_by_task is required for multi-task PPO")
             self.norm_stats_by_task = norm_stats_by_task
             if task_weights is None:
-                # Uniform
                 self.task_weights = [1.0 / len(self.task_names)] * len(self.task_names)
             else:
                 self.task_weights = list(task_weights)
@@ -92,7 +86,6 @@ class PPOTrainer:
             if missing:
                 raise ValueError(f"Missing norm_stats for tasks: {missing}")
 
-        # PPO hyperparams
         ppo_cfg = robotics_cfg.get("ppo", {})
         self.n_envs = ppo_cfg.get("n_envs", 8)
         self.n_steps = ppo_cfg.get("n_steps", 256)
@@ -106,13 +99,11 @@ class PPOTrainer:
         self.max_iterations = ppo_cfg.get("max_iterations", 500)
         self.horizon = ppo_cfg.get("horizon", 400)
         self.reward_shaping = ppo_cfg.get("reward_shaping", True)
-        # Custom reward function name (looked up in src.robotics.rewards
-        # registry inside RobosuiteGymEnv). None = use robosuite native.
+
         self.reward_fn_name = ppo_cfg.get("reward_fn")
-        # Per-task horizon override (tool_hang needs longer episodes)
+
         self.task_horizons = dict(task_horizons) if task_horizons else {}
 
-        # Training config
         self.actor_lr = ppo_cfg.get("actor_lr", 1e-5)
         self.critic_lr = ppo_cfg.get("critic_lr", 1e-4)
         self.max_grad_norm = training_cfg.get("max_grad_norm", 0.5)
@@ -120,16 +111,13 @@ class PPOTrainer:
         self.compile = ppo_cfg.get("compile", False)
         self.profile_rollouts = bool(ppo_cfg.get("profile_rollouts", False))
         self.show_progress = bool(ppo_cfg.get("show_progress", False))
-        # Async rollout: overlap env-stepping + rollout forward passes on a
-        # snapshot policy with the PPO update on the main policy. One iter
-        # off-policy (PPO clip handles it). Doubles buffer + policy VRAM.
+
         self.async_rollout = ppo_cfg.get("async_rollout", False)
         self.output_dir = training_cfg.get("output_dir", "outputs/ppo")
         self.logging_steps = training_cfg.get("logging_steps", 1)
         self.save_steps = int(training_cfg.get("save_steps", 50) or 0)
         self.save_final = bool(training_cfg.get("save_final", True))
-        # PPO resume is not implemented in this trainer, so optimizer state is
-        # opt-in. This avoids 100+ MB of extra disk writes per checkpoint.
+
         self.save_optimizer_state = bool(training_cfg.get("save_optimizer_state", False))
         self.save_bc_compatible_every_checkpoint = bool(
             training_cfg.get("save_bc_compatible_every_checkpoint", False)
@@ -140,7 +128,6 @@ class PPOTrainer:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Perf knobs: TF32 for matmul, cudnn autotuner for ViT convs.
         if self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
@@ -150,16 +137,12 @@ class PPOTrainer:
     def train(self):
         """Main PPO training loop."""
         os.makedirs(self.output_dir, exist_ok=True)
-        # Keep the policy on CPU until after env subprocesses are launched.
-        # With the Linux fork start method this avoids inheriting a live CUDA
-        # context, while still avoiding spawn's repeated heavy imports.
+
         model = self.model
         model.train()
-        # Keep an uncompiled handle for checkpointing + attribute access
-        # (compile wraps the module; state_dict round-trips cleanly via _orig_mod).
+
         raw_model = model
 
-        # Separate param groups: lower LR for pretrained actor, higher for fresh critic
         actor_params = [
             p for p in (
                 list(model.backbone.parameters())
@@ -175,7 +158,6 @@ class PPOTrainer:
             {"params": critic_params, "lr": self.critic_lr, "weight_decay": 1e-4},
         ])
 
-        # WandB
         run = None
         if self.wandb_cfg:
             try:
@@ -225,9 +207,6 @@ class PPOTrainer:
             except Exception as e:
                 print(f"[PPO] WandB init failed: {e}")
 
-        # --- Mixture allocation ---
-        # Largest-remainder allocates ``n_envs`` across tasks proportional to
-        # ``task_weights``; harder-but-downweighted tasks still get ≥1 env.
         counts = allocate_envs_by_weights(self.n_envs, self.task_weights)
         env_specs: List[EnvSpec] = []
         task_id_per_env: List[int] = []
@@ -264,9 +243,6 @@ class PPOTrainer:
         model.train()
         raw_model = model
 
-        # Compile AFTER optimizer so param references stay clean. dynamic=True
-        # lets one compiled graph serve rollout (bs=n_envs) and update
-        # (bs=minibatch) without recompilation.
         if self.compile and self.device.type == "cuda":
             print("[PPO] torch.compile(model, dynamic=True, mode='reduce-overhead')")
             try:
@@ -274,9 +250,6 @@ class PPOTrainer:
             except Exception as e:
                 print(f"[PPO] compile failed, falling back to eager: {e}")
 
-        # Create history buffers (one per env), each carrying ITS task's
-        # task_id and norm_stats — so per-env normalization is correct and
-        # the stacked model batch has the right task embeddings.
         arch_cfg = self.robotics_cfg.get("architecture", {})
         history_length = arch_cfg.get("history_length", 3)
         action_dim = arch_cfg.get("action_dim", 7)
@@ -288,18 +261,16 @@ class PPOTrainer:
                 action_dim=action_dim,
                 task_id=spec.task_id,
                 norm_stats=spec.norm_stats,
-                target_state_dim=obs_dim,  # pad to unified arch input dim
+                target_state_dim=obs_dim,
             )
             for spec in env_specs
         ]
 
-        # Determine image/state dims for rollout buffer
         image_specs = {
             cam: (self.camera_size, self.camera_size, 3)
             for cam in self.obs_keys_image
         }
-        # In multi-task, tasks have different native state dims — arch_cfg.obs_dim
-        # is the padded width emitted by every HistoryBuffer.
+
         if obs_dim is not None:
             state_dim = obs_dim
         else:
@@ -319,25 +290,18 @@ class PPOTrainer:
 
         rollout_buffer = _make_buffer()
 
-        # --- Async rollout scaffolding ---
-        # Snapshot model for background rollouts: deep-copied once, then
-        # re-seeded via load_state_dict each iteration. Rollout uses this
-        # snapshot while the main model is being updated on the previous
-        # iteration's data → one-step-stale on-policy (PPO clip is fine).
         rollout_buffer_next = _make_buffer() if self.async_rollout else None
         if self.async_rollout:
             rollout_model = copy.deepcopy(raw_model).to(self.device).eval()
             for p in rollout_model.parameters():
                 p.requires_grad_(False)
             async_pool = ThreadPoolExecutor(max_workers=1)
-            print("[PPO] async_rollout=True — double-buffered collect/update")
+            print("[PPO] async_rollout=True - double-buffered collect/update")
         else:
             rollout_model = None
             async_pool = None
         pending_future: Optional[Future] = None
 
-        # Initial env reset + push first obs to history buffers.
-        # MultiTaskVecEnv returns per-env observation dicts (list).
         obs_list, _ = vec_env.reset()
         for i in range(self.n_envs):
             history_buffers[i].reset()
@@ -358,20 +322,15 @@ class PPOTrainer:
 
         for iteration in range(1, self.max_iterations + 1):
             iter_start = time.time()
-            # Reset peak so `gpu/mem_peak_mib` reflects THIS iteration's max
-            # (otherwise it monotonically grows and tells us nothing).
+
             if self.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats()
 
-            # --- Collect rollouts ---
             if self.async_rollout and pending_future is not None:
-                # Claim the previous iter's background rollout; its results
-                # live in rollout_buffer_next. Swap so it becomes active.
                 rollout_stats = pending_future.result()
                 rollout_buffer, rollout_buffer_next = rollout_buffer_next, rollout_buffer
                 pending_future = None
             else:
-                # Serial path: warmup in async mode, or plain synchronous mode.
                 model.eval()
                 rollout_stats = collect_rollouts(
                     vec_env, model, history_buffers, rollout_buffer,
@@ -382,9 +341,6 @@ class PPOTrainer:
                     show_progress=self.show_progress,
                 )
 
-            # Kick off the NEXT rollout now, before the update, so env steps
-            # overlap with the GPU backward pass. Snapshot uses pre-update
-            # weights; the update will drift one iter ahead.
             if self.async_rollout and iteration < self.max_iterations:
                 rollout_model.load_state_dict(raw_model.state_dict())
                 rollout_model.eval()
@@ -396,20 +352,18 @@ class PPOTrainer:
                     self.profile_rollouts, self.show_progress,
                 )
 
-            # --- Compute GAE + per-task advantage normalization ---
             rollout_buffer.compute_advantages(
                 rollout_stats["last_values"], self.gamma, self.gae_lambda
             )
             rollout_buffer.normalize_advantages_per_task()
 
-            # --- PPO update ---
             model.train()
             total_policy_loss = 0.0
             total_value_loss = 0.0
             total_entropy = 0.0
             total_clip_fraction = 0.0
-            total_approx_kl = 0.0          # Schulman's k3 estimator, mean over minibatch
-            total_grad_norm = 0.0          # pre-clip norm across all params
+            total_approx_kl = 0.0
+            total_grad_norm = 0.0
             total_ratio_mean = 0.0
             total_ratio_std = 0.0
             n_updates = 0
@@ -426,10 +380,6 @@ class PPOTrainer:
                 )
                 mb_iter = mb_pbar
             for mb in mb_iter:
-                # Advantages were z-scored per-task on the full rollout buffer
-                # (see RolloutBuffer.normalize_advantages_per_task). Doing it
-                # again per-minibatch would re-bias toward whichever task
-                # happens to be over-represented in each minibatch.
                 adv = mb["advantages"]
 
                 with amp_ctx:
@@ -446,9 +396,6 @@ class PPOTrainer:
                 grad_norm = nn.utils.clip_grad_norm_(trainable_params, self.max_grad_norm)
                 optimizer.step()
 
-                # Track stats — approx_kl uses Schulman's k3 estimator,
-                # which is unbiased and strictly non-negative. Spiking KL is
-                # the main signal that the PPO clip isn't holding.
                 with torch.no_grad():
                     log_ratio = log_prob - mb["old_log_probs"]
                     ratio = log_ratio.exp()
@@ -469,14 +416,11 @@ class PPOTrainer:
                 mb_pbar.close()
             update_time = time.time() - update_t0
 
-            # --- Logging ---
             if iteration % self.logging_steps == 0:
                 elapsed = time.time() - t_start
                 fps = (iteration * self.n_steps * self.n_envs) / elapsed
                 iter_time = time.time() - iter_start
 
-                # Explained variance — how well the critic fits returns.
-                # Negative means the critic is worse than predicting the mean.
                 with torch.no_grad():
                     returns_flat = rollout_buffer.returns.flatten()
                     values_flat = rollout_buffer.values.flatten()
@@ -490,7 +434,6 @@ class PPOTrainer:
                     rewards_flat = rollout_buffer.rewards.flatten()
                     log_std = raw_model.log_std.detach()
 
-                # GPU memory (MiB)
                 if self.device.type == "cuda":
                     mem_alloc = torch.cuda.memory_allocated() / 1024**2
                     mem_reserved = torch.cuda.memory_reserved() / 1024**2
@@ -499,7 +442,7 @@ class PPOTrainer:
                     mem_alloc = mem_reserved = mem_peak = 0.0
 
                 log_dict = {
-                    # --- Core PPO ---
+
                     "iteration": iteration,
                     "ppo/policy_loss": total_policy_loss / n_updates,
                     "ppo/value_loss": total_value_loss / n_updates,
@@ -510,10 +453,10 @@ class PPOTrainer:
                     "ppo/ratio_mean": total_ratio_mean / n_updates,
                     "ppo/ratio_std": total_ratio_std / n_updates,
                     "ppo/explained_variance": explained_var,
-                    # --- Learning-rate tracking ---
+
                     "optim/actor_lr": optimizer.param_groups[0]["lr"],
                     "optim/critic_lr": optimizer.param_groups[1]["lr"],
-                    # --- Rollout episode stats ---
+
                     "rollout/mean_reward": rollout_stats["mean_reward"],
                     "rollout/success_rate": rollout_stats["success_rate"],
                     "rollout/mean_ep_length": rollout_stats["mean_length"],
@@ -525,29 +468,29 @@ class PPOTrainer:
                     "rollout/ep_reward_min": rollout_stats.get("reward_min", 0.0),
                     "rollout/ep_reward_max": rollout_stats.get("reward_max", 0.0),
                     "rollout/n_episodes": rollout_stats["n_episodes"],
-                    # --- Reward distribution (per-step across the rollout) ---
+
                     "rollout/reward_step_mean": rewards_flat.mean().item(),
                     "rollout/reward_step_std": rewards_flat.std().item(),
                     "rollout/reward_step_min": rewards_flat.min().item(),
                     "rollout/reward_step_max": rewards_flat.max().item(),
-                    # --- Advantage distribution (pre-normalization) ---
+
                     "adv/mean": adv_flat.mean().item(),
                     "adv/std": adv_flat.std().item(),
                     "adv/min": adv_flat.min().item(),
                     "adv/max": adv_flat.max().item(),
-                    # --- Value / return distribution ---
+
                     "value/mean": values_flat.mean().item(),
                     "value/std": values_flat.std().item(),
                     "return/mean": returns_flat.mean().item(),
                     "return/std": returns_flat.std().item(),
-                    # --- Policy exploration ---
+
                     "policy/log_std_mean": log_std.mean().item(),
                     "policy/log_std_max": log_std.max().item(),
                     "policy/log_std_min": log_std.min().item(),
                     "policy/action_mean_abs": actions_flat.abs().mean().item(),
                     "policy/action_std": actions_flat.std().item(),
                     "policy/action_max_abs": actions_flat.abs().max().item(),
-                    # --- Throughput / system ---
+
                     "time/fps": fps,
                     "time/iter_time": iter_time,
                     "time/rollout_time": rollout_stats.get("rollout_time", 0.0),
@@ -557,14 +500,12 @@ class PPOTrainer:
                     "gpu/mem_reserved_mib": mem_reserved,
                     "gpu/mem_peak_mib": mem_peak,
                 }
-                # Per-dim log_std and action stats — spot which action dims
-                # are collapsing or saturating.
+
                 for d in range(log_std.numel()):
                     log_dict[f"policy/log_std_d{d}"] = log_std[d].item()
                     log_dict[f"policy/action_mean_d{d}"] = actions_flat[:, d].mean().item()
                     log_dict[f"policy/action_std_d{d}"] = actions_flat[:, d].std().item()
-                # Per-task breakdown — essential for spotting catastrophic
-                # forgetting on downweighted tasks.
+
                 for task, stats in rollout_stats.get("per_task", {}).items():
                     log_dict[f"per_task/{task}/success_rate"] = stats["success_rate"]
                     log_dict[f"per_task/{task}/mean_reward"] = stats["mean_reward"]
@@ -597,12 +538,10 @@ class PPOTrainer:
                 if run is not None:
                     run.log(log_dict, step=iteration)
 
-            # --- Checkpointing ---
             if self.save_steps > 0 and iteration % self.save_steps == 0:
                 self._save_checkpoint(raw_model, optimizer, iteration)
                 self._prune_checkpoints()
 
-                # Track best by success rate
                 sr = rollout_stats["success_rate"]
                 if sr > best_success_rate:
                     best_success_rate = sr
@@ -635,13 +574,9 @@ class PPOTrainer:
 
         os.makedirs(ckpt_dir, exist_ok=True)
 
-        # Full actor-critic state
         model_state = model.state_dict()
         torch.save(model_state, os.path.join(ckpt_dir, "actor_critic.pt"))
 
-        # BC-compatible actor-only state (for eval_robomimic.py). Regular
-        # checkpoints skip this by default to halve disk writes; best/final
-        # always include it.
         include_bc = (
             is_best
             or name == "final"
@@ -664,8 +599,6 @@ class PPOTrainer:
             with open(os.path.join(ckpt_dir, "training_state.json"), "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2)
 
-        # Norm stats — save one file per task so downstream eval / re-init
-        # can pick the right stats regardless of which task is being rolled out.
         for task_name, ns in self.norm_stats_by_task.items():
             ns.save(os.path.join(ckpt_dir, f"norm_stats_{task_name}.json"))
 

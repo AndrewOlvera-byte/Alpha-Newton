@@ -1,9 +1,4 @@
-"""Rollout buffer and collection for on-policy PPO training.
-
-Stores transitions from parallel environments and provides minibatch
-iteration for PPO updates. Images are kept as uint8 on CPU to save
-GPU memory; conversion to float32 happens lazily per minibatch.
-"""
+"""Rollout storage and collection utilities for on-policy robotics PPO."""
 from __future__ import annotations
 
 import time
@@ -26,7 +21,7 @@ class RolloutBuffer:
         n_envs: int,
         action_dim: int,
         state_dim: int,
-        image_specs: Dict[str, tuple],  # {cam_key: (H, W, C)}
+        image_specs: Dict[str, tuple],
         history_length: int,
         device: torch.device,
     ):
@@ -36,15 +31,8 @@ class RolloutBuffer:
         self.history_length = history_length
         self.device = device
 
-        # Per-step storage: images on GPU as uint8. Previously stored on CPU
-        # as a numpy array and copied float32 per-minibatch — that was the
-        # single biggest source of both host-RAM pressure and PCIe traffic
-        # during the update phase. uint8 on GPU costs ~0.9 GB at
-        # T=192, N=16, hist=3, 2 cams, 128² (~1.4 GB at 160²) and fits
-        # comfortably alongside the ViT on a 16 GB card.
         self.images: Dict[str, torch.Tensor] = {}
         for cam, (h, w, c) in image_specs.items():
-            # [T, N, H, C, h, w] -- stored per history frame
             self.images[cam] = torch.zeros(
                 (n_steps, n_envs, history_length, c, h, w),
                 dtype=torch.uint8, device=device,
@@ -72,17 +60,16 @@ class RolloutBuffer:
         dones: np.ndarray,
     ):
         """Store one transition for all envs."""
-        # batch comes from HistoryBuffer.get_batch() calls stacked across envs
-        # images: {cam: [N, H, C, h, w]} as float tensors -- store as uint8 on GPU
+
         for cam in self.images:
-            imgs = batch["images"][cam]  # [N, H, C, h, w] float [0,1] on device
+            imgs = batch["images"][cam]
             self.images[cam][step].copy_(
                 imgs.mul(255).clamp_(0, 255).to(torch.uint8), non_blocking=True
             )
 
-        self.states[step] = batch["state"]  # [N, H, state_dim]
-        self.prev_actions[step] = batch["prev_actions"]  # [N, H, action_dim]
-        self.task_ids[step] = batch["task_id"]  # [N]
+        self.states[step] = batch["state"]
+        self.prev_actions[step] = batch["prev_actions"]
+        self.task_ids[step] = batch["task_id"]
         self.actions[step] = actions
         self.log_probs[step] = log_probs
         self.values[step] = values
@@ -98,17 +85,9 @@ class RolloutBuffer:
         )
 
     def normalize_advantages_per_task(self) -> None:
-        """Z-score advantages within each task before minibatching.
-
-        A medium model learning 4 tasks with different horizons and reward
-        scales gets dominated by whichever task has the biggest advantage
-        variance. Normalizing per-task equalizes gradient magnitude across
-        tasks — important when downweighted tasks (e.g. lift at n_env=1)
-        would otherwise produce advantages with different characteristic
-        scale than tool_hang at n_env=8.
-        """
-        adv = self.advantages          # [T, N]
-        tids = self.task_ids           # [T, N]
+        """Z-score advantages independently for each task id."""
+        adv = self.advantages
+        tids = self.task_ids
         flat_adv = adv.reshape(-1)
         flat_tids = tids.reshape(-1)
         out = flat_adv.clone()
@@ -129,7 +108,6 @@ class RolloutBuffer:
         total = T * N
         indices = np.arange(total)
 
-        # Flatten [T, N] -> [T*N] for all tensors
         flat_states = self.states.view(total, self.history_length, -1)
         flat_prev_actions = self.prev_actions.view(total, self.history_length, -1)
         flat_task_ids = self.task_ids.view(total)
@@ -139,7 +117,6 @@ class RolloutBuffer:
         flat_advantages = self.advantages.view(total)
         flat_returns = self.returns.view(total)
 
-        # Flatten images on-device: {cam: [T*N, H, C, h, w]} uint8 GPU tensor
         flat_images = {}
         for cam, arr in self.images.items():
             flat_images[cam] = arr.view(total, *arr.shape[2:])
@@ -150,9 +127,6 @@ class RolloutBuffer:
                 idx = indices[start : start + batch_size]
                 idx_t = torch.from_numpy(idx).long().to(self.device)
 
-                # No CPU→GPU hop — index the uint8 GPU buffer directly and
-                # cast to float inside the minibatch. This used to be a 1+ GB
-                # pinned copy per epoch for nothing.
                 mb_images = {}
                 for cam, flat in flat_images.items():
                     mb_images[cam] = flat.index_select(0, idx_t).float().mul_(1.0 / 255.0)
@@ -211,8 +185,7 @@ def collect_rollouts(
         return None
 
     t0 = time.time()
-    # Fine-grained wall-time breakdown per phase — lets us pick the right
-    # optimization lever (render vs IPC vs transfer vs forward).
+
     t_batch_build = 0.0
     t_forward = 0.0
     t_vec_step = 0.0
@@ -232,8 +205,7 @@ def collect_rollouts(
 
     for step in iterator:
         _t = time.time()
-        # Build batched input from all history buffers (each carries its own
-        # task_id + norm_stats, so the stacked batch already respects tasks).
+
         batches = [hb.get_batch(device=device) for hb in history_buffers]
         batch = _stack_batches(batches, device)
         t_batch_build += time.time() - _t
@@ -241,9 +213,8 @@ def collect_rollouts(
         _t = time.time()
         with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16), torch.no_grad():
             actions, log_probs, values = actor_critic.act(batch)
-        actions_np = actions.float().cpu().numpy()  # [N, action_dim]
-        # Only synchronize for diagnostics. A device-wide synchronize inside
-        # background rollouts makes async PPO wait on unrelated update kernels.
+        actions_np = actions.float().cpu().numpy()
+
         if profile and device.type == "cuda":
             torch.cuda.synchronize()
         t_forward += time.time() - _t
@@ -266,7 +237,7 @@ def collect_rollouts(
             if not hasattr(vec_env, "reset_at"):
                 raise RuntimeError(
                     "vec_env must implement reset_at(indices) so PPO can autoreset "
-                    "only terminated/truncated robosuite envs"
+                    "only terminated/truncated environments"
                 )
             reset_obs, _reset_infos = vec_env.reset_at(done_indices)
             reset_obs_by_env = dict(zip(done_indices, reset_obs))
@@ -296,11 +267,9 @@ def collect_rollouts(
                 history_buffers[i].record_action(raw_action)
                 o = obs_list[i]
 
-            # Push next observation (per-env dict from MultiTaskVecEnv)
             history_buffers[i].push(o["images"], o["state"])
         t_hb_push += time.time() - _t
 
-        # Live FPS — env-steps/sec across all envs.
         if pbar is not None and ((step + 1) % 8 == 0 or step == n_steps - 1):
             elapsed = max(time.time() - t0, 1e-6)
             fps = (step + 1) * n_envs / elapsed
@@ -310,7 +279,6 @@ def collect_rollouts(
         pbar.close()
     rollout_time = time.time() - t0
 
-    # Bootstrap value for GAE
     batches = [hb.get_batch(device=device) for hb in history_buffers]
     batch = _stack_batches(batches, device)
     with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16), torch.no_grad():

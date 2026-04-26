@@ -2,120 +2,63 @@ run:
   name: "bc_multitask_ph"
   mode: "bc"
 
-# ─────────────────────────────────────────────
-# Dataset
-# ─────────────────────────────────────────────
-# 3 tasks (lift=0, can=1, square=2) — all single-arm, action_dim=7, obs_dim=23.
-# Combined ~600 demos vs 200 for single-task, providing 3× more scene diversity
-# to fight overfitting without changing the architecture dimensions.
-#
-# transport / tool_hang are available via robomimic_download.py but require a
-# separate config (bimanual action_dim=14 / larger obs_dim).
-#
-# Data prep (run once before training):
-#   python scripts/robomimic_download.py --tasks lift can square
-#   python scripts/render_images.py --dataset data/robomimic/lift/ph/low_dim.hdf5 --size 84
-#   python scripts/render_images.py --dataset data/robomimic/can/ph/low_dim.hdf5  --size 84
-#   python scripts/render_images.py --dataset data/robomimic/square/ph/low_dim.hdf5 --size 84
-#   python scripts/precompute_features.py --hdf5 data/robomimic/lift/ph/image.hdf5   --n-aug 4
-#   python scripts/precompute_features.py --hdf5 data/robomimic/can/ph/image.hdf5    --n-aug 4
-#   python scripts/precompute_features.py --hdf5 data/robomimic/square/ph/image.hdf5 --n-aug 4
 data:
-  type: "robomimic_bc"
+  type: "robomimic_bc_robosuite"
   data_dir: "data/robomimic"
   tasks:
-    - "lift"    # task_id=0
-    - "can"     # task_id=1
-    - "square"  # task_id=2
+    - "lift"
+    - "can"
+    - "square"
   history_length: 3
   obs_keys:
     low_dim:
-      - "robot0_eef_pos"       # 3  — end-effector position
-      - "robot0_eef_quat"      # 4  — end-effector quaternion
-      - "robot0_gripper_qpos"  # 2  — gripper joint positions
-      - "object-state"         # 10 — object pos(3) + quat(4) + gripper_to_object(3)
+      - "robot0_eef_pos"
+      - "robot0_eef_quat"
+      - "robot0_gripper_qpos"
+      - "object-state"
     image:
       - "agentview_image"
       - "robot0_eye_in_hand_image"
-  action_chunk_size: 8      # must match architecture.action_chunk_size
+  action_chunk_size: 8
   eval_ratio: 0.1
   hdf5_filter_key: null
 
-# ─────────────────────────────────────────────
-# Architecture
-# ─────────────────────────────────────────────
 robotics:
   architecture:
     type: "vla_flow_matching"
 
-    # ── Causal Transformer Decoder ──────────────
-    d_model: 384              # must match DINOv2 ViT-S/14 hidden dim (384)
+    d_model: 384
     n_transformer_layers: 6
-    n_transformer_heads: 6    # d_head = 384/6 = 64
-    d_ff: 1536                # 4× d_model
+    n_transformer_heads: 6
+    d_ff: 1536
     dropout: 0.1
-    encoder_hidden_dim: 128   # hidden dim for state/action MLP encoders
+    encoder_hidden_dim: 128
 
-    # ── DiT Flow-Matching Action Head ───────────
     d_dit: 256
     n_dit_layers: 4
-    n_dit_heads: 4            # d_head = 256/4 = 64
-    d_dit_ff: 1024            # 4× d_dit
+    n_dit_heads: 4
+    d_dit_ff: 1024
 
-    # ── Task dimensions ─────────────────────────
-    action_dim: 7             # [dx,dy,dz, droll,dpitch,dyaw, gripper]
-    obs_dim: 23               # eef_pos(3)+eef_quat(4)+gripper(2)+object-state(max=14 for can/square; lift=10 padded)
+    action_dim: 7
+    obs_dim: 23
     n_cameras: 2
     history_length: 3
 
-    # ── Multi-task conditioning ─────────────────
-    # n_tasks learned task embeddings.
-    # task_emb [n_tasks, d_model]: prepended as group-0 token in the causal
-    #   transformer — every history frame attends back to it, injecting task
-    #   identity before any cross-frame reasoning.
-    # task_emb_dit [n_tasks, d_dit]: additive bias to the DiT conditioning
-    #   vector so the flow-matching action head is also task-conditioned.
-    # Must equal len(data.tasks). task_id is 0-indexed per task list above.
     n_tasks: 3
 
-    # ── Vision (DINOv2 ViT-S/14, frozen) ────────
     vit_model: "facebook/dinov2-small"
     vit_img_size: 224
     freeze_vit: true
-    # Pool 256 raw patches → 64 per camera via attention pooling.
-    # Sequence with task token: 1+2*64+2=131 tokens/frame → 1+3*130+1=392 total.
+
     vis_tokens_per_camera: 64
-    vis_pool_type: "attention"   # "attention" (Perceiver-style) or "avg"
+    vis_pool_type: "attention"
 
-    # ── Flow matching ────────────────────────────
-    num_flow_steps: 10        # Euler ODE steps at inference
+    num_flow_steps: 10
 
-    # ── Action chunking (Diffusion Policy style) ─
     action_chunk_size: 8
 
-    # ── Training optimisations ───────────────────
     gradient_checkpointing: false
 
-# ─────────────────────────────────────────────
-# Training
-# ─────────────────────────────────────────────
-# Hyperparameter rationale for multi-task 3× data regime (batch=128):
-#
-# Steps: ~600 demos × ~350 ts/demo = 210K samples/epoch at batch=128 → ~1640 steps/epoch.
-#   25K steps ≈ 15 epochs — same epoch count as the bs=64/50K baseline.
-#
-# LR: linear scaling rule (Goyal et al.) — LR ∝ batch size.
-#   6e-5 × (128/64) = 1.2e-4.  Safe here: small model, diverse multi-task data,
-#   and 500-step warmup absorbs early instability.
-#
-# Warmup: kept at 500 steps (not halved). Each step now sees 2× more samples,
-#   so 500 steps covers more data, giving extra stability at the higher peak LR.
-#
-# Weight decay: 5e-4 unchanged — independent of batch size.
-#
-# Eval steps: 250 (every ~0.15 epochs) — same data-volume cadence as before.
-# Early stopping: patience=8 × 250 steps = 2000 steps (~1.2 epochs) without
-#   improvement triggers a stop.
 training:
   per_device_train_batch_size: 128
   per_device_eval_batch_size: 128
@@ -128,9 +71,7 @@ training:
   logging_steps: 50
   save_steps: 1000
   eval_steps: 250
-  # Early stopping: patience=8 × eval_steps=250 = 2000 steps (~1.2 epochs) without
-  # improvement triggers a stop and saves an "early_stop" checkpoint.
-  # Set to 0 to disable.
+
   early_stopping_patience: 8
   bf16: true
   fp8: false
@@ -140,9 +81,6 @@ training:
   dataloader_prefetch_factor: 2
   output_dir: "outputs/bc_multitask_ph"
 
-# ─────────────────────────────────────────────
-# Wandb
-# ─────────────────────────────────────────────
 wandb:
   project: "robotics-bc"
   entity: "andrewolvera"

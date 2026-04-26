@@ -3,7 +3,7 @@ run:
   mode: "bc"
 
 data:
-  type: "robomimic_bc"
+  type: "robomimic_bc_robosuite"
   data_dir: "data/robomimic"
   tasks:
     - "lift"

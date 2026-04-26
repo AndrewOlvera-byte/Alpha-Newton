@@ -23,6 +23,7 @@ services:
       - ./outputs:/workspace/outputs          # Model checkpoints
       - ./experiments:/workspace/experiments  # Experiment configs
       - ~/.cache/huggingface:/root/.cache/huggingface  # Share HF cache with host
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw      # Unity renderer display socket
 
     # Keep container running for interactive CLI
     stdin_open: true
@@ -37,11 +38,16 @@ services:
     environment:
       - CUDA_VISIBLE_DEVICES=0
       - WANDB_API_KEY=${WANDB_API_KEY}  # Pass from host environment
-      # NVIDIA EGL hardware rendering for MuJoCo — requires `graphics` capability
-      # below so the runtime mounts libEGL_nvidia.so.0 from the host driver.
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+      - SDL_VIDEODRIVER=x11
+      - __GLX_VENDOR_LIBRARY_NAME=nvidia
       - MUJOCO_GL=egl
       - PYOPENGL_PLATFORM=egl
+      - FLIGHTMARE_PATH=/opt/flightmare
+      - FLIGHTMARE_UNITY_EXECUTABLE=/opt/flightmare/flightrender/RPG_Flightmare.x86_64
 
     # Port mappings
     ports:

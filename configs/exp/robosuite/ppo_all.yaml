@@ -2,24 +2,10 @@ run:
   name: "ppo_all_from_bc"
   mode: "ppo"
 
-# Launch with:
-#   python -m src.entrypoints.train_ppo \
-#     --exp ppo_all \
-#     --bc-checkpoint outputs/bc_multitask_mlp_rl_ready_medium_gnll_all/best/model.pt
-#
-# Multi-task PPO: the trainer allocates `n_envs` across tasks by `task_weights`
-# using largest-remainder, giving every positive-weight task ≥1 env (so
-# downweighted tasks still produce gradient signal and resist forgetting).
-# With n_envs=20 and the weights below → [lift=1, can=1, square=2, tool_hang=16]
-# = ~80% of rollout transitions on the hardest task.
-
 data:
-  type: "robomimic_bc"
+  type: "robomimic_bc_robosuite"
   data_dir: "data/robomimic"
-  # Each task declares its rollout mixture weight (normalized internally).
-  # Largest-remainder allocation guarantees every positive-weight task ≥1 env.
-  # Current mix targets the two hardest tasks (both 0% after BC):
-  #   n_envs=20 → [lift=2, can=2, square=8, tool_hang=8]
+
   tasks:
     - name: lift
       weight: 0.10
@@ -30,9 +16,7 @@ data:
     - name: tool_hang
       weight: 0.40
   history_length: 3
-  # Render at 128. DINOv2 resizes to 224 internally anyway, so anything above
-  # 128 is wasted rasterization cost + GPU memory. Cuts per-step render time
-  # ~40% and image buffer memory ~36%.
+
   image_size: 128
   obs_keys:
     low_dim:
@@ -67,29 +51,21 @@ robotics:
     vis_tokens_per_camera: 32
     vis_pool_type: "avg"
     action_chunk_size: 1
-    gradient_checkpointing: false  # VRAM headroom (~13 GB free on 16 GB) → prefer speed
+    gradient_checkpointing: false
     bc_loss_type: "gnll"
 
   ppo:
-    # Sized for a 16 GB VRAM card, left-running unattended:
-    #  - n_envs=16 cleanly partitions into [2,2,6,6] under the weights below
-    #  - n_steps=192 → rollout buffer image tensor ~900 MiB on GPU (uint8)
-    #  - minibatch_size=512 with uint8 GPU images → fast updates, ample VRAM
+
     n_envs: 16
     n_steps: 192
     ppo_epochs: 4
-    # 512 is the sweet spot now that images live as uint8 on GPU — no
-    # pinned copy per minibatch, VRAM is free for larger update batches.
-    # Drop to 256 only if `gpu/mem_peak_mib` crosses ~12 GB.
+
     minibatch_size: 512
-    # Keep torch.compile off by default. Inductor can spend minutes compiling
-    # this dict-heavy vision model and generate heavy cache I/O; enable only
-    # for a controlled benchmark after eager throughput is healthy.
+
     compile: false
     profile_rollouts: false
     show_progress: false
-    # Overlap env-stepping + rollout forward with PPO update (one iter
-    # off-policy; PPO clip tolerates it). Doubles policy VRAM.
+
     async_rollout: true
     clip_eps: 0.2
     vf_coeff: 0.5
@@ -99,14 +75,12 @@ robotics:
     actor_lr: 1.0e-5
     critic_lr: 1.0e-4
     max_iterations: 500
-    horizon: 400              # default horizon — overridden per task below
+    horizon: 400
     reward_shaping: true
-    # Reward function — looked up in src/robotics/rewards.py REWARD_FUNCTIONS.
-    # dense_multitask_v1 = per-task dense shaping + unified success/time schema.
+
     reward_fn: "dense_multitask_v1"
     value_hidden_dim: 512
-    # Weights now live on the task entries in `data.tasks` above.
-    # tool_hang + square need longer horizons to reach success states.
+
     task_horizons:
       lift: 400
       can: 400
@@ -114,11 +88,11 @@ robotics:
       tool_hang: 700
 
 training:
+  trainer_type: "ppo_robosuite"
   max_grad_norm: 0.5
   bf16: true
   logging_steps: 1
-  # PPO checkpoints are large. Save sparse actor-critic checkpoints, keep the
-  # newest three, and write BC-compatible model.pt only for best/final.
+
   save_steps: 100
   save_total_limit: 3
   save_optimizer_state: false

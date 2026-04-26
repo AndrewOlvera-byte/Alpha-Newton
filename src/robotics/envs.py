@@ -1,19 +1,7 @@
-"""Gymnasium-wrapped robosuite environments for RL training.
-
-Wraps robosuite envs as gymnasium.Env instances with observation/action
-formats matching the BC pipeline (HistoryBuffer expects raw uint8 images
-and float32 state; actions are in normalized space).
-"""
+"""Robosuite environment backend for robotics reinforcement learning."""
 from __future__ import annotations
 
 import os
-# Safety: if anything imports this module before train_ppo.py sets EGL,
-# override here too. Must run before robosuite/mujoco touch GL.
-os.environ.setdefault("MUJOCO_GL", "egl")
-os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-if os.environ.get("MUJOCO_GL") == "osmesa":
-    os.environ["MUJOCO_GL"] = "egl"
-    os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
@@ -27,8 +15,6 @@ from gymnasium import spaces
 from src.robotics.normalization import NormStats
 from src.robotics.rewards import get_reward_function
 
-
-# Robomimic config task names → robosuite environment names
 _ROBOSUITE_ENV_MAP = {
     "lift": "Lift",
     "can": "PickPlaceCan",
@@ -42,15 +28,7 @@ _ROBOSUITE_ENV_MAP = {
 
 
 class RobosuiteGymEnv(gymnasium.Env):
-    """Gymnasium wrapper around a robosuite environment.
-
-    Observations are returned as a dict with:
-      - "state": float32 array of concatenated low-dim obs
-      - "images": dict of {cam_key: uint8 HWC array}
-
-    Actions are accepted in **normalized** space (matching BC model output).
-    The wrapper denormalizes before stepping robosuite.
-    """
+    """Gymnasium wrapper with BC-compatible observations and actions."""
 
     def __init__(
         self,
@@ -74,8 +52,6 @@ class RobosuiteGymEnv(gymnasium.Env):
         self.horizon = horizon
         self._step_count = 0
         self._task_name = task_name
-        # Look up the reward-shaping callable once — None means "use robosuite's
-        # native reward as-is" (backwards compatible with earlier PPO runs).
         self._reward_fn = get_reward_function(reward_fn) if reward_fn else None
 
         robosuite_name = _ROBOSUITE_ENV_MAP.get(task_name.lower(), task_name.capitalize())
@@ -96,13 +72,11 @@ class RobosuiteGymEnv(gymnasium.Env):
             horizon=horizon,
         )
 
-        # Determine dims from a probe reset
         probe_obs = self._env.reset()
         state = self._extract_state(probe_obs)
         state_dim = state.shape[0]
         action_dim = len(self.norm_stats.action_mean)
 
-        # Observation space
         img_spaces = {}
         for key in self.obs_keys_image:
             img_spaces[key] = spaces.Box(0, 255, shape=(camera_size, camera_size, 3), dtype=np.uint8)
@@ -111,10 +85,7 @@ class RobosuiteGymEnv(gymnasium.Env):
             "images": spaces.Dict(img_spaces),
         })
 
-        # Action space in normalized space (model outputs clamped to [-5, 5])
         self.action_space = spaces.Box(-5.0, 5.0, shape=(action_dim,), dtype=np.float32)
-
-        # Seed
         self._seed = seed
 
     def _extract_state(self, obs: dict) -> np.ndarray:
@@ -154,7 +125,6 @@ class RobosuiteGymEnv(gymnasium.Env):
         return self._make_obs(raw_obs), {}
 
     def step(self, action: np.ndarray) -> Tuple[dict, float, bool, bool, dict]:
-        # Denormalize action from model's normalized space to world space
         raw_action = self.norm_stats.denormalize_action(action.astype(np.float32))
         raw_action = np.clip(raw_action, -1.0, 1.0)
 
@@ -168,9 +138,6 @@ class RobosuiteGymEnv(gymnasium.Env):
         terminated = success
         truncated = self._step_count >= self.horizon and not success
 
-        # Apply custom reward shaping if one was requested. The function sees
-        # the raw robosuite obs (has task-specific keys like cube_pos, tool_pos,
-        # frame_pos) plus robosuite's native reward as its base.
         if self._reward_fn is not None:
             info["base_reward"] = float(reward)
             reward = self._reward_fn(
@@ -197,29 +164,15 @@ class EnvSpec:
     norm_stats: NormStats
     horizon: int = 400
     reward_shaping: bool = True
-    reward_fn: Optional[str] = None  # name from REWARD_FUNCTIONS registry
+    reward_fn: Optional[str] = None
 
 
 class MultiTaskVecEnv:
-    """Vectorized robosuite env supporting heterogeneous tasks.
-
-    Unlike ``gymnasium.vector.SyncVectorEnv``, this wrapper does NOT stack
-    per-env observations — different tasks have different state/object
-    dimensions, so observations are returned as a per-env list.  Physics
-    steps are parallelized via a ``ThreadPoolExecutor`` (robosuite /
-    MuJoCo release the GIL during ``sim.step``).
-
-    API (mirrors SyncVectorEnv but list-valued where stacking is impossible):
-        reset()  → (List[obs_dict], List[info_dict])
-        step(actions: np.ndarray[N, action_dim])
-                 → (List[obs_dict], rewards[N], terms[N], truncs[N], List[info_dict])
-        close(), n_envs
-    """
+    """Threaded vector environment for heterogeneous robosuite tasks."""
 
     def __init__(self, env_fns: List[callable], max_workers: Optional[int] = None):
         self.envs: List[RobosuiteGymEnv] = [fn() for fn in env_fns]
         self.n_envs = len(self.envs)
-        # One worker per env — robosuite steps are CPU-bound but GIL-releasing.
         self._pool = ThreadPoolExecutor(max_workers=max_workers or self.n_envs)
 
     def reset(self, *, seed: Optional[int] = None) -> Tuple[List[dict], List[dict]]:
@@ -257,18 +210,7 @@ class MultiTaskVecEnv:
 
 
 def _subproc_worker(conn, env_fn: Callable):
-    """Child-process entry: build env, serve reset/step over a Pipe.
-
-    robosuite import + GL setup happens in the child so every env has its own
-    MuJoCo context, no GIL contention, and osmesa/EGL can be used safely.
-    """
-    # Force EGL (NVIDIA GPU rasterization) in the child before robosuite
-    # import. `setdefault` with "osmesa" here silently pinned every worker to
-    # CPU software rendering — the docker-compose NVIDIA_DRIVER_CAPABILITIES
-    # already includes `graphics` so libEGL_nvidia.so.0 is visible.
-    import os as _os
-    _os.environ["MUJOCO_GL"] = "egl"
-    _os.environ["PYOPENGL_PLATFORM"] = "egl"
+    """Build one environment and serve reset/step commands over a pipe."""
     try:
         env = env_fn()
         conn.send(("ready", None))
@@ -295,31 +237,11 @@ def _subproc_worker(conn, env_fn: Callable):
 
 
 class SubprocMultiTaskVecEnv:
-    """Process-per-env vectorized robosuite env — drop-in for MultiTaskVecEnv.
-
-    ThreadPoolExecutor hits Python's GIL hard during robosuite/MuJoCo steps
-    (numpy, XML parsing, rasterization all hold it). Subprocesses bypass the
-    GIL entirely: benchmarked 8× faster at 8 parallel envs (11 FPS/env vs
-    1.3 FPS/env threaded on WSL2). Workers render via EGL on the GPU.
-    """
+    """Process-per-env vector environment for heterogeneous robosuite tasks."""
 
     def __init__(self, env_fns: List[Callable], start_method: Optional[str] = None,
                  startup_parallelism: Optional[int] = None):
-        """
-        start_method: multiprocessing start method. Defaults to
-        PPO_START_METHOD, else "fork" on Linux and "spawn" elsewhere. "spawn"
-        is safer after CUDA initialization, but starts a fresh interpreter per
-        env and can saturate disk/RAM by re-importing torch/robosuite N times.
-        PPOTrainer launches envs before moving the policy to CUDA, so Linux
-        "fork" is the safe and much lighter default here.
-
-        startup_parallelism: how many workers may be in the
-        "importing robosuite + creating EGL context" phase at once. Too many
-        at once → EGL context creation races on the NVIDIA driver and
-        silently segfaults workers (parent sees BrokenPipe on first reset).
-        Overridable via env var PPO_STARTUP_PARALLELISM for tuning;
-        defaults to 2 — safe up to at least 32 envs on a 16 GB card.
-        """
+        """Create subprocess workers with bounded startup concurrency."""
         if start_method is None:
             start_method = os.environ.get("PPO_START_METHOD")
         if start_method is None:
@@ -333,7 +255,6 @@ class SubprocMultiTaskVecEnv:
         self.conns: List = []
         self.procs: List = []
 
-        # Launch in waves, confirming ready before starting the next batch.
         pending: List = []
         for i, fn in enumerate(env_fns):
             parent, child = ctx.Pipe()
@@ -424,15 +345,7 @@ class SubprocMultiTaskVecEnv:
 
 
 def allocate_envs_by_weights(n_envs: int, weights: List[float]) -> List[int]:
-    """Largest-remainder (Hamilton/Hare) allocation of ``n_envs`` across tasks.
-
-    Every task with a strictly-positive weight is guaranteed at least one
-    env so that harder-but-downweighted tasks still get gradient signal.
-    The remaining envs are distributed by fractional parts of ``w * n_envs``.
-
-    Example:
-        n_envs=20, weights=[0.05, 0.05, 0.10, 0.80] → [1, 1, 2, 16]
-    """
+    """Allocate vector env slots by normalized task weights."""
     w = np.asarray(weights, dtype=np.float64)
     if (w < 0).any():
         raise ValueError(f"Negative weights not allowed: {weights}")
@@ -443,21 +356,17 @@ def allocate_envs_by_weights(n_envs: int, weights: List[float]) -> List[int]:
     n_tasks = len(w)
     if n_envs < (w > 0).sum():
         raise ValueError(
-            f"n_envs={n_envs} is too small — need at least one env per "
+            f"n_envs={n_envs} is too small - need at least one env per "
             f"positive-weight task ({(w > 0).sum()})"
         )
 
     raw = w * n_envs
     counts = np.floor(raw).astype(int)
-    # Min-1 guarantee for every positive-weight task.
     counts = np.where((w > 0) & (counts == 0), 1, counts)
     deficit = n_envs - counts.sum()
 
     if deficit > 0:
-        # Distribute remaining envs to largest fractional parts.
         frac = raw - np.floor(raw)
-        # Tasks already bumped to 1 should not get another bonus from their frac
-        # unless they had a natural remainder (w*n_envs was between 0 and 1).
         order = np.argsort(-frac)
         for i in order:
             if deficit == 0:
@@ -465,8 +374,6 @@ def allocate_envs_by_weights(n_envs: int, weights: List[float]) -> List[int]:
             counts[i] += 1
             deficit -= 1
     elif deficit < 0:
-        # Overshoot from min-1 clamping — strip from most over-allocated tasks
-        # relative to their fair share, never going below 1 for positive tasks.
         over = -deficit
         excess = counts - raw
         order = np.argsort(-excess)
@@ -488,7 +395,7 @@ def allocate_envs_by_weights(n_envs: int, weights: List[float]) -> List[int]:
 
 @dataclass
 class _EnvBuilder:
-    """Picklable env factory — needed for mp.spawn (closures aren't picklable)."""
+    """Picklable robosuite environment factory."""
     spec: EnvSpec
     camera_names: List[str]
     camera_size: int
@@ -531,8 +438,6 @@ def make_robosuite_multitask_vec_env(
         )
         for i, spec in enumerate(env_specs)
     ]
-    # SubprocMultiTaskVecEnv replaces the GIL-bound ThreadPoolExecutor path —
-    # each robosuite env runs in its own process, ~8× faster on WSL2.
     return SubprocMultiTaskVecEnv(fns)
 
 

@@ -1,17 +1,11 @@
 """
-PPO fine-tuning entrypoint for BC-pretrained robosuite policies.
+PPO fine-tuning entrypoint for BC-pretrained robotics policies.
 
 Usage:
     python -m src.entrypoints.train_ppo --exp ppo_lift --bc-checkpoint outputs/bc_lift_mlp_rl_ready/best/model.pt
     python -m src.entrypoints.train_ppo --exp ppo_lift --bc-checkpoint outputs/bc_lift_mlp_rl_ready/best/model.pt --test
 """
 import os
-# Force MuJoCo onto GPU (EGL) before robosuite/mujoco import — 5-10× faster
-# offscreen rendering than osmesa, and rendering actually releases the GIL so
-# ThreadPoolExecutor env-stepping parallelizes.
-os.environ["MUJOCO_GL"] = os.environ.get("MUJOCO_GL_OVERRIDE", "egl")
-os.environ["PYOPENGL_PLATFORM"] = os.environ.get("MUJOCO_GL_OVERRIDE", "egl")
-
 import argparse
 
 import torch
@@ -192,9 +186,10 @@ def main(exp_name: str, bc_checkpoint: str, test_only: bool = False):
     raw_horizons = ppo_cfg.get("task_horizons") or {}
     task_horizons = {str(k): int(v) for k, v in raw_horizons.items()}
 
+    trainer_type = cfg.training.get("trainer_type", "ppo_robosuite")
     trainer = build(
         "trainer",
-        type="ppo",
+        type=trainer_type,
         model=actor_critic,
         training_cfg=cfg.training,
         robotics_cfg=cfg.robotics,

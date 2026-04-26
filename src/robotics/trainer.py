@@ -1,15 +1,4 @@
-"""
-BC Trainer for robotics visuomotor policies.
-
-Handles:
-- Flow matching training loop
-- Mixed precision (bf16, FP8 stub)
-- Gradient clipping & accumulation
-- Cosine LR schedule with warmup
-- Wandb logging
-- Checkpointing with resume
-- Evaluation
-"""
+"""Behavioral cloning trainer for robotics visuomotor policies."""
 from __future__ import annotations
 
 import os
@@ -28,26 +17,13 @@ from src.core.registry import register
 
 
 class TaskBalancedBatchSampler(Sampler):
-    """Yields complete batches with exactly spt = batch_size // n_tasks samples
-    from each task.  Implemented as a BatchSampler (yields lists of indices) so
-    the DataLoader never crosses a round boundary — the guarantee is exact.
-
-    Works with ConcatDataset where each component dataset corresponds to one task.
-    Each epoch independently shuffles within each task before interleaving.
-    Falls back cleanly for single-task datasets (equivalent to random batching).
-
-    Note: effective batch size = spt * n_tasks which may be slightly less than
-    the requested batch_size when batch_size is not divisible by n_tasks.
-    e.g. batch_size=128, n_tasks=3 → spt=42, effective_bs=126.  The <2%
-    difference is negligible for LR scaling purposes.
-    """
+    """Batch sampler that emits equal per-task samples from ConcatDataset."""
 
     def __init__(self, dataset, batch_size: int):
         datasets = list(getattr(dataset, "datasets", [dataset]))
         self.n_tasks = len(datasets)
-        self.spt = batch_size // self.n_tasks  # samples per task per batch
+        self.spt = batch_size // self.n_tasks
 
-        # Absolute index range for each task within the ConcatDataset
         self._task_ranges: List[tuple] = []
         offset = 0
         for ds in datasets:
@@ -55,7 +31,6 @@ class TaskBalancedBatchSampler(Sampler):
             self._task_ranges.append((offset, offset + n))
             offset += n
 
-        # Limit to the smallest task so all tasks contribute equally.
         min_task_n = min(hi - lo for lo, hi in self._task_ranges)
         self._n_batches = min_task_n // self.spt
         self.effective_batch_size = self.spt * self.n_tasks
@@ -64,15 +39,12 @@ class TaskBalancedBatchSampler(Sampler):
         return self._n_batches
 
     def __iter__(self):
-        # Independently shuffle each task's index pool for this epoch
         per_task = []
         for lo, hi in self._task_ranges:
             pool = list(range(lo, hi))
             random.shuffle(pool)
             per_task.append(pool)
 
-        # Each iteration yields one complete batch list.
-        # Shuffling within the batch mixes tasks so they're not contiguous.
         for b in range(self._n_batches):
             batch = []
             start = b * self.spt
@@ -106,8 +78,8 @@ class BCTrainer:
         training_cfg: Dict[str, Any],
         robotics_cfg: Dict[str, Any],
         wandb_cfg: Dict[str, Any],
-        norm_stats=None,  # NormStats — stored in checkpoint, used by eval
-        dataset_meta: dict = None,  # _train_demo_info, _obs_keys_low_dim from data builder
+        norm_stats=None,
+        dataset_meta: dict = None,
     ):
         self.model = model
         self.train_dataset = train_dataset
@@ -117,7 +89,7 @@ class BCTrainer:
         self.wandb_cfg = wandb_cfg or {}
         self.norm_stats = norm_stats
         self._dataset_meta = dataset_meta or {}
-        # {0: "lift", 1: "can", ...} — used to label per-task wandb metrics readably
+
         self._task_names: Dict[int, str] = {
             i: name for i, name in enumerate(self._dataset_meta.get("_task_names", []))
         }
@@ -125,11 +97,9 @@ class BCTrainer:
         self._obs_keys_image: List[str] = list(self._dataset_meta.get("_obs_keys_image", []) or [])
         self._image_size: int = int(self._dataset_meta.get("_image_size", 84) or 84)
 
-        # Device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = self.model.to(self.device)
 
-        # Training params
         self.batch_size = training_cfg.get("per_device_train_batch_size", 64)
         self.eval_batch_size = training_cfg.get("per_device_eval_batch_size", self.batch_size)
         self.grad_accum_steps = training_cfg.get("gradient_accumulation_steps", 1)
@@ -174,10 +144,9 @@ class BCTrainer:
                 f"every={self.rollout_eval_every} steps"
             )
 
-        # Mixed precision
         self.use_bf16 = training_cfg.get("bf16", True)
         self.use_fp8 = training_cfg.get("fp8", False)
-        # bf16 autocast always runs — FP8 operates below autocast at the Linear level
+
         self.amp_dtype = torch.bfloat16 if (self.use_bf16 or self.use_fp8) else torch.float32
         self._fp8_enabled = False
 
@@ -189,10 +158,6 @@ class BCTrainer:
                     Float8LinearRecipeName,
                 )
 
-                # Filter: only convert aligned Linear layers (dims divisible by 16).
-                # - Exclude frozen ViT entirely (not in training graph anyway).
-                # - Exclude small boundary layers (action_dim=7, obs_dim=19) that
-                #   would fail torch._scaled_mm alignment checks.
                 def _fp8_filter(mod, fqn):
                     if "vit" in fqn:
                         return False
@@ -200,8 +165,6 @@ class BCTrainer:
                         return mod.in_features % 16 == 0 and mod.out_features % 16 == 0
                     return False
 
-                # ROWWISE_WITH_GW_HP: FP8 for forward + dX, bf16 for dW.
-                # Compatible with PyTorch 2.9 (no batch-dim constraint in backward).
                 config = Float8LinearConfig.from_recipe_name(
                     Float8LinearRecipeName.ROWWISE_WITH_GW_HP
                 )
@@ -213,26 +176,23 @@ class BCTrainer:
                 print("[Trainer] FP8 covers transformer QKV/FFN and DiT blocks; "
                       "boundary layers (state/action encoders, output proj) stay in bf16")
             except ImportError:
-                print("[Trainer] torchao not found — falling back to bf16. "
+                print("[Trainer] torchao not found - falling back to bf16. "
                       "Install: pip install torchao")
                 self.use_fp8 = False
             except Exception as e:
-                print(f"[Trainer] FP8 init failed ({e}) — falling back to bf16")
+                print(f"[Trainer] FP8 init failed ({e}) - falling back to bf16")
                 self.use_fp8 = False
 
-        # torch.compile
         self.use_compile = training_cfg.get("torch_compile", False)
         if self.use_compile:
             print("[Trainer] Compiling model with torch.compile...")
             self.model = torch.compile(self.model)
 
-        # Optimizer (only trainable params)
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
             trainable_params, lr=self.lr, weight_decay=self.weight_decay, fused=True
         )
 
-        # Cosine schedule with linear warmup
         def lr_lambda(step):
             if step < self.warmup_steps:
                 return step / max(1, self.warmup_steps)
@@ -241,16 +201,11 @@ class BCTrainer:
 
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
-        # DataLoaders
         worker_kwargs = {}
         if self.num_workers > 0:
             worker_kwargs["prefetch_factor"] = self.prefetch_factor
             worker_kwargs["persistent_workers"] = True
 
-        # Use TaskBalancedBatchSampler for multi-task (ConcatDataset) to guarantee
-        # exactly spt = batch_size // n_tasks samples from each task per batch.
-        # Implemented as a batch_sampler so the DataLoader never crosses a round
-        # boundary — the guarantee is exact, not approximate.
         _n_task_components = len(getattr(self.train_dataset, "datasets", [None]))
         if _n_task_components > 1:
             _batch_sampler = TaskBalancedBatchSampler(self.train_dataset, batch_size=self.batch_size)
@@ -285,20 +240,16 @@ class BCTrainer:
                if min(self.num_workers, 2) > 0 else {}),
         )
 
-        # State
         self.global_step = 0
         self.best_eval_loss = float("inf")
         self.best_rollout_success = float("-inf")
         self.best_rollout_reward = float("-inf")
 
-        # Early stopping: stop when eval loss fails to improve for `patience` consecutive
-        # evaluations. patience=0 disables early stopping.
         self.patience = training_cfg.get("early_stopping_patience", 0)
-        self._es_counter = 0  # consecutive evals without improvement
+        self._es_counter = 0
 
         os.makedirs(self.output_dir, exist_ok=True)
 
-        # Norm stats: compute from training data if not provided
         if self.norm_stats is None:
             self._maybe_compute_norm_stats()
         else:
@@ -309,7 +260,7 @@ class BCTrainer:
         """Compute or load per-task normalization statistics.
 
         Priority for each task's stats:
-          1. norm_stats/ group in the task's own HDF5  (primary — survives across runs)
+          1. norm_stats/ group in the task's own HDF5  (primary - survives across runs)
           2. norm_stats_{task}.json in output_dir       (fallback if HDF5 was regenerated)
           3. Compute from scratch, then write both
 
@@ -319,7 +270,7 @@ class BCTrainer:
         separate normalized output spaces per task without confusion.
 
         Storing stats in the HDF5 collocates normalization with data, making the
-        RL handoff clean — the RL script only needs the HDF5 path, not the BC
+        RL handoff clean - the RL script only needs the HDF5 path, not the BC
         output directory.
         """
         from src.robotics.normalization import NormStats
@@ -328,13 +279,12 @@ class BCTrainer:
         obs_keys_low_dim = self._dataset_meta.get("_obs_keys_low_dim", [])
 
         if not demo_info or not obs_keys_low_dim:
-            print("[Trainer] No dataset metadata — skipping norm stats.")
+            print("[Trainer] No dataset metadata - skipping norm stats.")
             return
 
         is_multitask = len(demo_info) > 1
 
         if not is_multitask:
-            # ── Single-task (backward-compatible path) ──────────────────
             hdf5_path, demo_keys = demo_info[0]
             json_path = os.path.join(self.output_dir, "norm_stats.json")
 
@@ -354,11 +304,7 @@ class BCTrainer:
             self._inject_norm_stats()
             return
 
-        # ── Multi-task: compute independently per task ───────────────────
-        # Global stats would blend task distributions (lift=vertical,
-        # can=horizontal, square=rotational), producing a biased reference.
-        # Each task normalizes in its own action/state space.
-        print("[NormStats] Multi-task mode — computing per-task statistics:")
+        print("[NormStats] Multi-task mode - computing per-task statistics:")
         task_stats: Dict[int, NormStats] = {}
 
         for task_id, (hdf5_path, demo_keys) in enumerate(demo_info):
@@ -384,22 +330,13 @@ class BCTrainer:
         self._inject_norm_stats()
 
     def _inject_norm_stats(self):
-        """Propagate norm stats into each dataset so DataLoader workers see them.
-
-        For multi-task (self.norm_stats is a dict), each task dataset gets its
-        own NormStats keyed by task_id.  For single-task, all datasets receive
-        the same NormStats (backward-compatible).
-
-        Workers are forked on the first iter() call in train(), which happens
-        after this method completes — so the injected stats are visible to workers.
-        """
+        """Attach normalization stats to train and eval datasets."""
         if self.norm_stats is None:
             return
         for ds in [self.train_dataset, self.eval_dataset]:
             sub_datasets = ds.datasets if hasattr(ds, "datasets") else [ds]
             for d in sub_datasets:
                 if isinstance(self.norm_stats, dict):
-                    # Per-task: look up by the dataset's own task_id
                     d.norm_stats = self.norm_stats.get(d.task_id)
                 else:
                     d.norm_stats = self.norm_stats
@@ -408,7 +345,7 @@ class BCTrainer:
         """Initialize wandb, prompting for API key if not set."""
         project = self.wandb_cfg.get("project")
         if not project:
-            print("[Trainer] No wandb project set — skipping wandb logging")
+            print("[Trainer] No wandb project set - skipping wandb logging")
             self._wandb = None
             return
 
@@ -417,7 +354,6 @@ class BCTrainer:
             import sys
             import wandb
 
-            # Resolve API key: env var → wandb netrc → interactive prompt
             api_key = (
                 os.environ.get("WANDB_API_KEY", "").strip()
                 or (wandb.api.api_key or "")
@@ -437,7 +373,7 @@ class BCTrainer:
                         self._wandb = None
                         return
                 else:
-                    print("[Wandb] No API key and non-interactive session — skipping wandb.")
+                    print("[Wandb] No API key and non-interactive session - skipping wandb.")
                     self._wandb = None
                     return
 
@@ -529,10 +465,6 @@ class BCTrainer:
             "avg_length": float(result["avg_length"]),
         }
 
-    # ------------------------------------------------------------------
-    # Optimization dynamics helpers
-    # ------------------------------------------------------------------
-
     def _grad_norm(self, params) -> float:
         """Total L2 grad norm across a param iterable (pre-clip)."""
         total = 0.0
@@ -604,43 +536,35 @@ class BCTrainer:
             return f"{m}m{s:02d}s"
         return f"{s}s"
 
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
-
     def train(self):
         """Main training loop."""
         self._init_wandb()
 
-        # Print model stats
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         frozen = sum(p.numel() for p in self.model.parameters() if not p.requires_grad)
         print(f"[Trainer] Trainable: {trainable:,} | Frozen: {frozen:,} | Total: {trainable+frozen:,}")
         print(f"[Trainer] Device: {self.device} | bf16: {self.use_bf16} | fp8: {self.use_fp8}")
-        print(f"[Trainer] Batch: {self.batch_size} × {self.grad_accum_steps} accum = {self.batch_size * self.grad_accum_steps} effective")
+        print(f"[Trainer] Batch: {self.batch_size} x {self.grad_accum_steps} accum = {self.batch_size * self.grad_accum_steps} effective")
         print(f"[Trainer] LR: {self.lr} | Warmup: {self.warmup_steps} | Max steps: {self.max_steps}")
         print(f"[Trainer] Train: {len(self.train_dataset):,} | Eval: {len(self.eval_dataset):,} samples")
         print()
 
-        # Resume from checkpoint if exists
         self._try_resume()
 
         self.model.train()
         train_iter = iter(self.train_loader)
 
-        # Rolling buffers for the current logging window
         step_losses: list = []
         step_grad_norms: list = []
-        # Per-sample (loss, t) for flow-timestep bucketing
-        _window_t: list = []          # list of [B] tensors
-        _window_lps: list = []        # list of [B] tensors (loss_per_sample)
+
+        _window_t: list = []
+        _window_lps: list = []
 
         t0 = time.time()
         t_last_log = t0
         _stop_early = False
 
         while self.global_step < self.max_steps:
-            # ── Get batch ──────────────────────────────────────────────
             try:
                 batch = next(train_iter)
             except StopIteration:
@@ -649,7 +573,6 @@ class BCTrainer:
 
             batch = _move_batch_to_device(batch, self.device)
 
-            # ── Forward ────────────────────────────────────────────────
             with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_bf16):
                 output = self.model(batch)
                 loss = output["loss"] / self.grad_accum_steps
@@ -657,14 +580,11 @@ class BCTrainer:
             loss.backward()
             step_losses.append(output["loss"].item())
 
-            # Accumulate per-sample diagnostics for t-bucketing
             if "_t" in output:
                 _window_t.append(output["_t"].cpu())
                 _window_lps.append(output["_loss_per_sample"].cpu())
 
-            # ── Optimizer step ─────────────────────────────────────────
             if (self.global_step + 1) % self.grad_accum_steps == 0 or self.global_step == self.max_steps - 1:
-                # Capture grad norm BEFORE clipping
                 trainable_params = [p for p in self.model.parameters() if p.requires_grad]
                 grad_norm = self._grad_norm(trainable_params)
                 step_grad_norms.append(grad_norm)
@@ -678,7 +598,6 @@ class BCTrainer:
 
             self.global_step += 1
 
-            # ── Logging ────────────────────────────────────────────────
             if self.global_step % self.logging_steps == 0:
                 window = min(len(step_losses), self.logging_steps)
                 avg_loss = sum(step_losses[-window:]) / window
@@ -694,11 +613,10 @@ class BCTrainer:
                 eta_sec = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0
                 lr_now = self.scheduler.get_last_lr()[0]
 
-                # Flow-timestep loss bucketing [0,.25), [.25,.5), [.5,.75), [.75,1]
                 t_bucket_metrics = {}
                 if _window_t:
-                    all_t = torch.cat(_window_t)          # [N]
-                    all_lps = torch.cat(_window_lps)      # [N]
+                    all_t = torch.cat(_window_t)
+                    all_lps = torch.cat(_window_lps)
                     bucket_edges = [0.0, 0.25, 0.5, 0.75, 1.01]
                     for i in range(4):
                         lo, hi = bucket_edges[i], bucket_edges[i + 1]
@@ -711,7 +629,7 @@ class BCTrainer:
 
                 print(
                     f"[{self.global_step:>6}/{self.max_steps}] "
-                    f"loss={avg_loss:.4f}±{loss_std:.4f} "
+                    f"loss={avg_loss:.4f}+/-{loss_std:.4f} "
                     f"gnorm={avg_gnorm:.3f} "
                     f"clip={grad_clipped_frac*100:.0f}% "
                     f"lr={lr_now:.2e} "
@@ -729,7 +647,6 @@ class BCTrainer:
                     **t_bucket_metrics,
                 }, self.global_step)
 
-                # ── Per-module grad & param norms (every 5× logging interval) ──
                 if self.global_step % (self.logging_steps * 5) == 0:
                     module_metrics = {}
                     for name, params in self._named_module_params().items():
@@ -739,14 +656,11 @@ class BCTrainer:
                         module_metrics[f"param_norm/{name}"] = pnorm
                     self._log(module_metrics, self.global_step)
 
-            # ── Evaluation ─────────────────────────────────────────────
             if self.global_step % self.eval_steps == 0:
-                # Use recent training loss for gap metric
                 recent_train_loss = sum(step_losses[-self.logging_steps:]) / min(len(step_losses), self.logging_steps)
                 eval_metrics = self.evaluate()
                 eval_loss = eval_metrics["loss"]
 
-                # Remap task_{id}_* keys to task_{name}_* for readability in wandb
                 def _remap(k: str, v: float):
                     for tid, tname in self._task_names.items():
                         k = k.replace(f"task_{tid}_", f"task_{tname}_")
@@ -797,7 +711,7 @@ class BCTrainer:
                     self._es_counter += 1
                     print(f"[EarlyStopping] No improvement {self._es_counter}/{self.patience}")
                     if self._es_counter >= self.patience:
-                        print(f"[EarlyStopping] Patience exhausted — stopping training.")
+                        print(f"[EarlyStopping] Patience exhausted - stopping training.")
                         _stop_early = True
 
                 self._log({"eval/es_counter": self._es_counter}, self.global_step)
@@ -806,12 +720,10 @@ class BCTrainer:
                     self._save_checkpoint("early_stop")
                     break
 
-            # ── Checkpoint ─────────────────────────────────────────────
             if self.save_steps > 0 and self.global_step % self.save_steps == 0:
                 self._save_checkpoint(f"checkpoint-{self.global_step}")
                 self._prune_checkpoints()
 
-        # Final save
         if self.save_final:
             self._save_checkpoint("final")
         elapsed_total = time.time() - t0
@@ -837,11 +749,8 @@ class BCTrainer:
         all_t: list = []
         all_lps: list = []
 
-        # Per-task loss accumulation: {task_id: [per-sample losses]}
         task_lps: Dict[int, list] = {}
-        # One representative batch per task for diversity sampling.
-        # eval_loader is unshuffled (tasks arrive in blocks) so the first batch
-        # seen for each task_id is a clean representative.
+
         task_batches: Dict[int, dict] = {}
 
         for batch in self.eval_loader:
@@ -856,7 +765,6 @@ class BCTrainer:
                 all_t.append(output["_t"].cpu())
                 all_lps.append(output["_loss_per_sample"].cpu())
 
-            # Accumulate per-task losses and capture representative batches
             if "task_id" in batch and "_loss_per_sample" in output:
                 lps = output["_loss_per_sample"].cpu()
                 for i, tid in enumerate(batch["task_id"].cpu().tolist()):
@@ -868,11 +776,9 @@ class BCTrainer:
         avg_loss = total_loss / max(1, n_batches)
         metrics: Dict[str, float] = {"loss": avg_loss}
 
-        # ── Per-task mean loss ──────────────────────────────────────────
         for tid, losses in sorted(task_lps.items()):
             metrics[f"task_{tid}_loss"] = sum(losses) / len(losses)
 
-        # ── Flow-timestep loss buckets ──────────────────────────────────
         if all_t:
             cat_t = torch.cat(all_t)
             cat_lps = torch.cat(all_lps)
@@ -884,9 +790,6 @@ class BCTrainer:
                     metrics[f"loss_t{int(lo*100):02d}_{int(bucket_edges[i+1]*100):02d}"] = \
                         cat_lps[mask].mean().item()
 
-        # ── Action diversity per task ───────────────────────────────────
-        # Sample the policy n_samples times on the same obs with different noise.
-        # High std = stochastic/diverse policy. Near-zero = mode-collapsed.
         diversity_batches = task_batches if task_batches else {"0": next(iter(self.eval_loader))}
         all_stds = []
         n_samples = 8
@@ -896,7 +799,7 @@ class BCTrainer:
                     tb = _move_batch_to_device(tb, self.device)
                 samples = torch.stack([
                     self.model.predict(tb).float() for _ in range(n_samples)
-                ], dim=0)  # [n_samples, B, action_dim]
+                ], dim=0)
                 std = samples.std(dim=0).mean().item()
                 all_stds.append(std)
                 metrics[f"task_{tid}_action_std"] = std
@@ -920,7 +823,6 @@ class BCTrainer:
         path = os.path.join(self.output_dir, name)
         os.makedirs(path, exist_ok=True)
 
-        # Save model weights (handle torch.compile wrapper)
         model_to_save = self.model
         if hasattr(model_to_save, "_orig_mod"):
             model_to_save = model_to_save._orig_mod
@@ -945,9 +847,6 @@ class BCTrainer:
                     indent=2,
                 )
 
-        # Save norm stats alongside checkpoint (human-readable backup).
-        # Primary cache is already in the HDF5 files; these JSONs exist for
-        # quick inspection and as a fallback if HDF5s are regenerated.
         if isinstance(self.norm_stats, dict):
             for task_id, ns in self.norm_stats.items():
                 task_name = self._task_names.get(task_id, str(task_id))
@@ -983,13 +882,12 @@ class BCTrainer:
 
     def _try_resume(self):
         """Resume from latest checkpoint if available."""
-        # Check for explicit resume path
+
         resume_path = self.training_cfg.get("resume_from")
         if resume_path and os.path.isdir(resume_path):
             self._load_checkpoint(resume_path)
             return
 
-        # Auto-resume from latest checkpoint-N
         checkpoints = []
         if os.path.exists(self.output_dir):
             for name in os.listdir(self.output_dir):
@@ -1032,7 +930,7 @@ class BCTrainer:
         print(f"[Resume] Loaded checkpoint from {path} (step {self.global_step})")
 
 
-@register("trainer", "bc_flow_matching")
+@register("trainer", "bc_flow_matching_robosuite")
 def build_bc_trainer(
     model: nn.Module,
     dataset: dict,
@@ -1041,7 +939,6 @@ def build_bc_trainer(
     wandb_cfg: dict = None,
     **kwargs,
 ) -> BCTrainer:
-    # Extract metadata passed through from data builder (not actual dataset splits)
     dataset_meta = {
         "_train_demo_info": dataset.get("_train_demo_info"),
         "_obs_keys_low_dim": dataset.get("_obs_keys_low_dim"),

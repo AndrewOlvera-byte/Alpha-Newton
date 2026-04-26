@@ -2,18 +2,8 @@ run:
   name: "ppo_all_debug"
   mode: "ppo"
 
-# 10-iter smoke test of the full Tier-1 stack (EGL + GPU uint8 buffer +
-# async rollout + per-task adv norm + fixed rewards). Identical to ppo_all
-# in every respect EXCEPT max_iterations, save_steps, and output_dir — so
-# rollout/update timing from this run is representative of the long run.
-#
-# Launch with:
-#   python -m src.entrypoints.train_ppo \
-#     --exp ppo_all_debug \
-#     --bc-checkpoint outputs/bc_multitask_mlp_rl_ready_medium_gnll_all/best/model.pt
-
 data:
-  type: "robomimic_bc"
+  type: "robomimic_bc_robosuite"
   data_dir: "data/robomimic"
   tasks:
     - name: lift
@@ -78,8 +68,7 @@ robotics:
     gae_lambda: 0.95
     actor_lr: 1.0e-5
     critic_lr: 1.0e-4
-    # Smoke test. For detailed phase timings, run scripts/diag_ppo.py so
-    # profiling syncs do not distort async train/update overlap.
+
     max_iterations: 10
     horizon: 400
     reward_shaping: true
@@ -92,11 +81,11 @@ robotics:
       tool_hang: 700
 
 training:
+  trainer_type: "ppo_robosuite"
   max_grad_norm: 0.5
   bf16: true
   logging_steps: 1
-  # Debug runs should not write multi-hundred-MB checkpoints unless explicitly
-  # changed for a resume test.
+
   save_steps: 0
   save_final: false
   save_total_limit: 1

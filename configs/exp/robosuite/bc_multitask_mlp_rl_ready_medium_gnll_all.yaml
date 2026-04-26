@@ -64,6 +64,9 @@ training:
   max_grad_norm: 1.0
   logging_steps: 25
   save_steps: 300
+  save_total_limit: 5
+  save_optimizer_state: true
+  save_final: true
   eval_steps: 50
   early_stopping_patience: 30
   selection_metric: "eval_loss"

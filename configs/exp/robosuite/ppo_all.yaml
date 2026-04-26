@@ -1,6 +1,6 @@
 run:
   name: "ppo_all_from_bc"
-  mode: "bc"
+  mode: "ppo"
 
 # Launch with:
 #   python -m src.entrypoints.train_ppo \
@@ -30,7 +30,10 @@ data:
     - name: tool_hang
       weight: 0.40
   history_length: 3
-  image_size: 160
+  # Render at 128. DINOv2 resizes to 224 internally anyway, so anything above
+  # 128 is wasted rasterization cost + GPU memory. Cuts per-step render time
+  # ~40% and image buffer memory ~36%.
+  image_size: 128
   obs_keys:
     low_dim:
       - "robot0_eef_pos"
@@ -64,19 +67,30 @@ robotics:
     vis_tokens_per_camera: 32
     vis_pool_type: "avg"
     action_chunk_size: 1
-    gradient_checkpointing: true   # trade compute for memory — ~2× backward activation savings
+    gradient_checkpointing: false  # VRAM headroom (~13 GB free on 16 GB) → prefer speed
     bc_loss_type: "gnll"
 
   ppo:
     # Sized for a 16 GB VRAM card, left-running unattended:
     #  - n_envs=16 cleanly partitions into [2,2,6,6] under the weights below
-    #  - n_steps=192 shrinks rollout-buffer CPU image tensor to ~2.2 GB
-    #  - minibatch_size=32 halves peak ViT activation memory vs 64
-    # These are the "sleep-safe" defaults; bump back up if you watch a live run.
+    #  - n_steps=192 → rollout buffer image tensor ~900 MiB on GPU (uint8)
+    #  - minibatch_size=512 with uint8 GPU images → fast updates, ample VRAM
     n_envs: 16
     n_steps: 192
     ppo_epochs: 4
-    minibatch_size: 32
+    # 512 is the sweet spot now that images live as uint8 on GPU — no
+    # pinned copy per minibatch, VRAM is free for larger update batches.
+    # Drop to 256 only if `gpu/mem_peak_mib` crosses ~12 GB.
+    minibatch_size: 512
+    # Keep torch.compile off by default. Inductor can spend minutes compiling
+    # this dict-heavy vision model and generate heavy cache I/O; enable only
+    # for a controlled benchmark after eager throughput is healthy.
+    compile: false
+    profile_rollouts: false
+    show_progress: false
+    # Overlap env-stepping + rollout forward with PPO update (one iter
+    # off-policy; PPO clip tolerates it). Doubles policy VRAM.
+    async_rollout: true
     clip_eps: 0.2
     vf_coeff: 0.5
     ent_coeff: 0.01
@@ -103,7 +117,13 @@ training:
   max_grad_norm: 0.5
   bf16: true
   logging_steps: 1
-  save_steps: 50
+  # PPO checkpoints are large. Save sparse actor-critic checkpoints, keep the
+  # newest three, and write BC-compatible model.pt only for best/final.
+  save_steps: 100
+  save_total_limit: 3
+  save_optimizer_state: false
+  save_bc_compatible_every_checkpoint: false
+  save_final: true
   output_dir: "outputs/ppo_all_from_bc"
 
 wandb:

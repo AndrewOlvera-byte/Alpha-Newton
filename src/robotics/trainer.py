@@ -13,8 +13,10 @@ Handles:
 from __future__ import annotations
 
 import os
+import json
 import math
 import random
+import shutil
 import time
 from typing import Any, Dict, List, Optional
 
@@ -140,6 +142,11 @@ class BCTrainer:
         self.save_steps = training_cfg.get("save_steps", 5000)
         self.eval_steps = training_cfg.get("eval_steps", 5000)
         self.output_dir = training_cfg.get("output_dir", "outputs/bc")
+        self.save_final = bool(training_cfg.get("save_final", True))
+        self.save_optimizer_state = bool(training_cfg.get("save_optimizer_state", True))
+        self.save_total_limit = training_cfg.get("save_total_limit")
+        if self.save_total_limit is not None:
+            self.save_total_limit = int(self.save_total_limit)
         self.num_workers = training_cfg.get("dataloader_num_workers", 4)
         self.pin_memory = training_cfg.get("dataloader_pin_memory", True)
         self.prefetch_factor = training_cfg.get("dataloader_prefetch_factor", 2)
@@ -800,11 +807,13 @@ class BCTrainer:
                     break
 
             # ── Checkpoint ─────────────────────────────────────────────
-            if self.global_step % self.save_steps == 0:
+            if self.save_steps > 0 and self.global_step % self.save_steps == 0:
                 self._save_checkpoint(f"checkpoint-{self.global_step}")
+                self._prune_checkpoints()
 
         # Final save
-        self._save_checkpoint("final")
+        if self.save_final:
+            self._save_checkpoint("final")
         elapsed_total = time.time() - t0
         print(f"\n[Trainer] Training complete in {self._fmt_eta(elapsed_total)}. Output: {self.output_dir}")
 
@@ -917,14 +926,24 @@ class BCTrainer:
             model_to_save = model_to_save._orig_mod
 
         torch.save(model_to_save.state_dict(), os.path.join(path, "model.pt"))
-        torch.save({
-            "optimizer": self.optimizer.state_dict(),
+        state = {
             "scheduler": self.scheduler.state_dict(),
             "step": self.global_step,
             "best_eval_loss": self.best_eval_loss,
             "best_rollout_success": self.best_rollout_success,
             "best_rollout_reward": self.best_rollout_reward,
-        }, os.path.join(path, "training_state.pt"))
+            "optimizer_state_saved": self.save_optimizer_state,
+        }
+        if self.save_optimizer_state:
+            state["optimizer"] = self.optimizer.state_dict()
+            torch.save(state, os.path.join(path, "training_state.pt"))
+        else:
+            with open(os.path.join(path, "training_state.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {k: v for k, v in state.items() if k != "scheduler"},
+                    f,
+                    indent=2,
+                )
 
         # Save norm stats alongside checkpoint (human-readable backup).
         # Primary cache is already in the HDF5 files; these JSONs exist for
@@ -937,6 +956,30 @@ class BCTrainer:
             self.norm_stats.save(os.path.join(path, "norm_stats.json"))
 
         print(f"[Save] {path}")
+
+    def _prune_checkpoints(self):
+        """Keep only the newest N regular checkpoints when configured."""
+        if self.save_total_limit is None or self.save_total_limit <= 0:
+            return
+        if not os.path.isdir(self.output_dir):
+            return
+
+        checkpoints = []
+        for name in os.listdir(self.output_dir):
+            if not name.startswith("checkpoint-"):
+                continue
+            try:
+                step = int(name.split("-", 1)[1])
+            except ValueError:
+                continue
+            checkpoints.append((step, name))
+
+        checkpoints.sort()
+        excess = len(checkpoints) - self.save_total_limit
+        if excess <= 0:
+            return
+        for _, name in checkpoints[:excess]:
+            shutil.rmtree(os.path.join(self.output_dir, name), ignore_errors=True)
 
     def _try_resume(self):
         """Resume from latest checkpoint if available."""
@@ -978,7 +1021,8 @@ class BCTrainer:
 
         if os.path.exists(state_path):
             state = torch.load(state_path, map_location=self.device, weights_only=True)
-            self.optimizer.load_state_dict(state["optimizer"])
+            if "optimizer" in state:
+                self.optimizer.load_state_dict(state["optimizer"])
             self.scheduler.load_state_dict(state["scheduler"])
             self.global_step = state["step"]
             self.best_eval_loss = state.get("best_eval_loss", float("inf"))

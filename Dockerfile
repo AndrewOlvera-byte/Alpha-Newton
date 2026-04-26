@@ -10,14 +10,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCH_ALLOW_TF32_CUBLAS=1 \
     CUDA_MODULE_LOADING=LAZY \
     TORCH_CUDNN_V8_API_ENABLED=1 \
-    MUJOCO_GL=osmesa \
-    PYOPENGL_PLATFORM=osmesa
+    MUJOCO_GL=egl \
+    PYOPENGL_PLATFORM=egl
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl ca-certificates \
       build-essential g++ gcc \
       libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 \
       libgl1-mesa-glx xvfb libosmesa6 \
+      libegl1 libgles2 libegl-mesa0 libglvnd0 libglx0 libopengl0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

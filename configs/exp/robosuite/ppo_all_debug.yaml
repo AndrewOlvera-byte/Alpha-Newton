@@ -1,0 +1,112 @@
+run:
+  name: "ppo_all_debug"
+  mode: "ppo"
+
+# 10-iter smoke test of the full Tier-1 stack (EGL + GPU uint8 buffer +
+# async rollout + per-task adv norm + fixed rewards). Identical to ppo_all
+# in every respect EXCEPT max_iterations, save_steps, and output_dir — so
+# rollout/update timing from this run is representative of the long run.
+#
+# Launch with:
+#   python -m src.entrypoints.train_ppo \
+#     --exp ppo_all_debug \
+#     --bc-checkpoint outputs/bc_multitask_mlp_rl_ready_medium_gnll_all/best/model.pt
+
+data:
+  type: "robomimic_bc"
+  data_dir: "data/robomimic"
+  tasks:
+    - name: lift
+      weight: 0.10
+    - name: can
+      weight: 0.10
+    - name: square
+      weight: 0.40
+    - name: tool_hang
+      weight: 0.40
+  history_length: 3
+  image_size: 128
+  obs_keys:
+    low_dim:
+      - "robot0_eef_pos"
+      - "robot0_eef_quat"
+      - "robot0_gripper_qpos"
+      - "object-state"
+    image:
+      - "agentview_image"
+      - "robot0_eye_in_hand_image"
+
+robotics:
+  architecture:
+    type: "vla_mlp_bc"
+    d_model: 384
+    n_transformer_layers: 6
+    n_transformer_heads: 6
+    d_ff: 1536
+    dropout: 0.15
+    encoder_hidden_dim: 128
+    controller_hidden_dim: 768
+    controller_cross_attention_heads: 6
+    controller_ff_dim: 1536
+    action_dim: 7
+    obs_dim: 53
+    n_cameras: 2
+    history_length: 3
+    n_tasks: 4
+    vit_model: "facebook/dinov2-small"
+    vit_img_size: 224
+    freeze_vit: true
+    vis_tokens_per_camera: 32
+    vis_pool_type: "avg"
+    action_chunk_size: 1
+    gradient_checkpointing: false
+    bc_loss_type: "gnll"
+
+  ppo:
+    n_envs: 16
+    n_steps: 192
+    ppo_epochs: 4
+    minibatch_size: 512
+    compile: false
+    profile_rollouts: false
+    show_progress: false
+    async_rollout: true
+    clip_eps: 0.2
+    vf_coeff: 0.5
+    ent_coeff: 0.01
+    gamma: 0.99
+    gae_lambda: 0.95
+    actor_lr: 1.0e-5
+    critic_lr: 1.0e-4
+    # Smoke test. For detailed phase timings, run scripts/diag_ppo.py so
+    # profiling syncs do not distort async train/update overlap.
+    max_iterations: 10
+    horizon: 400
+    reward_shaping: true
+    reward_fn: "dense_multitask_v1"
+    value_hidden_dim: 512
+    task_horizons:
+      lift: 400
+      can: 400
+      square: 500
+      tool_hang: 700
+
+training:
+  max_grad_norm: 0.5
+  bf16: true
+  logging_steps: 1
+  # Debug runs should not write multi-hundred-MB checkpoints unless explicitly
+  # changed for a resume test.
+  save_steps: 0
+  save_final: false
+  save_total_limit: 1
+  save_optimizer_state: false
+  save_bc_compatible_every_checkpoint: false
+  output_dir: "outputs/ppo_all_debug"
+
+wandb:
+  mode: "disabled"
+  project: "robotics-ppo"
+  entity: "andrewolvera"
+  run_name: "ppo_all_debug_smoketest"
+  tags: ["ppo", "debug", "smoketest", "tier1"]

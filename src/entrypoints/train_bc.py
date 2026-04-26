@@ -93,6 +93,15 @@ def test_dataset(cfg: Config):
 
 def main(exp_name: str, test_only: bool = False):
     cfg = Config.from_experiment(exp_name)
+    if cfg.run.get("mode") != "bc":
+        raise ValueError(
+            f"train_bc.py only accepts run.mode='bc'. "
+            f"Got mode={cfg.run.get('mode')!r} for exp={exp_name!r}."
+        )
+    if (cfg.robotics or {}).get("ppo") is not None:
+        raise ValueError(
+            f"train_bc.py refuses PPO configs. Use train_ppo.py for exp={exp_name!r}."
+        )
 
     print(f"[Config] Run:   {cfg.run['name']}")
     print(f"[Config] Mode:  {cfg.run['mode']}")

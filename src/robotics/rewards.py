@@ -46,14 +46,17 @@ _TASK_REWARD_SCALE = {
     "lift": 2.25,
     "can": 2.25,
     "square": 5.00,
-    "tool_hang": 5.00,
+    "tool_hang": 1.00,  # ToolHang native reward caps ~1.0; don't shrink further
 }
-# Terminal success bonus (common across tasks) — large enough to dominate
-# shaping noise, small enough not to create runaway advantage spikes.
-_SUCCESS_BONUS = 10.0
-# Small time penalty to encourage fast completion without overwhelming the
-# shaping signal.
-_TIME_PENALTY = 0.005
+# Terminal success bonus — must dominate per-episode shaping variance, not
+# mean. With shaping capped ~0.15/step and horizons up to 700, cumulative
+# shaping is ~100; raw variance across failing trajectories is much smaller,
+# so 50 cleanly separates successes.
+_SUCCESS_BONUS = 50.0
+# Per-step time penalty. Disabled for now: at 0.005 × 700 steps = 3.5 floor,
+# and with 0% success the gradient is dominated by "fail faster" rather than
+# "succeed." Re-enable (and shrink) once any task reaches >10% success.
+_TIME_PENALTY = 0.0
 
 
 # ===========================================================================
@@ -100,32 +103,41 @@ def _reward_can(obs: dict, base_reward: float) -> float:
 
 def _reward_square(obs: dict, base_reward: float) -> float:
     """NutAssemblySquare: reach nut → grasp → align with peg → lower onto peg.
-    Add a small extra shaping for EEF proximity to the peg after grasping."""
+    Robosuite doesn't expose `peg_pos`; the previous implementation silently
+    fell through to base_reward. Use the nut-to-EEF vector robosuite *does*
+    expose to reward pre-grasp approach — the signal most missing from the
+    native shaped reward at the start of an episode.
+    """
     shaped = base_reward / _TASK_REWARD_SCALE["square"]
-    # If robosuite exposes peg_pos, reward getting the EEF near it.
-    peg_pos = obs.get("peg_pos") if "peg_pos" in obs else None
-    if peg_pos is not None:
-        d = _eef_to_point_dist(obs, np.asarray(peg_pos))
-        # Tanh bounded proximity bonus: max 0.1 when EEF touches the peg.
-        shaped += 0.1 * (1.0 - np.tanh(3.0 * d))
+    nut_to_eef = obs.get("SquareNut_to_robot0_eef_pos")
+    if nut_to_eef is not None:
+        d = float(np.linalg.norm(np.asarray(nut_to_eef)))
+        shaped += 0.05 * (1.0 - np.tanh(3.0 * d))
     return shaped
 
 
 def _reward_tool_hang(obs: dict, base_reward: float) -> float:
-    """ToolHang: the hardest task. Robosuite's shaped reward is relatively
-    weak here, so we layer extra shaping based on tool↔frame geometry when
-    those keys are present in the obs."""
+    """ToolHang: the hardest task. Layer extra shaping on the geometry
+    robosuite actually exposes (tool_to_robot0_eef_pos, tool_pos, frame_pos)
+    plus the two milestone booleans (tool_on_frame, frame_is_assembled).
+    """
     shaped = base_reward / _TASK_REWARD_SCALE["tool_hang"]
-    # Tool-to-frame proximity bonus (hang target).
+    # Pre-grasp: EEF → tool approach.
+    tool_to_eef = obs.get("tool_to_robot0_eef_pos")
+    if tool_to_eef is not None:
+        d = float(np.linalg.norm(np.asarray(tool_to_eef)))
+        shaped += 0.03 * (1.0 - np.tanh(3.0 * d))
+    # Transport: tool → frame proximity.
     tool_pos = obs.get("tool_pos")
     frame_pos = obs.get("frame_pos")
     if tool_pos is not None and frame_pos is not None:
         d = float(np.linalg.norm(np.asarray(tool_pos) - np.asarray(frame_pos)))
-        shaped += 0.2 * (1.0 - np.tanh(2.0 * d))
-    # Additional gripper-to-tool bonus before grasping.
-    if tool_pos is not None:
-        d_eef = _eef_to_point_dist(obs, np.asarray(tool_pos))
-        shaped += 0.05 * (1.0 - np.tanh(3.0 * d_eef))
+        shaped += 0.05 * (1.0 - np.tanh(2.0 * d))
+    # Milestone bonuses — sparse, informative, unambiguous sub-goals.
+    if bool(obs.get("tool_on_frame", False)):
+        shaped += 0.2
+    if bool(obs.get("frame_is_assembled", False)):
+        shaped += 0.5
     return shaped
 
 

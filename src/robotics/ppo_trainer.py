@@ -5,13 +5,18 @@ as an actor-critic, and runs on-policy PPO in robosuite environments.
 """
 from __future__ import annotations
 
+import copy
+import json
 import os
+import shutil
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Dict, List, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm.auto import tqdm
 
 from src.core.registry import register
 from src.robotics.collector import RolloutBuffer, collect_rollouts
@@ -112,21 +117,59 @@ class PPOTrainer:
         self.critic_lr = ppo_cfg.get("critic_lr", 1e-4)
         self.max_grad_norm = training_cfg.get("max_grad_norm", 0.5)
         self.use_bf16 = training_cfg.get("bf16", True)
+        self.compile = ppo_cfg.get("compile", False)
+        self.profile_rollouts = bool(ppo_cfg.get("profile_rollouts", False))
+        self.show_progress = bool(ppo_cfg.get("show_progress", False))
+        # Async rollout: overlap env-stepping + rollout forward passes on a
+        # snapshot policy with the PPO update on the main policy. One iter
+        # off-policy (PPO clip handles it). Doubles buffer + policy VRAM.
+        self.async_rollout = ppo_cfg.get("async_rollout", False)
         self.output_dir = training_cfg.get("output_dir", "outputs/ppo")
         self.logging_steps = training_cfg.get("logging_steps", 1)
-        self.save_steps = training_cfg.get("save_steps", 50)
+        self.save_steps = int(training_cfg.get("save_steps", 50) or 0)
+        self.save_final = bool(training_cfg.get("save_final", True))
+        # PPO resume is not implemented in this trainer, so optimizer state is
+        # opt-in. This avoids 100+ MB of extra disk writes per checkpoint.
+        self.save_optimizer_state = bool(training_cfg.get("save_optimizer_state", False))
+        self.save_bc_compatible_every_checkpoint = bool(
+            training_cfg.get("save_bc_compatible_every_checkpoint", False)
+        )
+        self.save_total_limit = training_cfg.get("save_total_limit")
+        if self.save_total_limit is not None:
+            self.save_total_limit = int(self.save_total_limit)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Perf knobs: TF32 for matmul, cudnn autotuner for ViT convs.
+        if self.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision("high")
 
     def train(self):
         """Main PPO training loop."""
         os.makedirs(self.output_dir, exist_ok=True)
-        model = self.model.to(self.device)
+        # Keep the policy on CPU until after env subprocesses are launched.
+        # With the Linux fork start method this avoids inheriting a live CUDA
+        # context, while still avoiding spawn's repeated heavy imports.
+        model = self.model
         model.train()
+        # Keep an uncompiled handle for checkpointing + attribute access
+        # (compile wraps the module; state_dict round-trips cleanly via _orig_mod).
+        raw_model = model
 
         # Separate param groups: lower LR for pretrained actor, higher for fresh critic
-        actor_params = list(model.backbone.parameters()) + list(model.actor_head.parameters()) + [model.log_std]
-        critic_params = list(model.value_head.parameters())
+        actor_params = [
+            p for p in (
+                list(model.backbone.parameters())
+                + list(model.actor_head.parameters())
+                + [model.log_std]
+            )
+            if p.requires_grad
+        ]
+        critic_params = [p for p in model.value_head.parameters() if p.requires_grad]
+        trainable_params = actor_params + critic_params
         optimizer = torch.optim.AdamW([
             {"params": actor_params, "lr": self.actor_lr, "weight_decay": 1e-4},
             {"params": critic_params, "lr": self.critic_lr, "weight_decay": 1e-4},
@@ -137,22 +180,48 @@ class PPOTrainer:
         if self.wandb_cfg:
             try:
                 import wandb
-                run = wandb.init(
-                    project=self.wandb_cfg.get("project", "robotics-ppo"),
-                    entity=self.wandb_cfg.get("entity"),
-                    name=self.wandb_cfg.get("run_name", "ppo"),
-                    tags=self.wandb_cfg.get("tags", []),
-                    config={
-                        "n_envs": self.n_envs,
-                        "n_steps": self.n_steps,
-                        "ppo_epochs": self.ppo_epochs,
-                        "clip_eps": self.clip_eps,
-                        "actor_lr": self.actor_lr,
-                        "critic_lr": self.critic_lr,
-                        "gamma": self.gamma,
-                        "gae_lambda": self.gae_lambda,
-                    },
-                )
+                project = self.wandb_cfg.get("project", "robotics-ppo")
+                mode = self.wandb_cfg.get("mode") or os.environ.get("WANDB_MODE", "").strip()
+                api_key = os.environ.get("WANDB_API_KEY", "").strip()
+                if mode == "disabled":
+                    print("[PPO] WandB disabled by config/env.")
+                elif not api_key and mode not in {"offline", "dryrun"}:
+                    print("[PPO] No WANDB_API_KEY; skipping WandB to avoid network/disk stalls.")
+                else:
+                    init_kwargs = {
+                        "project": project,
+                        "entity": self.wandb_cfg.get("entity"),
+                        "name": self.wandb_cfg.get("run_name", "ppo"),
+                        "tags": self.wandb_cfg.get("tags", []),
+                        "config": {
+                            "n_envs": self.n_envs,
+                            "n_steps": self.n_steps,
+                            "ppo_epochs": self.ppo_epochs,
+                            "minibatch_size": self.minibatch_size,
+                            "clip_eps": self.clip_eps,
+                            "vf_coeff": self.vf_coeff,
+                            "ent_coeff": self.ent_coeff,
+                            "actor_lr": self.actor_lr,
+                            "critic_lr": self.critic_lr,
+                            "max_grad_norm": self.max_grad_norm,
+                            "gamma": self.gamma,
+                            "gae_lambda": self.gae_lambda,
+                            "horizon": self.horizon,
+                            "task_horizons": self.task_horizons,
+                            "task_names": self.task_names,
+                            "task_weights": self.task_weights,
+                            "reward_fn": self.reward_fn_name,
+                            "bf16": self.use_bf16,
+                            "compile": self.compile,
+                            "async_rollout": self.async_rollout,
+                            "gradient_checkpointing": self.robotics_cfg.get(
+                                "architecture", {}
+                            ).get("gradient_checkpointing", False),
+                        },
+                    }
+                    if mode:
+                        init_kwargs["mode"] = mode
+                    run = wandb.init(**init_kwargs)
             except Exception as e:
                 print(f"[PPO] WandB init failed: {e}")
 
@@ -191,6 +260,20 @@ class PPOTrainer:
             obs_keys_image=self.obs_keys_image,
         )
 
+        model = model.to(self.device)
+        model.train()
+        raw_model = model
+
+        # Compile AFTER optimizer so param references stay clean. dynamic=True
+        # lets one compiled graph serve rollout (bs=n_envs) and update
+        # (bs=minibatch) without recompilation.
+        if self.compile and self.device.type == "cuda":
+            print("[PPO] torch.compile(model, dynamic=True, mode='reduce-overhead')")
+            try:
+                model = torch.compile(model, dynamic=True, mode="reduce-overhead")
+            except Exception as e:
+                print(f"[PPO] compile failed, falling back to eager: {e}")
+
         # Create history buffers (one per env), each carrying ITS task's
         # task_id and norm_stats — so per-env normalization is correct and
         # the stacked model batch has the right task embeddings.
@@ -223,15 +306,35 @@ class PPOTrainer:
             first_ns = next(iter(self.norm_stats_by_task.values()))
             state_dim = len(first_ns.state_mean)
 
-        rollout_buffer = RolloutBuffer(
-            n_steps=self.n_steps,
-            n_envs=self.n_envs,
-            action_dim=action_dim,
-            state_dim=state_dim,
-            image_specs=image_specs,
-            history_length=history_length,
-            device=self.device,
-        )
+        def _make_buffer():
+            return RolloutBuffer(
+                n_steps=self.n_steps,
+                n_envs=self.n_envs,
+                action_dim=action_dim,
+                state_dim=state_dim,
+                image_specs=image_specs,
+                history_length=history_length,
+                device=self.device,
+            )
+
+        rollout_buffer = _make_buffer()
+
+        # --- Async rollout scaffolding ---
+        # Snapshot model for background rollouts: deep-copied once, then
+        # re-seeded via load_state_dict each iteration. Rollout uses this
+        # snapshot while the main model is being updated on the previous
+        # iteration's data → one-step-stale on-policy (PPO clip is fine).
+        rollout_buffer_next = _make_buffer() if self.async_rollout else None
+        if self.async_rollout:
+            rollout_model = copy.deepcopy(raw_model).to(self.device).eval()
+            for p in rollout_model.parameters():
+                p.requires_grad_(False)
+            async_pool = ThreadPoolExecutor(max_workers=1)
+            print("[PPO] async_rollout=True — double-buffered collect/update")
+        else:
+            rollout_model = None
+            async_pool = None
+        pending_future: Optional[Future] = None
 
         # Initial env reset + push first obs to history buffers.
         # MultiTaskVecEnv returns per-env observation dicts (list).
@@ -255,20 +358,49 @@ class PPOTrainer:
 
         for iteration in range(1, self.max_iterations + 1):
             iter_start = time.time()
+            # Reset peak so `gpu/mem_peak_mib` reflects THIS iteration's max
+            # (otherwise it monotonically grows and tells us nothing).
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
 
             # --- Collect rollouts ---
-            model.eval()
-            rollout_stats = collect_rollouts(
-                vec_env, model, history_buffers, rollout_buffer,
-                self.n_steps, self.device,
-                task_id_per_env=task_id_per_env,
-                task_name_per_env=task_name_per_env,
-            )
+            if self.async_rollout and pending_future is not None:
+                # Claim the previous iter's background rollout; its results
+                # live in rollout_buffer_next. Swap so it becomes active.
+                rollout_stats = pending_future.result()
+                rollout_buffer, rollout_buffer_next = rollout_buffer_next, rollout_buffer
+                pending_future = None
+            else:
+                # Serial path: warmup in async mode, or plain synchronous mode.
+                model.eval()
+                rollout_stats = collect_rollouts(
+                    vec_env, model, history_buffers, rollout_buffer,
+                    self.n_steps, self.device,
+                    task_id_per_env=task_id_per_env,
+                    task_name_per_env=task_name_per_env,
+                    profile=self.profile_rollouts,
+                    show_progress=self.show_progress,
+                )
 
-            # --- Compute GAE ---
+            # Kick off the NEXT rollout now, before the update, so env steps
+            # overlap with the GPU backward pass. Snapshot uses pre-update
+            # weights; the update will drift one iter ahead.
+            if self.async_rollout and iteration < self.max_iterations:
+                rollout_model.load_state_dict(raw_model.state_dict())
+                rollout_model.eval()
+                pending_future = async_pool.submit(
+                    collect_rollouts,
+                    vec_env, rollout_model, history_buffers,
+                    rollout_buffer_next, self.n_steps, self.device,
+                    task_id_per_env, task_name_per_env,
+                    self.profile_rollouts, self.show_progress,
+                )
+
+            # --- Compute GAE + per-task advantage normalization ---
             rollout_buffer.compute_advantages(
                 rollout_stats["last_values"], self.gamma, self.gae_lambda
             )
+            rollout_buffer.normalize_advantages_per_task()
 
             # --- PPO update ---
             model.train()
@@ -276,12 +408,29 @@ class PPOTrainer:
             total_value_loss = 0.0
             total_entropy = 0.0
             total_clip_fraction = 0.0
+            total_approx_kl = 0.0          # Schulman's k3 estimator, mean over minibatch
+            total_grad_norm = 0.0          # pre-clip norm across all params
+            total_ratio_mean = 0.0
+            total_ratio_std = 0.0
             n_updates = 0
 
-            for mb in rollout_buffer.get_minibatches(self.minibatch_size, self.ppo_epochs):
-                # Normalize advantages
+            update_t0 = time.time()
+            total_mb = self.ppo_epochs * ((self.n_steps * self.n_envs + self.minibatch_size - 1) // self.minibatch_size)
+            mb_iter = rollout_buffer.get_minibatches(self.minibatch_size, self.ppo_epochs)
+            mb_pbar = None
+            if self.show_progress:
+                mb_pbar = tqdm(
+                    mb_iter,
+                    total=total_mb, desc="update", leave=False,
+                    dynamic_ncols=True, mininterval=0.5,
+                )
+                mb_iter = mb_pbar
+            for mb in mb_iter:
+                # Advantages were z-scored per-task on the full rollout buffer
+                # (see RolloutBuffer.normalize_advantages_per_task). Doing it
+                # again per-minibatch would re-bias toward whichever task
+                # happens to be over-represented in each minibatch.
                 adv = mb["advantages"]
-                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
                 with amp_ctx:
                     log_prob, entropy, value = model.evaluate_actions(mb["batch"], mb["actions"])
@@ -292,21 +441,33 @@ class PPOTrainer:
 
                     loss = p_loss + self.vf_coeff * v_loss - self.ent_coeff * ent
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
+                grad_norm = nn.utils.clip_grad_norm_(trainable_params, self.max_grad_norm)
                 optimizer.step()
 
-                # Track stats
+                # Track stats — approx_kl uses Schulman's k3 estimator,
+                # which is unbiased and strictly non-negative. Spiking KL is
+                # the main signal that the PPO clip isn't holding.
                 with torch.no_grad():
-                    ratio = (log_prob - mb["old_log_probs"]).exp()
+                    log_ratio = log_prob - mb["old_log_probs"]
+                    ratio = log_ratio.exp()
                     clip_frac = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
+                    approx_kl = ((ratio - 1.0) - log_ratio).mean()
 
                 total_policy_loss += p_loss.item()
                 total_value_loss += v_loss.item()
                 total_entropy += ent.item()
                 total_clip_fraction += clip_frac.item()
+                total_approx_kl += approx_kl.item()
+                total_grad_norm += float(grad_norm)
+                total_ratio_mean += ratio.mean().item()
+                total_ratio_std += ratio.std().item()
                 n_updates += 1
+
+            if mb_pbar is not None:
+                mb_pbar.close()
+            update_time = time.time() - update_t0
 
             # --- Logging ---
             if iteration % self.logging_steps == 0:
@@ -314,25 +475,100 @@ class PPOTrainer:
                 fps = (iteration * self.n_steps * self.n_envs) / elapsed
                 iter_time = time.time() - iter_start
 
+                # Explained variance — how well the critic fits returns.
+                # Negative means the critic is worse than predicting the mean.
+                with torch.no_grad():
+                    returns_flat = rollout_buffer.returns.flatten()
+                    values_flat = rollout_buffer.values.flatten()
+                    var_returns = returns_flat.var()
+                    explained_var = (
+                        1.0 - (returns_flat - values_flat).var() / (var_returns + 1e-8)
+                    ).item() if var_returns > 0 else 0.0
+
+                    adv_flat = rollout_buffer.advantages.flatten()
+                    actions_flat = rollout_buffer.actions.view(-1, rollout_buffer.actions.shape[-1])
+                    rewards_flat = rollout_buffer.rewards.flatten()
+                    log_std = raw_model.log_std.detach()
+
+                # GPU memory (MiB)
+                if self.device.type == "cuda":
+                    mem_alloc = torch.cuda.memory_allocated() / 1024**2
+                    mem_reserved = torch.cuda.memory_reserved() / 1024**2
+                    mem_peak = torch.cuda.max_memory_allocated() / 1024**2
+                else:
+                    mem_alloc = mem_reserved = mem_peak = 0.0
+
                 log_dict = {
+                    # --- Core PPO ---
                     "iteration": iteration,
-                    "policy_loss": total_policy_loss / n_updates,
-                    "value_loss": total_value_loss / n_updates,
-                    "entropy": total_entropy / n_updates,
-                    "clip_fraction": total_clip_fraction / n_updates,
-                    "mean_reward": rollout_stats["mean_reward"],
-                    "success_rate": rollout_stats["success_rate"],
-                    "mean_ep_length": rollout_stats["mean_length"],
-                    "n_episodes": rollout_stats["n_episodes"],
-                    "log_std_mean": model.log_std.data.mean().item(),
-                    "fps": fps,
-                    "iter_time": iter_time,
+                    "ppo/policy_loss": total_policy_loss / n_updates,
+                    "ppo/value_loss": total_value_loss / n_updates,
+                    "ppo/entropy": total_entropy / n_updates,
+                    "ppo/clip_fraction": total_clip_fraction / n_updates,
+                    "ppo/approx_kl": total_approx_kl / n_updates,
+                    "ppo/grad_norm": total_grad_norm / n_updates,
+                    "ppo/ratio_mean": total_ratio_mean / n_updates,
+                    "ppo/ratio_std": total_ratio_std / n_updates,
+                    "ppo/explained_variance": explained_var,
+                    # --- Learning-rate tracking ---
+                    "optim/actor_lr": optimizer.param_groups[0]["lr"],
+                    "optim/critic_lr": optimizer.param_groups[1]["lr"],
+                    # --- Rollout episode stats ---
+                    "rollout/mean_reward": rollout_stats["mean_reward"],
+                    "rollout/success_rate": rollout_stats["success_rate"],
+                    "rollout/mean_ep_length": rollout_stats["mean_length"],
+                    "rollout/ep_length_p50": rollout_stats.get("length_p50", 0.0),
+                    "rollout/ep_length_p95": rollout_stats.get("length_p95", 0.0),
+                    "rollout/ep_length_min": rollout_stats.get("length_min", 0),
+                    "rollout/ep_length_max": rollout_stats.get("length_max", 0),
+                    "rollout/ep_reward_std": rollout_stats.get("reward_std", 0.0),
+                    "rollout/ep_reward_min": rollout_stats.get("reward_min", 0.0),
+                    "rollout/ep_reward_max": rollout_stats.get("reward_max", 0.0),
+                    "rollout/n_episodes": rollout_stats["n_episodes"],
+                    # --- Reward distribution (per-step across the rollout) ---
+                    "rollout/reward_step_mean": rewards_flat.mean().item(),
+                    "rollout/reward_step_std": rewards_flat.std().item(),
+                    "rollout/reward_step_min": rewards_flat.min().item(),
+                    "rollout/reward_step_max": rewards_flat.max().item(),
+                    # --- Advantage distribution (pre-normalization) ---
+                    "adv/mean": adv_flat.mean().item(),
+                    "adv/std": adv_flat.std().item(),
+                    "adv/min": adv_flat.min().item(),
+                    "adv/max": adv_flat.max().item(),
+                    # --- Value / return distribution ---
+                    "value/mean": values_flat.mean().item(),
+                    "value/std": values_flat.std().item(),
+                    "return/mean": returns_flat.mean().item(),
+                    "return/std": returns_flat.std().item(),
+                    # --- Policy exploration ---
+                    "policy/log_std_mean": log_std.mean().item(),
+                    "policy/log_std_max": log_std.max().item(),
+                    "policy/log_std_min": log_std.min().item(),
+                    "policy/action_mean_abs": actions_flat.abs().mean().item(),
+                    "policy/action_std": actions_flat.std().item(),
+                    "policy/action_max_abs": actions_flat.abs().max().item(),
+                    # --- Throughput / system ---
+                    "time/fps": fps,
+                    "time/iter_time": iter_time,
+                    "time/rollout_time": rollout_stats.get("rollout_time", 0.0),
+                    "time/update_time": update_time,
+                    "time/rollout_fps": rollout_stats.get("rollout_fps", 0.0),
+                    "gpu/mem_alloc_mib": mem_alloc,
+                    "gpu/mem_reserved_mib": mem_reserved,
+                    "gpu/mem_peak_mib": mem_peak,
                 }
+                # Per-dim log_std and action stats — spot which action dims
+                # are collapsing or saturating.
+                for d in range(log_std.numel()):
+                    log_dict[f"policy/log_std_d{d}"] = log_std[d].item()
+                    log_dict[f"policy/action_mean_d{d}"] = actions_flat[:, d].mean().item()
+                    log_dict[f"policy/action_std_d{d}"] = actions_flat[:, d].std().item()
                 # Per-task breakdown — essential for spotting catastrophic
                 # forgetting on downweighted tasks.
                 for task, stats in rollout_stats.get("per_task", {}).items():
                     log_dict[f"per_task/{task}/success_rate"] = stats["success_rate"]
                     log_dict[f"per_task/{task}/mean_reward"] = stats["mean_reward"]
+                    log_dict[f"per_task/{task}/mean_length"] = stats["mean_length"]
                     log_dict[f"per_task/{task}/n_episodes"] = stats["n_episodes"]
 
                 per_task_str = " ".join(
@@ -346,8 +582,15 @@ class PPOTrainer:
                     f"pl={total_policy_loss/n_updates:.4f} "
                     f"vl={total_value_loss/n_updates:.4f} "
                     f"ent={total_entropy/n_updates:.3f} "
+                    f"kl={total_approx_kl/n_updates:.4f} "
                     f"clip={total_clip_fraction/n_updates:.3f} "
-                    f"fps={fps:.0f}"
+                    f"gn={total_grad_norm/n_updates:.2f} "
+                    f"ev={explained_var:+.2f} "
+                    f"mem={mem_peak/1024:.1f}G "
+                    f"fps={fps:.0f} "
+                    f"[roll={rollout_stats.get('rollout_time', 0):.1f}s "
+                    f"upd={update_time:.1f}s "
+                    f"rfps={rollout_stats.get('rollout_fps', 0):.0f}]"
                     + (f" | {per_task_str}" if per_task_str else "")
                 )
 
@@ -355,49 +598,99 @@ class PPOTrainer:
                     run.log(log_dict, step=iteration)
 
             # --- Checkpointing ---
-            if iteration % self.save_steps == 0:
-                self._save_checkpoint(model, optimizer, iteration)
+            if self.save_steps > 0 and iteration % self.save_steps == 0:
+                self._save_checkpoint(raw_model, optimizer, iteration)
+                self._prune_checkpoints()
 
                 # Track best by success rate
                 sr = rollout_stats["success_rate"]
                 if sr > best_success_rate:
                     best_success_rate = sr
-                    self._save_checkpoint(model, optimizer, iteration, is_best=True)
+                    self._save_checkpoint(raw_model, optimizer, iteration, is_best=True)
                     print(f"  [best] New best success rate: {sr:.1%}")
 
+        if pending_future is not None:
+            try:
+                pending_future.result(timeout=60)
+            except Exception as e:
+                print(f"[PPO] pending async rollout errored on shutdown: {e}")
+        if async_pool is not None:
+            async_pool.shutdown(wait=False)
         vec_env.close()
-        self._save_checkpoint(model, optimizer, self.max_iterations)
+        if self.save_final:
+            self._save_checkpoint(raw_model, optimizer, self.max_iterations, name="final")
         print(f"\n[PPO] Training complete. Best success rate: {best_success_rate:.1%}")
 
         if run is not None:
             run.finish()
 
-    def _save_checkpoint(self, model, optimizer, iteration, is_best=False):
+    def _save_checkpoint(self, model, optimizer, iteration, is_best=False, name: str = None):
         """Save model checkpoint in both PPO and BC-compatible formats."""
         if is_best:
             ckpt_dir = os.path.join(self.output_dir, "best")
+        elif name is not None:
+            ckpt_dir = os.path.join(self.output_dir, name)
         else:
             ckpt_dir = os.path.join(self.output_dir, f"checkpoint-{iteration}")
 
         os.makedirs(ckpt_dir, exist_ok=True)
 
         # Full actor-critic state
-        torch.save(model.state_dict(), os.path.join(ckpt_dir, "actor_critic.pt"))
+        model_state = model.state_dict()
+        torch.save(model_state, os.path.join(ckpt_dir, "actor_critic.pt"))
 
-        # BC-compatible actor-only state (for eval_robomimic.py)
-        bc_state = {}
-        for k, v in model.state_dict().items():
-            if not k.startswith("value_head.") and k != "log_std":
-                bc_state[k.replace("actor_head.", "controller.")] = v
-        torch.save(bc_state, os.path.join(ckpt_dir, "model.pt"))
+        # BC-compatible actor-only state (for eval_robomimic.py). Regular
+        # checkpoints skip this by default to halve disk writes; best/final
+        # always include it.
+        include_bc = (
+            is_best
+            or name == "final"
+            or self.save_bc_compatible_every_checkpoint
+        )
+        if include_bc:
+            bc_state = {}
+            for k, v in model_state.items():
+                if not k.startswith("value_head.") and k != "log_std":
+                    bc_state[k.replace("actor_head.", "controller.")] = v
+            torch.save(bc_state, os.path.join(ckpt_dir, "model.pt"))
 
-        # Optimizer + iteration
-        torch.save({
-            "optimizer": optimizer.state_dict(),
-            "iteration": iteration,
-        }, os.path.join(ckpt_dir, "training_state.pt"))
+        metadata = {"iteration": iteration, "optimizer_state_saved": self.save_optimizer_state}
+        if self.save_optimizer_state:
+            torch.save({
+                "optimizer": optimizer.state_dict(),
+                "iteration": iteration,
+            }, os.path.join(ckpt_dir, "training_state.pt"))
+        else:
+            with open(os.path.join(ckpt_dir, "training_state.json"), "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
 
         # Norm stats — save one file per task so downstream eval / re-init
         # can pick the right stats regardless of which task is being rolled out.
         for task_name, ns in self.norm_stats_by_task.items():
             ns.save(os.path.join(ckpt_dir, f"norm_stats_{task_name}.json"))
+
+        return ckpt_dir
+
+    def _prune_checkpoints(self):
+        """Keep only the newest N regular checkpoints when configured."""
+        if self.save_total_limit is None or self.save_total_limit <= 0:
+            return
+        if not os.path.isdir(self.output_dir):
+            return
+
+        checkpoints = []
+        for name in os.listdir(self.output_dir):
+            if not name.startswith("checkpoint-"):
+                continue
+            try:
+                iteration = int(name.split("-", 1)[1])
+            except ValueError:
+                continue
+            checkpoints.append((iteration, name))
+
+        checkpoints.sort()
+        excess = len(checkpoints) - self.save_total_limit
+        if excess <= 0:
+            return
+        for _, name in checkpoints[:excess]:
+            shutil.rmtree(os.path.join(self.output_dir, name), ignore_errors=True)

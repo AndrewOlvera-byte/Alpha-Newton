@@ -94,7 +94,7 @@ class Config:
         base_configs = [common_path]
         if mode == "rlvr" and rlvr_path.exists():
             base_configs.append(rlvr_path)
-        elif mode == "bc" and robotics_path.exists():
+        elif mode in {"bc", "ppo"} and robotics_path.exists():
             base_configs.append(robotics_path)
 
         return cls.load(exp_path, base_configs=base_configs)

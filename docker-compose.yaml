@@ -11,7 +11,7 @@ services:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu]
+              capabilities: [gpu, graphics, compute, utility]
 
     # Shared memory for PyTorch DataLoader workers (default 64MB is too small)
     shm_size: "16gb"
@@ -37,6 +37,11 @@ services:
     environment:
       - CUDA_VISIBLE_DEVICES=0
       - WANDB_API_KEY=${WANDB_API_KEY}  # Pass from host environment
+      # NVIDIA EGL hardware rendering for MuJoCo — requires `graphics` capability
+      # below so the runtime mounts libEGL_nvidia.so.0 from the host driver.
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+      - MUJOCO_GL=egl
+      - PYOPENGL_PLATFORM=egl
 
     # Port mappings
     ports:

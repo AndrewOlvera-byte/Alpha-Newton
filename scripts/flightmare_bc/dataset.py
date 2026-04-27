@@ -29,7 +29,7 @@ from src.core.registry import register
 from scripts.flightmare_bc.augmentations import build_eval_aug, build_train_aug
 
 
-_ActionT = Literal["waypoint", "ctbr", "motor"]
+_ActionT = Literal["waypoint", "ctbr"]
 
 
 class FlightmareBCDataset(Dataset):
@@ -58,6 +58,8 @@ class FlightmareBCDataset(Dataset):
         cameras: list[str] | None = None,
         normalize_state: bool = True,
         normalize_action: bool = True,
+        include_mission: bool = True,
+        normalize_mission: bool = True,
     ):
         if history_length != 1:
             raise ValueError(
@@ -71,6 +73,8 @@ class FlightmareBCDataset(Dataset):
         self.include_prev_action = include_prev_action
         self.normalize_state = normalize_state
         self.normalize_action = normalize_action
+        self.include_mission = include_mission
+        self.normalize_mission = normalize_mission and include_mission
 
         with open(self.data_dir / "index.json") as f:
             manifest = json.load(f)
@@ -105,8 +109,14 @@ class FlightmareBCDataset(Dataset):
             self.state_std = torch.from_numpy(stats["state_std"]).float()
             self.action_mean = torch.from_numpy(stats[f"{action_type}_mean"]).float()
             self.action_std = torch.from_numpy(stats[f"{action_type}_std"]).float()
+            if self.normalize_mission and "mission_mean" in stats.files:
+                self.mission_mean = torch.from_numpy(stats["mission_mean"]).float()
+                self.mission_std = torch.from_numpy(stats["mission_std"]).float()
+            else:
+                self.mission_mean = self.mission_std = None
         else:
             self.state_mean = self.state_std = self.action_mean = self.action_std = None
+            self.mission_mean = self.mission_std = None
 
         self._handles: dict[int, h5py.File] = {}
         self._owner_pid: int | None = None
@@ -153,11 +163,16 @@ class FlightmareBCDataset(Dataset):
             prev_action = (prev_action - self.action_mean) / self.action_std
 
         out = {
-            "images": images if len(images) > 1 else next(iter(images.values())),
+            "images": images,
             "state": state,
             "prev_actions": prev_action,
             "action": action,
         }
+        if self.include_mission and "mission/vec" in h:
+            mission = torch.from_numpy(h["mission/vec"][t]).float()
+            if self.normalize_mission and self.mission_mean is not None:
+                mission = (mission - self.mission_mean) / self.mission_std
+            out["mission"] = mission
         return out
 
 
@@ -177,11 +192,14 @@ def _collate(batch: list[dict]) -> dict:
 def build_flightmare_bc(**kwargs):
     kwargs.pop("type", None)
     split = kwargs.pop("split", "train")
-    train_ds = FlightmareBCDataset(split="train", **kwargs)
-    val_ds = FlightmareBCDataset(
-        split="val",
-        **{**kwargs, "augment": False},
-    ) if split in ("train", "all") else None
     if split == "val":
-        return val_ds if val_ds is not None else FlightmareBCDataset(split="val", **kwargs)
-    return {"train": train_ds, "val": val_ds, "collate_fn": _collate}
+        return FlightmareBCDataset(split="val", **{**kwargs, "augment": False})
+    train_ds = FlightmareBCDataset(split="train", **kwargs)
+    val_ds = None
+    if split in ("train", "all"):
+        try:
+            val_ds = FlightmareBCDataset(split="val", **{**kwargs, "augment": False})
+        except RuntimeError as e:
+            if "No episodes for split=val" not in str(e):
+                raise
+    return {"train": train_ds, "eval": val_ds, "collate_fn": _collate}

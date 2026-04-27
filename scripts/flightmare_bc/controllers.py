@@ -51,12 +51,12 @@ def quat_to_R(quat: np.ndarray) -> np.ndarray:
 
 @dataclass
 class QuadParams:
-    mass: float = 0.752                  # kg, RotorS / agile_autonomy default
+    mass: float = 0.73                   # kg, Flightmare default
     g: float = 9.81
     arm_length: float = 0.17
     k_thrust: float = 1.91e-6
     k_torque: float = 2.6e-7
-    max_collective_thrust: float = 4.0 * 9.81 * 0.752  # ~4 g of total thrust
+    max_collective_thrust: float = 4.0 * 9.81 * 0.73  # ~4 g of total thrust
     inertia: tuple[float, float, float] = (0.0025, 0.0021, 0.0043)
 
 

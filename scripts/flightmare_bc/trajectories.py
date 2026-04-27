@@ -122,6 +122,7 @@ def random_waypoint_path(
     bbox: tuple[float, float, float] = (8.0, 8.0, 3.0),
     z_min: float = 1.0,
     min_step: float = 1.5,
+    origin: np.ndarray | None = None,
 ) -> np.ndarray:
     """Sample a random waypoint sequence inside an XYZ bounding box.
 
@@ -129,14 +130,17 @@ def random_waypoint_path(
     segments are well-conditioned.
     """
     bx, by, bz = bbox
-    out = [np.array([0.0, 0.0, max(z_min, bz * 0.5)])]
+    if origin is None:
+        origin = np.array([0.0, 0.0, max(z_min, bz * 0.5)], dtype=np.float64)
+    out = [np.asarray(origin, dtype=np.float64).copy()]
     for _ in range(n_waypoints):
         for _ in range(40):
-            cand = np.array([
+            cand = out[0] + np.array([
                 rng.uniform(-bx, bx),
                 rng.uniform(-by, by),
-                rng.uniform(z_min, bz),
+                rng.uniform(-max(0.0, bz - z_min), bz),
             ])
+            cand[2] = max(z_min, cand[2])
             if np.linalg.norm(cand - out[-1]) >= min_step:
                 out.append(cand)
                 break

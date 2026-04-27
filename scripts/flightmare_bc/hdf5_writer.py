@@ -76,8 +76,15 @@ class EpisodeWriter:
                 f"action/{name}", shape=(0, 4), maxshape=(None, 4),
                 chunks=(chunk_action, 4), dtype=np.float32, **_FLOAT_KW,
             )
-            for name in ("waypoint", "ctbr", "motor")
+            for name in ("waypoint", "ctbr")
         }
+        # Mission/perception-prior channels: next-K-gates in body frame +
+        # progress + distance. Dim is set when first sample is appended.
+        self._ds_mission = None
+        self._ds_gate_index = self._h5.create_dataset(
+            "mission/gate_index", shape=(0,), maxshape=(None,),
+            chunks=(chunk_action,), dtype=np.int32,
+        )
         self._ds_ref_pos = self._h5.create_dataset(
             "reference/pos_des", shape=(0, 3), maxshape=(None, 3),
             chunks=(chunk_action, 3), dtype=np.float32, **_FLOAT_KW,
@@ -110,6 +117,8 @@ class EpisodeWriter:
         ref_vel: np.ndarray,
         ref_yaw: float,
         done: bool,
+        mission: np.ndarray | None = None,
+        gate_index: int = -1,
     ) -> None:
         i = self._grow(self._ds_state, 1)
         self._ds_state[i] = state.astype(np.float32, copy=False)
@@ -119,6 +128,19 @@ class EpisodeWriter:
         for name, ds in self._ds_action.items():
             self._grow(ds, 1)
             ds[i] = actions[name].astype(np.float32, copy=False)
+        if mission is not None:
+            mission = np.asarray(mission, dtype=np.float32)
+            if self._ds_mission is None:
+                self._ds_mission = self._h5.create_dataset(
+                    "mission/vec", shape=(0, mission.shape[0]),
+                    maxshape=(None, mission.shape[0]),
+                    chunks=(256, mission.shape[0]), dtype=np.float32,
+                    **_FLOAT_KW,
+                )
+            self._grow(self._ds_mission, 1)
+            self._ds_mission[i] = mission
+        self._grow(self._ds_gate_index, 1)
+        self._ds_gate_index[i] = int(gate_index)
         self._grow(self._ds_ref_pos, 1)
         self._ds_ref_pos[i] = ref_pos.astype(np.float32, copy=False)
         self._grow(self._ds_ref_vel, 1)

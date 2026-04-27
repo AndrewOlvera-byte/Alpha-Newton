@@ -17,6 +17,8 @@ import src.robotics.trainer
 import src.robotics.models.VLA_like
 import src.robotics.models.VLA_MLP
 import src.robotics.models.VLA_Gaussian
+import src.robotics.models.flightmare
+import scripts.flightmare_bc.dataset
 
 
 def test_dataset(cfg: Config):

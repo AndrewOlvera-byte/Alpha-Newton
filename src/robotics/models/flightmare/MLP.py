@@ -80,6 +80,7 @@ class TinyVisionEncoder(nn.Module):
                 self.features = nn.Sequential(net.features, net.avgpool)
             self.feature_dim = self._CNN_FEATURE_DIMS[backbone]
             self._is_vit = False
+            
         elif backbone == "dinov2_small":
             from transformers import Dinov2Model
 

@@ -107,8 +107,16 @@ def main(exp_name: str, test_only: bool = False):
 
     print(f"[Config] Run:   {cfg.run['name']}")
     print(f"[Config] Mode:  {cfg.run['mode']}")
-    print(f"[Config] Tasks: {cfg.data.get('tasks', [])}")
-    print(f"[Config] Image size: {cfg.data.get('image_size', 'unset')}")
+    data_type = cfg.data.get("type", "?")
+    print(f"[Config] Data:  type={data_type}")
+    if data_type.startswith("robomimic"):
+        print(f"[Config]        tasks={cfg.data.get('tasks', [])}  image_size={cfg.data.get('image_size', 'unset')}")
+    elif data_type.startswith("flightmare"):
+        print(f"[Config]        data_dir={cfg.data.get('data_dir', '?')}  "
+              f"action={cfg.data.get('action_type', '?')}  "
+              f"include_mission={cfg.data.get('include_mission', True)}")
+    arch_type = (cfg.robotics or {}).get("architecture", {}).get("type", "?")
+    print(f"[Config] Arch:  {arch_type}")
     print(f"[Config] Output: {cfg.training['output_dir']}")
     print()
 

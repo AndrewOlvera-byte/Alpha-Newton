@@ -26,14 +26,24 @@ PPO builds optionally take ``bc_checkpoint`` to warm-start from a BC run.
 """
 from __future__ import annotations
 
+import inspect
+
 from src.core.registry import register
 from src.robotics.models.flightmare.MLPFusionGaussianExpertActor import (
     MLPFusionGaussianExpertActor,
 )
 
 
+_ACTOR_PARAMS = set(inspect.signature(MLPFusionGaussianExpertActor.__init__).parameters)
+_ACTOR_PARAMS.discard("self")
+_ACTOR_PARAMS.add("bc_checkpoint")  # consumed by PPO builders before construction
+
+
 def _strip(kwargs: dict) -> dict:
-    cfg = dict(kwargs)
+    """Drop keys the actor doesn't accept (e.g. shared base-config fields like
+    d_model that target other architectures), keeping the builder robust to
+    cross-arch config merges."""
+    cfg = {k: v for k, v in kwargs.items() if k in _ACTOR_PARAMS}
     cfg.pop("type", None)
     return cfg
 
@@ -86,6 +96,47 @@ def build_flightmare_ctbr_ppo(**kwargs):
     cfg = _strip(kwargs)
     bc_ckpt = cfg.pop("bc_checkpoint", None)
     cfg = _ppo_defaults(cfg, action_dim=4)
+    if bc_ckpt is not None:
+        return MLPFusionGaussianExpertActor.from_bc_checkpoint(bc_ckpt, cfg)
+    return MLPFusionGaussianExpertActor(**cfg)
+
+
+# ---------------------------------------------------------------------------
+# State-only variants (no vision encoder). Used for vectorized RL at scale
+# where running many Unity instances is infeasible. Inputs: proprio state +
+# privileged mission vector (concatenated into ``state`` upstream).
+# ---------------------------------------------------------------------------
+@register("architecture", "flightmare_waypoint_bc_state")
+def build_flightmare_waypoint_bc_state(**kwargs):
+    cfg = _bc_defaults(_strip(kwargs), action_dim=4)
+    cfg.setdefault("use_vision", False)
+    return MLPFusionGaussianExpertActor(**cfg)
+
+
+@register("architecture", "flightmare_waypoint_ppo_state")
+def build_flightmare_waypoint_ppo_state(**kwargs):
+    cfg = _strip(kwargs)
+    bc_ckpt = cfg.pop("bc_checkpoint", None)
+    cfg = _ppo_defaults(cfg, action_dim=4)
+    cfg.setdefault("use_vision", False)
+    if bc_ckpt is not None:
+        return MLPFusionGaussianExpertActor.from_bc_checkpoint(bc_ckpt, cfg)
+    return MLPFusionGaussianExpertActor(**cfg)
+
+
+@register("architecture", "flightmare_ctbr_bc_state")
+def build_flightmare_ctbr_bc_state(**kwargs):
+    cfg = _bc_defaults(_strip(kwargs), action_dim=4)
+    cfg.setdefault("use_vision", False)
+    return MLPFusionGaussianExpertActor(**cfg)
+
+
+@register("architecture", "flightmare_ctbr_ppo_state")
+def build_flightmare_ctbr_ppo_state(**kwargs):
+    cfg = _strip(kwargs)
+    bc_ckpt = cfg.pop("bc_checkpoint", None)
+    cfg = _ppo_defaults(cfg, action_dim=4)
+    cfg.setdefault("use_vision", False)
     if bc_ckpt is not None:
         return MLPFusionGaussianExpertActor.from_bc_checkpoint(bc_ckpt, cfg)
     return MLPFusionGaussianExpertActor(**cfg)

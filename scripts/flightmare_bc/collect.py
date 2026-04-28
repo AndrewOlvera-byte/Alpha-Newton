@@ -137,7 +137,9 @@ def launch_unity_if_requested(args: argparse.Namespace) -> subprocess.Popen | No
     exe = Path(os.environ.get("FLIGHTMARE_UNITY_EXECUTABLE", "/opt/flightmare/flightrender/RPG_Flightmare.x86_64"))
     if not exe.exists():
         raise FileNotFoundError(f"Flightmare Unity executable not found: {exe}")
-    proc = subprocess.Popen([str(exe)], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    extra_args = os.environ.get("FLIGHTMARE_UNITY_ARGS", "").split()
+    cmd = [str(exe), *extra_args]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     time.sleep(max(0.0, float(args.unity_startup_s)))
     return proc
 
@@ -154,6 +156,11 @@ def collect_one_episode(
     gates: list[GateSpec] = []
     if cfg.course_mode == "gates":
         gates = sample_gate_course(rng, cfg)
+        # Prefix gate IDs with episode index so reused Unity instances don't
+        # collide on object IDs across episodes (older gates remain in the
+        # scene visually but are unused by the controller / mission tracker).
+        for g in gates:
+            g.gate_id = f"ep{episode_id:06d}_{g.gate_id}"
         env.add_gates(gates)
         waypoints = waypoints_from_gates(gates, cfg.z_min)
         obs = env.reset(init_pos=waypoints[0], yaw=float(gates[0].yaw))
@@ -272,7 +279,7 @@ def main():
     p.add_argument("--out", type=Path, default=Path("data/flightmare/expert_v1"))
     p.add_argument("--episodes", type=int, default=500)
     p.add_argument("--image-size", type=int, default=224)
-    p.add_argument("--cameras", nargs="+", default=["forward"])
+    p.add_argument("--cameras", nargs="*", default=[])
     p.add_argument("--control-hz", type=float, default=100.0)
     p.add_argument("--max-steps", type=int, default=1500)
     p.add_argument("--n-waypoints", type=int, default=6)
@@ -297,8 +304,14 @@ def main():
                    help="Seconds to wait after --launch-unity before connecting.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--val-frac", type=float, default=0.1)
-    p.add_argument("--no-render", action="store_true",
-                   help="Skip Unity rendering (state-only dataset, for debugging).")
+    p.add_argument("--min-gate-completion", type=float, default=0.999,
+                   help="Episodes that complete a smaller fraction of gates are "
+                        "marked split='discard' and excluded from train/val + norm_stats.")
+    p.add_argument("--render", action="store_true",
+                   help="Enable Unity rendering and image collection (vision mode). "
+                        "Default: state-only collection (no Unity, no image datasets).")
+    p.add_argument("--no-render", dest="render", action="store_false",
+                   help=argparse.SUPPRESS)
     # Multi-process / shard mode (set by parallel_collect.py orchestrator).
     # When --shard-manifest is set, we skip the val-split + norm_stats step
     # (the orchestrator does both after all shards finish).
@@ -311,8 +324,13 @@ def main():
                         "instead of the consolidated index.json.")
     p.add_argument("--shard-id", type=int, default=0)
     args = p.parse_args()
-    if args.course_mode == "gates" and args.no_render:
-        print("[collect] gate course requested with --no-render; gates are logged but not visualized.")
+    state_only = not args.render
+    if state_only:
+        if args.cameras:
+            print(f"[collect] state-only mode: ignoring --cameras {args.cameras}")
+        args.cameras = []
+        if args.course_mode == "gates":
+            print("[collect] state-only gate course: gates logged but not visualized.")
 
     out: Path = args.out
     (out / "episodes").mkdir(parents=True, exist_ok=True)
@@ -321,7 +339,6 @@ def main():
     params = QuadParams()
     controller = GeometricSE3Controller(params=params)
     unity_proc = launch_unity_if_requested(args)
-    env = None
 
     manifest = {
         "version": 1,
@@ -354,20 +371,23 @@ def main():
     ep_end = int(args.episodes) if args.ep_end is None else int(args.ep_end)
 
     t0 = time.time()
+    # Build a single env and reuse it across episodes. Tearing down + rebuilding
+    # the Unity bridge per episode put Unity in a half-connected state that
+    # stalled subsequent renders.
+    env = FlightmareExpertEnv(
+        image_size=args.image_size,
+        cameras=tuple(args.cameras),
+        control_hz=args.control_hz,
+        params=params,
+        scene=args.scene,
+        render=args.render,
+        seed=args.seed,
+        visual_backend=(args.course_mode == "gates") or state_only,
+    )
+    if env.using_fallback:
+        print("[collect] WARNING: numpy fallback active - images will be blank.")
     try:
         for ep in range(ep_start, ep_end):
-            env = FlightmareExpertEnv(
-                image_size=args.image_size,
-                cameras=tuple(args.cameras),
-                control_hz=args.control_hz,
-                params=params,
-                scene=args.scene,
-                render=not args.no_render,
-                seed=args.seed + ep,
-                visual_backend=args.course_mode == "gates",
-            )
-            if env.using_fallback:
-                print("[collect] WARNING: numpy fallback active - images will be blank.")
             ep_path = out / "episodes" / f"ep_{ep:06d}.h5"
             with EpisodeWriter(
                 ep_path,
@@ -382,8 +402,6 @@ def main():
                 info = collect_one_episode(
                     env, controller, rng, args, ep, w, args.lookahead_s,
                 )
-            env.close()
-            env = None
             info["path"] = str(ep_path.relative_to(out))
             manifest["episodes"].append(info)
             done_in_shard = ep - ep_start + 1
@@ -395,8 +413,10 @@ def main():
                       f"v={info['avg_speed']:.1f}m/s  ({elapsed:.0f}s elapsed)",
                       flush=True)
     finally:
-        if env is not None:
+        try:
             env.close()
+        except Exception:
+            pass
         if unity_proc is not None:
             unity_proc.terminate()
             try:
@@ -419,13 +439,32 @@ def main():
         print(f"[collect][shard{args.shard_id}] wrote {len(manifest['episodes'])} eps -> {args.shard_manifest}", flush=True)
         return
 
-    # Train/val split (episode-level, deterministic for given seed).
-    n = len(manifest["episodes"])
-    perm = np.random.default_rng(args.seed).permutation(n)
-    n_val = int(round(args.val_frac * n))
-    val_ids = set(int(i) for i in perm[:n_val])
+    # Quality filter: episodes that didn't pass enough gates are discarded.
+    keep_idx: list[int] = []
     for i, ep in enumerate(manifest["episodes"]):
-        ep["split"] = "val" if i in val_ids else "train"
+        n_gates = max(1, len(ep.get("gates", [])))
+        # gates_passed is recorded as the final mission gate_index in the H5;
+        # we approximate it via episode meta (recompute from H5 to be safe).
+        import h5py
+        with h5py.File(out / ep["path"], "r") as h:
+            gi = h["mission/gate_index"][...]
+            gates_passed = int(gi[-1]) if gi.size else 0
+        ep["gates_passed"] = gates_passed
+        completion = gates_passed / n_gates
+        ep["gate_completion"] = float(completion)
+        if completion >= args.min_gate_completion:
+            keep_idx.append(i)
+        else:
+            ep["split"] = "discard"
+
+    # Train/val split (episode-level, deterministic for given seed) over kept eps.
+    n_keep = len(keep_idx)
+    perm = np.random.default_rng(args.seed).permutation(n_keep)
+    n_val = int(round(args.val_frac * n_keep))
+    val_local = set(int(i) for i in perm[:n_val])
+    for local_i, global_i in enumerate(keep_idx):
+        manifest["episodes"][global_i]["split"] = "val" if local_i in val_local else "train"
+    n_discard = len(manifest["episodes"]) - n_keep
 
     with open(out / "index.json", "w") as f:
         json.dump(manifest, f, indent=2)
@@ -434,7 +473,8 @@ def main():
     if train_files:
         write_norm_stats(out, train_files)
 
-    print(f"[collect] done. {n} episodes -> {out}")
+    print(f"[collect] done. {len(manifest['episodes'])} episodes "
+          f"(train+val={n_keep}, discarded={n_discard}) -> {out}")
 
 
 if __name__ == "__main__":

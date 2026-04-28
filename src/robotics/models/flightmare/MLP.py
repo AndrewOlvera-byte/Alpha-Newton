@@ -153,6 +153,7 @@ class MLPFusion(nn.Module):
         pretrained: bool = True,
         freeze_vision: bool = True,
         n_cameras: int = 1,
+        use_vision: bool = True,
         include_prev_action: bool = True,
         state_hidden_dim: int = 128,
         state_embed_dim: int = 128,
@@ -164,16 +165,22 @@ class MLPFusion(nn.Module):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.n_cameras = n_cameras
+        self.n_cameras = n_cameras if use_vision else 0
+        self.use_vision = use_vision
         self.include_prev_action = include_prev_action
 
-        self.vision = TinyVisionEncoder(
-            backbone=backbone,
-            img_size=img_size,
-            freeze=freeze_vision,
-            pretrained=pretrained,
-            channels_last=channels_last,
-        )
+        if use_vision:
+            self.vision = TinyVisionEncoder(
+                backbone=backbone,
+                img_size=img_size,
+                freeze=freeze_vision,
+                pretrained=pretrained,
+                channels_last=channels_last,
+            )
+            vision_feature_dim = self.vision.feature_dim * n_cameras
+        else:
+            self.vision = None
+            vision_feature_dim = 0
 
         self.state_encoder = nn.Sequential(
             nn.LayerNorm(state_dim),
@@ -194,7 +201,7 @@ class MLPFusion(nn.Module):
             self.action_encoder = None
             extra = 0
 
-        fused_in = self.vision.feature_dim * n_cameras + state_embed_dim + extra
+        fused_in = vision_feature_dim + state_embed_dim + extra
         layers: list[nn.Module] = [
             nn.LayerNorm(fused_in),
             nn.Linear(fused_in, trunk_hidden_dim),
@@ -220,9 +227,11 @@ class MLPFusion(nn.Module):
         return feats
 
     def forward(self, batch: dict) -> torch.Tensor:
-        feats = self.encode_images(batch["images"])
         state_emb = self.state_encoder(batch["state"])
-        parts = [feats, state_emb]
+        parts = []
+        if self.use_vision:
+            parts.append(self.encode_images(batch["images"]))
+        parts.append(state_emb)
         if self.include_prev_action:
             parts.append(self.action_encoder(batch["prev_actions"]))
         fused = torch.cat(parts, dim=-1)

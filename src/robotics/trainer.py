@@ -795,8 +795,7 @@ class BCTrainer:
         n_samples = 8
         with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_bf16):
             for tid, tb in diversity_batches.items():
-                if not isinstance(tb, dict):
-                    tb = _move_batch_to_device(tb, self.device)
+                tb = _move_batch_to_device(tb, self.device)
                 samples = torch.stack([
                     self.model.predict(tb).float() for _ in range(n_samples)
                 ], dim=0)

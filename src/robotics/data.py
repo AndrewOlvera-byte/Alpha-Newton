@@ -1,12 +1,29 @@
-"""Robosuite imitation-learning datasets backed by robomimic HDF5 files."""
+"""Robotics imitation-learning datasets.
+
+Two families live in this file:
+
+* ``robomimic_*``: per-step / per-window datasets backed by robomimic HDF5
+  files (vision + low-dim state + actions, multi-task).
+
+* ``flightmare_bc_state``: per-step state-only dataset for Flightmare drone
+  BC. Inputs are the drone state (13-dim) concatenated with the privileged
+  mission vector (next-K-gates body-frame + progress + dist; 14-dim) into a
+  single 27-dim feature, so the existing
+  ``MLPFusionGaussianExpertActor(use_vision=False)`` can be used without
+  any model-side plumbing changes. Targets are either the controller's CTBR
+  output or the reference-derived waypoint+speed label.
+"""
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional
+
 import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import Any, Dict, List, Optional
 
 from src.core.registry import register
 
@@ -542,4 +559,219 @@ def build_robomimic_bc_dataset(
         "_obs_keys_image": obs_keys_image,
         "_image_size": image_size,
         "_task_names": list(tasks),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Flightmare drone BC (state-only)
+# ---------------------------------------------------------------------------
+class FlightmareBCStateDataset(Dataset):
+    """Per-timestep state-only Flightmare BC dataset.
+
+    Each sample is a flat dict consumed by ``MLPFusionGaussianExpertActor``:
+
+        state:        [state_dim]                  float32  (drone state ++ mission)
+        prev_actions: [action_dim]                 float32
+        action:       [action_dim]                 float32
+        images:       {}                           (empty - kept for trainer compat)
+
+    All values are mean/std normalized using ``norm_stats.npz`` written by the
+    collector. ``state_dim = 13 (pos+vel+quat+omega) + 14 (next-3-gates body
+    frame + progress + dist) = 27`` when ``include_mission=True`` (default).
+
+    HDF5 handles are opened lazily per worker and cached, so this composes
+    safely with ``DataLoader(num_workers>0)``.
+    """
+
+    ACTION_TYPES = ("waypoint", "ctbr")
+
+    def __init__(
+        self,
+        data_dir: str,
+        action_type: Literal["waypoint", "ctbr"] = "ctbr",
+        split: Literal["train", "val", "all"] = "train",
+        include_mission: bool = True,
+        normalize_state: bool = True,
+        normalize_action: bool = True,
+        normalize_mission: bool = True,
+    ):
+        if action_type not in self.ACTION_TYPES:
+            raise ValueError(f"action_type must be one of {self.ACTION_TYPES}, got {action_type!r}")
+        self.data_dir = Path(data_dir)
+        self.action_type = action_type
+        self.split = split
+        self.include_mission = include_mission
+        self.normalize_state = normalize_state
+        self.normalize_action = normalize_action
+        self.normalize_mission = normalize_mission and include_mission
+
+        with open(self.data_dir / "index.json") as f:
+            manifest = json.load(f)
+        self._meta = manifest
+
+        if split == "all":
+            episodes = manifest["episodes"]
+        else:
+            episodes = [e for e in manifest["episodes"] if e.get("split", "train") == split]
+        if not episodes:
+            raise RuntimeError(
+                f"No episodes for split={split!r} under {data_dir}. "
+                f"Counts: {self._split_counts(manifest)}"
+            )
+
+        self._episode_paths = [str(self.data_dir / e["path"]) for e in episodes]
+        # Flat (episode_idx, t) sample index.
+        self._index: List[tuple[int, int]] = []
+        for ei, ep in enumerate(episodes):
+            T = int(ep["length"])
+            self._index.extend((ei, t) for t in range(T))
+
+        # Load + cache normalization stats as torch tensors (cheap; reused per item).
+        stats_path = self.data_dir / "norm_stats.npz"
+        if not stats_path.exists():
+            raise FileNotFoundError(
+                f"norm_stats.npz missing in {data_dir} - rerun collect.py to (re)build it."
+            )
+        s = np.load(stats_path)
+        self.state_mean = torch.from_numpy(s["state_mean"]).float()
+        self.state_std = torch.from_numpy(s["state_std"]).float()
+        self.action_mean = torch.from_numpy(s[f"{action_type}_mean"]).float()
+        self.action_std = torch.from_numpy(s[f"{action_type}_std"]).float()
+        if self.include_mission and "mission_mean" in s.files:
+            self.mission_mean = torch.from_numpy(s["mission_mean"]).float()
+            self.mission_std = torch.from_numpy(s["mission_std"]).float()
+        else:
+            self.mission_mean = self.mission_std = None
+            if self.include_mission:
+                print(f"[FlightmareBCState] mission stats missing in {stats_path}; "
+                      f"skipping mission normalization.")
+
+        # Resolved by first sample (can also pull from manifest).
+        self.state_dim_drone = int(manifest.get("state_dim", 13))
+        self.mission_dim = int(manifest.get("mission", {}).get("dim", 0))
+        self.state_dim = self.state_dim_drone + (self.mission_dim if self.include_mission else 0)
+        self.action_dim = 4
+
+        self._handles: Dict[int, h5py.File] = {}
+        self._owner_pid: Optional[int] = None
+
+    @staticmethod
+    def _split_counts(manifest: dict) -> dict:
+        counts: Dict[str, int] = {}
+        for ep in manifest["episodes"]:
+            counts[ep.get("split", "train")] = counts.get(ep.get("split", "train"), 0) + 1
+        return counts
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def _get_handle(self, ep_idx: int) -> h5py.File:
+        pid = os.getpid()
+        if self._owner_pid is None:
+            self._owner_pid = pid
+        elif self._owner_pid != pid:
+            self._handles = {}
+            self._owner_pid = pid
+        h = self._handles.get(ep_idx)
+        if h is None:
+            h = h5py.File(self._episode_paths[ep_idx], "r", swmr=False, libver="latest")
+            self._handles[ep_idx] = h
+        return h
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        ep_idx, t = self._index[idx]
+        h = self._get_handle(ep_idx)
+
+        drone_state = torch.from_numpy(h["obs/state"][t]).float()
+        if self.normalize_state:
+            drone_state = (drone_state - self.state_mean) / self.state_std
+
+        if self.include_mission and "mission/vec" in h:
+            mission = torch.from_numpy(h["mission/vec"][t]).float()
+            if self.normalize_mission and self.mission_mean is not None:
+                mission = (mission - self.mission_mean) / self.mission_std
+            state = torch.cat([drone_state, mission], dim=0)
+        else:
+            state = drone_state
+
+        action_key = f"action/{self.action_type}"
+        action = torch.from_numpy(h[action_key][t]).float()
+        prev_t = max(0, t - 1)
+        prev_action = torch.from_numpy(h[action_key][prev_t]).float()
+        if self.normalize_action:
+            action = (action - self.action_mean) / self.action_std
+            prev_action = (prev_action - self.action_mean) / self.action_std
+
+        return {
+            "images": {},  # kept for trainer-side compat (empty -> ignored)
+            "state": state,
+            "prev_actions": prev_action,
+            "action": action,
+        }
+
+    # Hook for normalization-injection from trainer; this dataset already
+    # normalizes inline so we accept any value silently.
+    @property
+    def task_id(self) -> int:
+        return 0
+
+    @task_id.setter
+    def task_id(self, value: int) -> None:  # pragma: no cover - trivial
+        pass
+
+
+@register("data", "flightmare_bc_state")
+def build_flightmare_bc_state(
+    data_dir: str,
+    action_type: Literal["waypoint", "ctbr"] = "ctbr",
+    include_mission: bool = True,
+    normalize_state: bool = True,
+    normalize_action: bool = True,
+    normalize_mission: bool = True,
+    **_: Any,
+) -> Dict[str, Any]:
+    """Build train/val state-only Flightmare BC datasets.
+
+    Returns the trainer-expected dict ``{"train": ..., "eval": ...}``. The
+    BCTrainer skips its own norm-stats step because we don't include
+    ``_train_demo_info`` (the dataset already normalizes inline using the
+    collector's ``norm_stats.npz`` - that's the right behavior here, since
+    Flightmare data has a single self-contained train split).
+    """
+    common = dict(
+        data_dir=data_dir,
+        action_type=action_type,
+        include_mission=include_mission,
+        normalize_state=normalize_state,
+        normalize_action=normalize_action,
+        normalize_mission=normalize_mission,
+    )
+    train_ds = FlightmareBCStateDataset(split="train", **common)
+    try:
+        eval_ds = FlightmareBCStateDataset(split="val", **common)
+    except RuntimeError:
+        # No val split (e.g. val_frac=0.0 collection). Fall back to a tiny
+        # held-out slice from train so eval/loss/diversity still emit metrics.
+        print("[FlightmareBCState] No val split in manifest; using last 10% of train as eval.")
+        n = len(train_ds)
+        n_eval = max(1, int(0.1 * n))
+        # Use Subset wrappers to avoid double-loading; cheap.
+        from torch.utils.data import Subset
+        eval_idx = list(range(n - n_eval, n))
+        train_idx = list(range(0, n - n_eval))
+        eval_ds = Subset(train_ds, eval_idx)
+        train_ds = Subset(train_ds, train_idx)
+
+    print(f"[FlightmareBCState] {data_dir}  action={action_type}  "
+          f"state_dim={getattr(train_ds, 'state_dim', '?')}  "
+          f"action_dim=4  train={len(train_ds)}  eval={len(eval_ds)}")
+    return {
+        "train": train_ds,
+        "eval": eval_ds,
+        "_obs_keys_low_dim": [],
+        "_obs_keys_image": [],
+        "_image_size": 0,
+        "_task_names": ["flightmare"],
+        "_state_dim": getattr(train_ds, "state_dim", 27),
+        "_action_dim": getattr(train_ds, "action_dim", 4),
     }

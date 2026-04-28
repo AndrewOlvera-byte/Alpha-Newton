@@ -188,6 +188,8 @@ def main() -> None:
     p.add_argument("--no-render", action="store_true",
                    help="Run all workers state-only (sanity check; no Unity needed).")
     p.add_argument("--keep-shard-manifests", action="store_true")
+    p.add_argument("--headless-unity", action="store_true",
+                   help="Force Unity into -batchmode -nographics even with workers=1.")
     # collect.py passthrough
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--cameras", nargs="+", default=["forward"])
@@ -233,6 +235,7 @@ def main() -> None:
         if args.no_render:
             cmd.append("--no-render")
         else:
+            cmd.append("--render")
             cmd.append("--launch-unity")
             cmd.extend(["--unity-startup-s", str(args.unity_startup_s)])
 
@@ -243,9 +246,10 @@ def main() -> None:
             worker_env["FLIGHTMARE_SUB_PORT"] = str(sub)
             worker_env["FLIGHTMARE_UNITY_EXECUTABLE"] = args.unity_bin
             # Pass port flags to the Unity binary that collect.py will spawn.
-            worker_env["FLIGHTMARE_UNITY_ARGS"] = (
-                f"-input-port {pub} -output-port {sub} -batchmode -nographics"
-            )
+            unity_extra = f"-input-port {pub} -output-port {sub}"
+            if args.workers > 1 or args.headless_unity:
+                unity_extra += " -batchmode -nographics"
+            worker_env["FLIGHTMARE_UNITY_ARGS"] = unity_extra
             print(f"[parallel] worker {wid}: ports pub={pub} sub={sub} eps=[{s},{e})",
                   flush=True)
 

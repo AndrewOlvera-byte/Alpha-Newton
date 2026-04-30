@@ -186,6 +186,69 @@ def dense_multitask_v1(
 
 
 # ===========================================================================
+# Flightmare drone racing reward
+# ===========================================================================
+
+def flightmare_racing_v1(
+    *,
+    info: dict,
+    action: np.ndarray | None = None,
+    prev_action: np.ndarray | None = None,
+    dt: float = 0.01,
+    progress_scale: float = 8.0,
+    segment_progress_scale: float = 1.0,
+    gate_pass_bonus: float = 12.0,
+    completion_bonus: float = 75.0,
+    gate_miss_penalty: float = 25.0,
+    crash_penalty: float = 25.0,
+    time_penalty: float = 0.01,
+    body_rate_penalty: float = 0.002,
+    action_smoothness_penalty: float = 0.01,
+    alignment_scale: float = 0.05,
+    max_progress_reward: float = 2.0,
+    **_,
+) -> float:
+    """Dense gate-progress reward for state-only autonomous drone racing.
+
+    The structure mirrors modern drone-racing RL rewards:
+      progress toward the next gate + line-segment progress + action/body-rate
+      smoothness + terminal miss/crash penalties. The visual perception term
+      used by Swift-style policies is represented here as a lightweight
+      body-forward alignment bonus because this stack is privileged-state only.
+    """
+    dist_progress = float(info.get("distance_progress_m", 0.0))
+    segment_progress = float(info.get("segment_progress_m", 0.0))
+    dist_progress = float(np.clip(dist_progress, -max_progress_reward, max_progress_reward))
+    segment_progress = float(np.clip(segment_progress, -max_progress_reward, max_progress_reward))
+
+    r = progress_scale * dist_progress
+    r += segment_progress_scale * segment_progress
+    r -= float(time_penalty)
+
+    if action is not None:
+        a = np.asarray(action, dtype=np.float32)
+        if a.size >= 4:
+            r -= float(body_rate_penalty) * float(np.sum(a[1:4] ** 2))
+        if prev_action is not None:
+            pa = np.asarray(prev_action, dtype=np.float32)
+            r -= float(action_smoothness_penalty) * float(np.sum((a - pa) ** 2))
+
+    # Alignment is in [0, 1] where 1 means body/camera forward points at next gate.
+    r += float(alignment_scale) * float(info.get("gate_alignment", 0.0))
+
+    if info.get("gate_passed", False):
+        margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
+        r += float(gate_pass_bonus) + 2.0 * margin
+    if info.get("success", False):
+        r += float(completion_bonus)
+    if info.get("gate_missed", False):
+        r -= float(gate_miss_penalty)
+    if info.get("crash", False):
+        r -= float(crash_penalty)
+    return float(r)
+
+
+# ===========================================================================
 # Registry + lookup
 # ===========================================================================
 
@@ -193,6 +256,7 @@ REWARD_FUNCTIONS: Dict[str, Callable] = {
     "native_shaped": native_shaped,
     "sparse_success": sparse_success,
     "dense_multitask_v1": dense_multitask_v1,
+    "flightmare_racing_v1": flightmare_racing_v1,
 }
 
 

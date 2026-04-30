@@ -19,7 +19,10 @@ from src.robotics.normalization import NormStats
 import src.robotics.models.VLA_MLP
 import src.robotics.models.VLA_Gaussian
 import src.robotics.models.ActorCritic
+import src.robotics.models.flightmare
 import src.robotics.ppo_trainer
+import src.robotics.flightmare_envs
+import src.robotics.flightmare_ppo_trainer
 
 
 def _load_norm_stats(ckpt_dir: str, task_name: str) -> NormStats:
@@ -42,6 +45,75 @@ def _load_norm_stats(ckpt_dir: str, task_name: str) -> NormStats:
         return NormStats.load_from_hdf5(data_path)
 
     raise FileNotFoundError(f"No norm_stats found for task '{task_name}' in {ckpt_dir}")
+
+
+def _resolve_bc_checkpoint(cfg: Config, bc_checkpoint: str | None) -> str:
+    if bc_checkpoint:
+        return bc_checkpoint
+    arch_cfg = (cfg.robotics or {}).get("architecture", {})
+    ppo_cfg = (cfg.robotics or {}).get("ppo", {})
+    candidate = arch_cfg.get("bc_checkpoint") or ppo_cfg.get("bc_checkpoint")
+    if not candidate:
+        raise ValueError(
+            "BC checkpoint must be passed with --bc-checkpoint or configured as "
+            "robotics.architecture.bc_checkpoint / robotics.ppo.bc_checkpoint."
+        )
+    return str(candidate)
+
+
+def _is_flightmare_cfg(cfg: Config) -> bool:
+    trainer_type = cfg.training.get("trainer_type", "")
+    data_type = (cfg.data or {}).get("type", "")
+    arch_type = ((cfg.robotics or {}).get("architecture", {}) or {}).get("type", "")
+    return trainer_type == "ppo_flightmare" or data_type.startswith("flightmare") or arch_type.startswith("flightmare_")
+
+
+def _apply_cli_overrides(cfg: Config, args) -> None:
+    ppo_cfg = (cfg.robotics or {}).setdefault("ppo", {})
+    if args.max_iterations is not None:
+        ppo_cfg["max_iterations"] = int(args.max_iterations)
+    if args.n_envs is not None:
+        ppo_cfg["n_envs"] = int(args.n_envs)
+    if args.n_steps is not None:
+        ppo_cfg["n_steps"] = int(args.n_steps)
+    if args.save_steps is not None:
+        cfg.training["save_steps"] = int(args.save_steps)
+    if args.output_dir is not None:
+        cfg.training["output_dir"] = args.output_dir
+    if args.wandb_mode is not None:
+        cfg.wandb = cfg.wandb or {}
+        cfg.wandb["mode"] = args.wandb_mode
+
+
+def _build_flightmare_ppo_model(cfg: Config, bc_checkpoint: str):
+    arch_cfg = dict((cfg.robotics or {}).get("architecture", {}))
+    if not arch_cfg.get("type"):
+        raise ValueError("robotics.architecture.type must be set for Flightmare PPO.")
+    arch_cfg["bc_checkpoint"] = bc_checkpoint
+    return build("architecture", **arch_cfg)
+
+
+def test_flightmare(cfg: Config, bc_checkpoint: str):
+    print("=" * 60)
+    print("[TEST] Flightmare PPO Pipeline Validation")
+    print("=" * 60)
+    model = _build_flightmare_ppo_model(cfg, bc_checkpoint)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model: {cfg.robotics.get('architecture', {}).get('type')} | trainable={trainable:,}")
+
+    trainer = build(
+        "trainer",
+        type=cfg.training.get("trainer_type", "ppo_flightmare"),
+        model=model,
+        training_cfg=cfg.training,
+        robotics_cfg=cfg.robotics,
+        wandb_cfg=cfg.wandb,
+        data_cfg=cfg.data,
+    )
+    trainer.smoke_test()
+    print(f"\n{'=' * 60}")
+    print("[TEST] Flightmare PPO checks passed")
+    print(f"{'=' * 60}")
 
 
 def test(cfg: Config, bc_checkpoint: str):
@@ -122,8 +194,10 @@ def test(cfg: Config, bc_checkpoint: str):
     print(f"{'=' * 60}")
 
 
-def main(exp_name: str, bc_checkpoint: str, test_only: bool = False):
+def main(exp_name: str, bc_checkpoint: str | None, test_only: bool = False, args=None):
     cfg = Config.from_experiment(exp_name)
+    if args is not None:
+        _apply_cli_overrides(cfg, args)
     if cfg.run.get("mode") not in {"ppo", "bc"}:
         raise ValueError(
             f"train_ppo.py expects a PPO robotics config. "
@@ -134,13 +208,38 @@ def main(exp_name: str, bc_checkpoint: str, test_only: bool = False):
             f"train_ppo.py requires robotics.ppo in exp={exp_name!r}."
         )
 
-    print(f"[Config] Run:  {cfg.run['name']}")
-    print(f"[Config] Task: {cfg.data.get('tasks', [])}")
-    print(f"[Config] Output: {cfg.training['output_dir']}")
+    bc_checkpoint = _resolve_bc_checkpoint(cfg, bc_checkpoint)
+    trainer_type = cfg.training.get("trainer_type", "ppo_robosuite")
+
+    print(f"[Config] Run:     {cfg.run['name']}")
+    print(f"[Config] Trainer: {trainer_type}")
+    if _is_flightmare_cfg(cfg):
+        print(f"[Config] Env:     flightmare action={cfg.data.get('action_type', '?')}")
+    else:
+        print(f"[Config] Task:    {cfg.data.get('tasks', [])}")
+    print(f"[Config] BC:      {bc_checkpoint}")
+    print(f"[Config] Output:  {cfg.training['output_dir']}")
     print()
 
     if test_only:
-        test(cfg, bc_checkpoint)
+        if _is_flightmare_cfg(cfg):
+            test_flightmare(cfg, bc_checkpoint)
+        else:
+            test(cfg, bc_checkpoint)
+        return
+
+    if _is_flightmare_cfg(cfg):
+        model = _build_flightmare_ppo_model(cfg, bc_checkpoint)
+        trainer = build(
+            "trainer",
+            type=trainer_type,
+            model=model,
+            training_cfg=cfg.training,
+            robotics_cfg=cfg.robotics,
+            wandb_cfg=cfg.wandb,
+            data_cfg=cfg.data,
+        )
+        trainer.train()
         return
 
     # Load components
@@ -210,7 +309,13 @@ def main(exp_name: str, bc_checkpoint: str, test_only: bool = False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PPO fine-tuning of BC policy")
     parser.add_argument("--exp", type=str, required=True, help="Experiment config name")
-    parser.add_argument("--bc-checkpoint", type=str, required=True, help="Path to BC model.pt")
+    parser.add_argument("--bc-checkpoint", type=str, default=None, help="Path to BC model.pt; optional if set in config")
     parser.add_argument("--test", action="store_true", help="Test pipeline only")
+    parser.add_argument("--max-iterations", type=int, default=None, help="Override robotics.ppo.max_iterations")
+    parser.add_argument("--n-envs", type=int, default=None, help="Override robotics.ppo.n_envs")
+    parser.add_argument("--n-steps", type=int, default=None, help="Override robotics.ppo.n_steps")
+    parser.add_argument("--save-steps", type=int, default=None, help="Override training.save_steps")
+    parser.add_argument("--output-dir", type=str, default=None, help="Override training.output_dir")
+    parser.add_argument("--wandb-mode", type=str, default=None, help="Override wandb.mode, e.g. disabled/offline")
     args = parser.parse_args()
-    main(exp_name=args.exp, bc_checkpoint=args.bc_checkpoint, test_only=args.test)
+    main(exp_name=args.exp, bc_checkpoint=args.bc_checkpoint, test_only=args.test, args=args)

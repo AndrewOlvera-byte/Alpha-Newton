@@ -65,6 +65,7 @@ class FlightmareExpertEnv:
         render: bool = True,
         seed: int = 1,
         visual_backend: bool = False,
+        backend: str = "auto",
     ):
         self.image_size = image_size
         self.cameras = tuple(cameras)
@@ -74,11 +75,26 @@ class FlightmareExpertEnv:
         self._render = render
         self.seed = int(seed)
         self.visual_backend = bool(visual_backend)
+        self.backend = str(backend)
         self._impl = self._build_impl()
 
     def _build_impl(self):
         try:
-            impl_cls = _VisualFlightmareImpl if (self._render or self.visual_backend) else _FlightgymImpl
+            if self.backend == "numpy":
+                return _NumpyFallbackImpl(
+                    image_size=self.image_size,
+                    cameras=self.cameras,
+                    dt=self.dt,
+                    params=self.params,
+                )
+            if self.backend == "flightgym":
+                impl_cls = _FlightgymImpl
+            elif self.backend == "visual":
+                impl_cls = _VisualFlightmareImpl
+            elif self.backend == "auto":
+                impl_cls = _VisualFlightmareImpl if (self._render or self.visual_backend) else _FlightgymImpl
+            else:
+                raise ValueError(f"Unknown FlightmareExpertEnv backend={self.backend!r}")
             return impl_cls(
                 image_size=self.image_size,
                 cameras=self.cameras,
@@ -312,8 +328,10 @@ class _VisualFlightmareImpl:
         quat = row[3:7]
         vel = row[7:10]
         omega = row[10:13]
-        rgb = np.asarray(self.env.getRGB(), dtype=np.uint8)
-        images = {cam_name: rgb.copy() for cam_name in self.cameras}
+        images = {}
+        if self.cameras:
+            rgb = np.asarray(self.env.getRGB(), dtype=np.uint8)
+            images = {cam_name: rgb.copy() for cam_name in self.cameras}
         return StepResult(pos=pos, vel=vel, quat=quat, omega=omega, images=images, done=done)
 
     def close(self):

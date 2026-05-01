@@ -45,18 +45,19 @@ robotics:
   ppo:
     bc_checkpoint: outputs/flightmare_ctbr_bc_state_v1/best/model.pt
     action_type: ctbr
-    n_envs: 16
-    n_steps: 256
-    ppo_epochs: 4
-    minibatch_size: 1024
-    clip_eps: 0.15
+    n_envs: 32
+    n_steps: 1500
+    ppo_epochs: 2
+    minibatch_size: 8192
+    clip_eps: 0.10
     vf_coeff: 0.5
-    ent_coeff: 0.003
+    ent_coeff: 0.002
     gamma: 0.995
     gae_lambda: 0.95
     max_iterations: 1000
     actor_lr: 2.0e-5
-    critic_lr: 1.0e-4
+    critic_lr: 3.0e-4
+    target_kl: 0.03
 
     control_hz: 100.0
     horizon: 1500
@@ -84,16 +85,19 @@ robotics:
 
     reward_fn: flightmare_racing_v1
     reward_kwargs:
-      progress_scale: 8.0
+      progress_scale: 6.0
       segment_progress_scale: 1.0
-      gate_pass_bonus: 12.0
-      completion_bonus: 75.0
-      gate_miss_penalty: 25.0
-      crash_penalty: 30.0
+      gate_pass_bonus: 20.0
+      completion_bonus: 150.0
+      gate_miss_penalty: 60.0
+      crash_penalty: 75.0
       time_penalty: 0.02
       body_rate_penalty: 0.002
       action_smoothness_penalty: 0.01
       alignment_scale: 0.05
+      gate_centering_penalty: 0.08
+      gate_violation_penalty: 0.20
+      gate_centering_near_m: 4.0
       max_progress_reward: 2.0
 
 training:

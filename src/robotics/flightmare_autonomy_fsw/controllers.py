@@ -127,6 +127,35 @@ class BaseCTBRController:
         )
 
 
+class BaseMotorController:
+    """Thin actuator adapter for policy-predicted per-motor thrust commands."""
+
+    def __init__(
+        self,
+        params: QuadParams | None = None,
+        min_motor_norm: float = 0.0,
+        max_motor_norm: float = 1.0,
+    ):
+        self.params = params or QuadParams()
+        self.min_motor_norm = float(min_motor_norm)
+        self.max_motor_norm = float(max_motor_norm)
+
+    def compute(self, planner: PlannerOutput) -> ControlCommand:
+        action = np.asarray(planner.action, dtype=np.float32)
+        motors = np.clip(action[:4], self.min_motor_norm, self.max_motor_norm).astype(np.float32)
+        thrust_normalized = float(np.clip(np.mean(motors), 0.0, 1.0))
+        return ControlCommand(
+            t=planner.t,
+            step=planner.step,
+            thrust_newton=thrust_normalized * float(self.params.max_collective_thrust),
+            body_rates=np.zeros(3, dtype=np.float32),
+            thrust_normalized=thrust_normalized,
+            source_action_type="motor",
+            planner_action=action,
+            motor_normalized=motors,
+        )
+
+
 class BaseAutonomyController:
     """Dispatch planner outputs to the appropriate command-generation controller."""
 
@@ -135,14 +164,18 @@ class BaseAutonomyController:
         params: QuadParams | None = None,
         waypoint_controller: WaypointLQRController | None = None,
         ctbr_controller: BaseCTBRController | None = None,
+        motor_controller: BaseMotorController | None = None,
     ):
         self.params = params or QuadParams()
         self.waypoint_controller = waypoint_controller or WaypointLQRController(params=self.params)
         self.ctbr_controller = ctbr_controller or BaseCTBRController(params=self.params)
+        self.motor_controller = motor_controller or BaseMotorController(params=self.params)
 
     def compute(self, state: VehicleState, planner: PlannerOutput) -> ControlCommand:
         if planner.action_type == "waypoint":
             return self.waypoint_controller.compute(state, planner)
         if planner.action_type == "ctbr":
             return self.ctbr_controller.compute(planner)
+        if planner.action_type == "motor":
+            return self.motor_controller.compute(planner)
         raise ValueError(f"Unsupported planner action_type={planner.action_type!r}")

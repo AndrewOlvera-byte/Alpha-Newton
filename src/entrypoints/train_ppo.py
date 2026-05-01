@@ -76,6 +76,24 @@ def _apply_cli_overrides(cfg: Config, args) -> None:
         ppo_cfg["n_envs"] = int(args.n_envs)
     if args.n_steps is not None:
         ppo_cfg["n_steps"] = int(args.n_steps)
+    if args.minibatch_size is not None:
+        ppo_cfg["minibatch_size"] = int(args.minibatch_size)
+    if args.ppo_epochs is not None:
+        ppo_cfg["ppo_epochs"] = int(args.ppo_epochs)
+    if args.horizon is not None:
+        ppo_cfg["horizon"] = int(args.horizon)
+    if args.actor_lr is not None:
+        ppo_cfg["actor_lr"] = float(args.actor_lr)
+    if args.critic_lr is not None:
+        ppo_cfg["critic_lr"] = float(args.critic_lr)
+    if args.ent_coeff is not None:
+        ppo_cfg["ent_coeff"] = float(args.ent_coeff)
+    if args.clip_eps is not None:
+        ppo_cfg["clip_eps"] = float(args.clip_eps)
+    if args.gamma is not None:
+        ppo_cfg["gamma"] = float(args.gamma)
+    if args.gae_lambda is not None:
+        ppo_cfg["gae_lambda"] = float(args.gae_lambda)
     if args.save_steps is not None:
         cfg.training["save_steps"] = int(args.save_steps)
     if args.output_dir is not None:
@@ -314,6 +332,15 @@ if __name__ == "__main__":
     parser.add_argument("--max-iterations", type=int, default=None, help="Override robotics.ppo.max_iterations")
     parser.add_argument("--n-envs", type=int, default=None, help="Override robotics.ppo.n_envs")
     parser.add_argument("--n-steps", type=int, default=None, help="Override robotics.ppo.n_steps")
+    parser.add_argument("--minibatch-size", type=int, default=None, help="Override robotics.ppo.minibatch_size")
+    parser.add_argument("--ppo-epochs", type=int, default=None, help="Override robotics.ppo.ppo_epochs")
+    parser.add_argument("--horizon", type=int, default=None, help="Override robotics.ppo.horizon")
+    parser.add_argument("--actor-lr", type=float, default=None, help="Override robotics.ppo.actor_lr")
+    parser.add_argument("--critic-lr", type=float, default=None, help="Override robotics.ppo.critic_lr")
+    parser.add_argument("--ent-coeff", type=float, default=None, help="Override robotics.ppo.ent_coeff")
+    parser.add_argument("--clip-eps", type=float, default=None, help="Override robotics.ppo.clip_eps")
+    parser.add_argument("--gamma", type=float, default=None, help="Override robotics.ppo.gamma")
+    parser.add_argument("--gae-lambda", type=float, default=None, help="Override robotics.ppo.gae_lambda")
     parser.add_argument("--save-steps", type=int, default=None, help="Override training.save_steps")
     parser.add_argument("--output-dir", type=str, default=None, help="Override training.output_dir")
     parser.add_argument("--wandb-mode", type=str, default=None, help="Override wandb.mode, e.g. disabled/offline")

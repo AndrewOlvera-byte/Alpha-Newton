@@ -26,10 +26,11 @@ import torch
 from torch.utils.data import Dataset
 
 from src.core.registry import register
+from scripts.flightmare_bc.action_norms import action_bounds, stats_mode
 from scripts.flightmare_bc.augmentations import build_eval_aug, build_train_aug
 
 
-_ActionT = Literal["waypoint", "ctbr"]
+_ActionT = Literal["waypoint", "ctbr", "motor"]
 
 
 class FlightmareBCDataset(Dataset):
@@ -58,6 +59,7 @@ class FlightmareBCDataset(Dataset):
         cameras: list[str] | None = None,
         normalize_state: bool = True,
         normalize_action: bool = True,
+        action_normalization: Literal["auto", "standard", "bounds"] = "auto",
         include_mission: bool = True,
         normalize_mission: bool = True,
     ):
@@ -73,6 +75,7 @@ class FlightmareBCDataset(Dataset):
         self.include_prev_action = include_prev_action
         self.normalize_state = normalize_state
         self.normalize_action = normalize_action
+        self.action_normalization = action_normalization
         self.include_mission = include_mission
         self.normalize_mission = normalize_mission and include_mission
 
@@ -109,6 +112,10 @@ class FlightmareBCDataset(Dataset):
             self.state_std = torch.from_numpy(stats["state_std"]).float()
             self.action_mean = torch.from_numpy(stats[f"{action_type}_mean"]).float()
             self.action_std = torch.from_numpy(stats[f"{action_type}_std"]).float()
+            self.action_norm_mode = stats_mode(stats, default="standard") if action_normalization == "auto" else str(action_normalization)
+            low, high = action_bounds(action_type, stats)
+            self.action_low = torch.from_numpy(low).float()
+            self.action_high = torch.from_numpy(high).float()
             if self.normalize_mission and "mission_mean" in stats.files:
                 self.mission_mean = torch.from_numpy(stats["mission_mean"]).float()
                 self.mission_std = torch.from_numpy(stats["mission_std"]).float()
@@ -117,6 +124,8 @@ class FlightmareBCDataset(Dataset):
         else:
             self.state_mean = self.state_std = self.action_mean = self.action_std = None
             self.mission_mean = self.mission_std = None
+            self.action_norm_mode = "standard"
+            self.action_low = self.action_high = None
 
         self._handles: dict[int, h5py.File] = {}
         self._owner_pid: int | None = None
@@ -159,8 +168,13 @@ class FlightmareBCDataset(Dataset):
         if self.normalize_state and self.state_mean is not None:
             state = (state - self.state_mean) / self.state_std
         if self.normalize_action and self.action_mean is not None:
-            action = (action - self.action_mean) / self.action_std
-            prev_action = (prev_action - self.action_mean) / self.action_std
+            if self.action_norm_mode == "bounds":
+                scale = torch.clamp(self.action_high - self.action_low, min=1e-6)
+                action = 2.0 * (action - self.action_low) / scale - 1.0
+                prev_action = 2.0 * (prev_action - self.action_low) / scale - 1.0
+            else:
+                action = (action - self.action_mean) / self.action_std
+                prev_action = (prev_action - self.action_mean) / self.action_std
 
         out = {
             "images": images,

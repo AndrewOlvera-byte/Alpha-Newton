@@ -205,6 +205,9 @@ def flightmare_racing_v1(
     body_rate_penalty: float = 0.002,
     action_smoothness_penalty: float = 0.01,
     alignment_scale: float = 0.05,
+    gate_centering_penalty: float = 0.0,
+    gate_violation_penalty: float = 0.0,
+    gate_centering_near_m: float = 4.0,
     max_progress_reward: float = 2.0,
     **_,
 ) -> float:
@@ -235,6 +238,16 @@ def flightmare_racing_v1(
 
     # Alignment is in [0, 1] where 1 means body/camera forward points at next gate.
     r += float(alignment_scale) * float(info.get("gate_alignment", 0.0))
+
+    if gate_centering_penalty > 0.0 or gate_violation_penalty > 0.0:
+        lat_norm = float(info.get("gate_lateral_norm", 0.0))
+        vert_norm = float(info.get("gate_vertical_norm", 0.0))
+        signed_dist = abs(float(info.get("gate_signed_distance_m", 0.0)))
+        near = max(0.0, 1.0 - signed_dist / max(float(gate_centering_near_m), 1e-6))
+        center_err = min(lat_norm ** 2 + vert_norm ** 2, 4.0)
+        aperture_violation = min(max(abs(lat_norm) - 1.0, 0.0) + max(abs(vert_norm) - 1.0, 0.0), 4.0)
+        r -= float(gate_centering_penalty) * near * center_err
+        r -= float(gate_violation_penalty) * near * aperture_violation
 
     if info.get("gate_passed", False):
         margin = max(0.0, float(info.get("gate_margin_m", 0.0)))

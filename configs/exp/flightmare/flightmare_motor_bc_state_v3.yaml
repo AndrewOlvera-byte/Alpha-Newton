@@ -1,0 +1,78 @@
+# State-only BC warmup for v3 Swift-scale per-motor racing.
+# Uses the same recollected dataset as waypoint v3, but trains on action/motor.
+
+run:
+  name: flightmare_motor_bc_state_v3
+  mode: bc
+  seed: 0
+
+data:
+  type: flightmare_bc_state
+  data_dir: data/flightmare/bc_v3_swift_like
+  action_type: motor
+  include_mission: true
+  normalize_state: true
+  normalize_action: true
+  action_normalization: bounds
+  normalize_mission: true
+
+robotics:
+  architecture:
+    type: flightmare_motor_bc_state
+    state_dim: 27
+    action_dim: 4
+    use_vision: false
+    include_prev_action: true
+
+    state_hidden_dim: 256
+    state_embed_dim: 256
+    trunk_hidden_dim: 512
+    trunk_depth: 3
+    dropout: 0.1
+
+    head_hidden_dim: 256
+    head_depth: 2
+    state_dependent_std: true
+    init_log_std: -1.0
+    log_std_min: -5.0
+    log_std_max: 0.5
+
+    with_critic: false
+    bc_loss_type: gnll
+    action_clip: 1.2
+
+training:
+  trainer_type: bc_flow_matching_robosuite
+  per_device_train_batch_size: 2048
+  per_device_eval_batch_size: 2048
+  gradient_accumulation_steps: 1
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 1000
+  max_steps: 60000
+  max_grad_norm: 5.0
+  logging_steps: 100
+  save_steps: 5000
+  eval_steps: 1000
+  bf16: true
+  fp8: false
+  torch_compile: false
+  dataloader_num_workers: 2
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+  selection_metric: eval_loss
+  early_stopping_patience: 12
+  output_dir: outputs/${run.name}
+
+wandb:
+  project: flightmare-bc
+  entity: andrewolvera
+  run_name: ${run.name}
+  tags:
+    - flightmare
+    - bc
+    - state-only
+    - motor
+    - v3
+    - swift-like
+    - bounds-norm

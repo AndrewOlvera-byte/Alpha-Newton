@@ -131,7 +131,7 @@ class GaussianActionExpert(nn.Module):
         dist = Normal(mu, log_std.exp())
         action = dist.rsample()
         log_prob = dist.log_prob(action).sum(-1)
-        return action.clamp(-self.action_clip, self.action_clip), log_prob, mu, log_std
+        return action, log_prob, mu, log_std
 
     def evaluate(
         self, feature: torch.Tensor, action: torch.Tensor

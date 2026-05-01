@@ -48,6 +48,7 @@ from scripts.flightmare_bc.parallel_unity import (
     DEFAULT_UNITY_BIN,
     allocate_ports,
 )
+from scripts.flightmare_bc.action_norms import ACTION_TYPES, DEFAULT_ACTION_BOUNDS
 
 
 PASSTHROUGH_FLAGS = {
@@ -60,12 +61,19 @@ PASSTHROUGH_FLAGS = {
     "min_step": ("--min-step", 1),
     "lookahead_s": ("--lookahead-s", 1),
     "scene": ("--scene", 1),
+    "backend": ("--backend", 1),
+    "action_normalization": ("--action-normalization", 1),
     "course_mode": ("--course-mode", 1),
+    "gate_layout": ("--gate-layout", 1),
     "num_gates": ("--num-gates", 1),
     "gate_lateral_jitter": ("--gate-lateral-jitter", 1),
+    "fixed_gate_pos_noise": ("--fixed-gate-pos-noise", 1),
+    "fixed_gate_yaw_noise": ("--fixed-gate-yaw-noise", 1),
     "gate_yaw_step": ("--gate-yaw-step", 1),
     "gate_yaw_noise": ("--gate-yaw-noise", 1),
     "gate_size": ("--gate-size", 1),
+    "max_world_radius": ("--max-world-radius", 1),
+    "max_collective_thrust_g": ("--max-collective-thrust-g", 1),
     "unity_startup_s": ("--unity-startup-s", 1),
 }
 PASSTHROUGH_LIST = {
@@ -101,10 +109,14 @@ def build_worker_cmd(args: argparse.Namespace, worker_id: int,
            "--shard-id", str(worker_id),
            "--val-frac", "0.0"]
     for attr, (flag, _) in PASSTHROUGH_FLAGS.items():
-        cmd.extend([flag, str(getattr(args, attr))])
+        value = getattr(args, attr)
+        if value is not None:
+            cmd.extend([flag, str(value)])
     for attr, flag in PASSTHROUGH_LIST.items():
         cmd.append(flag)
         cmd.extend(str(v) for v in getattr(args, attr))
+    if args.random_start_gate:
+        cmd.append("--random-start-gate")
     return cmd
 
 
@@ -142,7 +154,7 @@ def write_norm_stats_from_index(out_dir: Path, manifest: dict) -> None:
     if not train:
         print("[parallel] no train episodes; skipping norm_stats")
         return
-    sums: dict = {"state": None, "waypoint": None, "ctbr": None, "mission": None}
+    sums: dict = {"state": None, "mission": None, **{action_type: None for action_type in ACTION_TYPES}}
     sq_sums = {k: None for k in sums}
     counts = {k: 0 for k in sums}
 
@@ -157,8 +169,10 @@ def write_norm_stats_from_index(out_dir: Path, manifest: dict) -> None:
     for fp in train:
         with h5py.File(fp, "r") as f:
             acc("state", f["obs/state"][...])
-            acc("waypoint", f["action/waypoint"][...])
-            acc("ctbr", f["action/ctbr"][...])
+            for action_type in ACTION_TYPES:
+                key = f"action/{action_type}"
+                if key in f:
+                    acc(action_type, f[key][...])
             if "mission/vec" in f:
                 acc("mission", f["mission/vec"][...])
 
@@ -171,6 +185,10 @@ def write_norm_stats_from_index(out_dir: Path, manifest: dict) -> None:
         std = np.sqrt(np.clip(var, 1e-8, None))
         out[f"{k}_mean"] = mean.astype(np.float32)
         out[f"{k}_std"] = std.astype(np.float32)
+    out["action_normalization"] = np.array(str(manifest.get("action_normalization", "standard")))
+    for action_type, (low, high) in DEFAULT_ACTION_BOUNDS.items():
+        out[f"{action_type}_low"] = low.astype(np.float32)
+        out[f"{action_type}_high"] = high.astype(np.float32)
     np.savez(out_dir / "norm_stats.npz", **out)
     print(f"[parallel] wrote norm_stats.npz ({len(train)} train files)")
 
@@ -202,7 +220,13 @@ def main() -> None:
     p.add_argument("--speed-range", nargs=2, type=float, default=[2.5, 5.5])
     p.add_argument("--lookahead-s", type=float, default=0.3)
     p.add_argument("--scene", type=str, default="warehouse")
-    p.add_argument("--course-mode", choices=["random", "gates"], default="gates")
+    p.add_argument("--backend", choices=["numpy", "auto", "visual", "flightgym"], default="numpy")
+    p.add_argument("--action-normalization", choices=["standard", "bounds"], default="standard")
+    p.add_argument("--course-mode", choices=["random", "gates", "swift_like", "fixed_gates"], default="gates")
+    p.add_argument("--gate-layout", type=Path, default=None)
+    p.add_argument("--random-start-gate", action="store_true")
+    p.add_argument("--fixed-gate-pos-noise", type=float, default=0.0)
+    p.add_argument("--fixed-gate-yaw-noise", type=float, default=0.0)
     p.add_argument("--num-gates", type=int, default=8)
     p.add_argument("--gate-spacing-range", nargs=2, type=float, default=[4.0, 8.0])
     p.add_argument("--gate-lateral-jitter", type=float, default=2.0)
@@ -210,6 +234,8 @@ def main() -> None:
     p.add_argument("--gate-yaw-step", type=float, default=0.5)
     p.add_argument("--gate-yaw-noise", type=float, default=0.25)
     p.add_argument("--gate-size", type=float, default=1.0)
+    p.add_argument("--max-world-radius", type=float, default=350.0)
+    p.add_argument("--max-collective-thrust-g", type=float, default=4.0)
     args = p.parse_args()
 
     out: Path = args.out

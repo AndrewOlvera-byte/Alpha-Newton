@@ -24,6 +24,7 @@ from src.robotics.models.flightmare.MissionWrapper import MissionObservation, Mi
 class CourseConfig:
     """Procedural gate-course parameters shared with ``scripts.flightmare_bc.collect``."""
 
+    course_mode: str = "gates"
     num_gates: int = 8
     z_min: float = 1.0
     gate_spacing_range: Sequence[float] = (4.0, 9.0)
@@ -32,6 +33,10 @@ class CourseConfig:
     gate_yaw_step: float = 0.7
     gate_yaw_noise: float = 0.25
     gate_size: float = 1.0
+    gate_layout: str | None = None
+    random_start_gate: bool = False
+    fixed_gate_pos_noise: float = 0.0
+    fixed_gate_yaw_noise: float = 0.0
 
 
 class FlightmareStateNode:
@@ -46,6 +51,7 @@ class FlightmareStateNode:
         render: bool = False,
         seed: int = 0,
         image_size: int = 224,
+        backend: str = "auto",
     ):
         self.control_hz = float(control_hz)
         self.dt = 1.0 / self.control_hz
@@ -55,6 +61,7 @@ class FlightmareStateNode:
         self.render = bool(render)
         self.seed = int(seed)
         self.image_size = int(image_size)
+        self.backend = str(backend)
         self.env = FlightmareExpertEnv(
             image_size=self.image_size,
             cameras=(),
@@ -64,6 +71,7 @@ class FlightmareStateNode:
             render=self.render,
             seed=self.seed,
             visual_backend=True,
+            backend=self.backend,
         )
         self._step = 0
         self._t = 0.0
@@ -94,7 +102,10 @@ class FlightmareStateNode:
         return self._course, VehicleState.from_step_result(obs, t=self._t, step=self._step)
 
     def step(self, command: ControlCommand) -> VehicleState:
-        obs = self.env.step_ctbr(command.thrust_newton, command.body_rates)
+        if command.source_action_type == "motor":
+            obs = self.env.step_motor(command.motor)
+        else:
+            obs = self.env.step_ctbr(command.thrust_newton, command.body_rates)
         self._step += 1
         self._t = self._step * self.dt
         return VehicleState.from_step_result(obs, t=self._t, step=self._step)

@@ -235,8 +235,8 @@ env:
         raise NotImplementedError("Flightmare's Python QuadrotorEnv_v1 accepts motor thrust actions, not CTBR.")
 
     def step_motor(self, motor_normalized):
-        # Controller motor labels are f_i / (m*g). Flightmare's RL wrapper uses
-        # action_i=0 as hover and denormalizes with std=m*2g/4.
+        # Flightgym's bundled wrapper has its own motor-action normalization.
+        # The numpy/visual backends use motor_normalized as f_i / f_i,max.
         self.act[0] = np.clip(2.0 * motor_normalized - 0.5, -0.5, 1.5).astype(np.float32)
         self.env.step(self.act, self.obs, self.reward, self.done, self.extra)
         return self._observe(done=bool(self.done[0]))
@@ -316,7 +316,8 @@ class _VisualFlightmareImpl:
         return self._observe(done=False)
 
     def step_motor(self, motor_normalized):
-        thrusts = np.asarray(motor_normalized, dtype=np.float32) * float(self.params.mass * self.params.g)
+        per_motor_max = float(self.params.max_collective_thrust / 4.0)
+        thrusts = np.asarray(motor_normalized, dtype=np.float32) * per_motor_max
         self.env.stepMotor(thrusts, float(self.dt))
         if self.render:
             self.env.render()
@@ -385,8 +386,40 @@ class _NumpyFallbackImpl:
         return self._observe()
 
     def step_motor(self, motor_normalized):
-        f = np.asarray(motor_normalized, dtype=np.float64) * self.params.g * self.params.mass
-        return self.step_ctbr(float(f.sum()), self.omega)
+        motors = np.clip(np.asarray(motor_normalized, dtype=np.float64), 0.0, 1.0)
+        f = motors * float(self.params.max_collective_thrust / 4.0)
+        thrust_newton = float(f.sum())
+
+        L = float(self.params.arm_length)
+        s = np.sqrt(0.5)
+        kappa = float(self.params.k_torque / max(self.params.k_thrust, 1e-12))
+        tau = np.array([
+            L * s * (-f[0] + f[1] + f[2] - f[3]),
+            L * s * (-f[0] + f[1] - f[2] + f[3]),
+            kappa * (-f[0] - f[1] + f[2] + f[3]),
+        ], dtype=np.float64)
+
+        I = np.diag(np.asarray(self.params.inertia, dtype=np.float64))
+        Iomega = I @ self.omega
+        omega_dot = np.linalg.solve(I, tau - np.cross(self.omega, Iomega))
+        self.omega = np.clip(self.omega + omega_dot * self.dt, -40.0, 40.0)
+
+        m, g = self.params.mass, 9.81
+        R = quat_to_R(self.quat)
+        accel = R @ np.array([0.0, 0.0, thrust_newton / m]) - np.array([0.0, 0.0, g])
+        self.vel = self.vel + accel * self.dt
+        self.pos = self.pos + self.vel * self.dt
+
+        wx, wy, wz = self.omega
+        Omega = 0.5 * np.array([
+            [0, -wx, -wy, -wz],
+            [wx, 0,  wz, -wy],
+            [wy, -wz, 0,  wx],
+            [wz, wy, -wx, 0],
+        ])
+        self.quat = self.quat + Omega @ self.quat * self.dt
+        self.quat /= np.linalg.norm(self.quat) + 1e-9
+        return self._observe()
 
     def _observe(self):
         return StepResult(

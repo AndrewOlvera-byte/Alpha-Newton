@@ -41,6 +41,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from scripts.flightmare_bc.action_norms import action_bounds, stats_mode
 from scripts.flightmare_bc.mission import (
     LOOKAHEAD_GATES,
     MISSION_DIM,
@@ -140,6 +141,8 @@ class MissionWrapper:
         self._state_mean = self._state_std = None
         self._mission_mean = self._mission_std = None
         self._action_mean = self._action_std = None
+        self._action_low = self._action_high = None
+        self._action_norm_mode = "standard"
         if norm_stats is not None:
             stats = np.load(norm_stats)
             self._state_mean = torch.from_numpy(stats["state_mean"]).float().to(self.device)
@@ -151,6 +154,10 @@ class MissionWrapper:
             if mkey in stats.files:
                 self._action_mean = torch.from_numpy(stats[mkey]).float().to(self.device)
                 self._action_std = torch.from_numpy(stats[f"{action_type}_std"]).float().to(self.device)
+                low, high = action_bounds(action_type, stats)
+                self._action_low = torch.from_numpy(low).float().to(self.device)
+                self._action_high = torch.from_numpy(high).float().to(self.device)
+                self._action_norm_mode = stats_mode(stats, default="standard")
 
         self._prev_action = None  # populated on first act()
         self._last_observation: MissionObservation | None = None
@@ -235,7 +242,7 @@ class MissionWrapper:
         if prev.ndim == 1:
             prev = prev.unsqueeze(0)
         if not prev_action_normalized and self._action_mean is not None:
-            prev = (prev - self._action_mean) / self._action_std
+            prev = self._normalize_action(prev)
         return prev
 
     def make_policy_batch(
@@ -292,11 +299,26 @@ class MissionWrapper:
         if action_t.ndim == 1:
             action_t = action_t.unsqueeze(0)
         if not normalized and self._action_mean is not None:
-            action_t = (action_t - self._action_mean) / self._action_std
+            action_t = self._normalize_action(action_t)
         self._prev_action = action_t
+
+    def _normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        if self._action_mean is None:
+            return action
+        if self._action_norm_mode == "bounds":
+            if self._action_low is None or self._action_high is None:
+                raise RuntimeError("Bounds action normalization selected but action bounds are missing.")
+            scale = torch.clamp(self._action_high - self._action_low, min=1e-6)
+            return 2.0 * (action - self._action_low) / scale - 1.0
+        return (action - self._action_mean) / self._action_std
 
     def denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
         if self._action_mean is not None:
+            if self._action_norm_mode == "bounds":
+                if self._action_low is None or self._action_high is None:
+                    raise RuntimeError("Bounds action normalization selected but action bounds are missing.")
+                scale = torch.clamp(self._action_high - self._action_low, min=1e-6)
+                return self._action_low + 0.5 * (action + 1.0) * scale
             return action * self._action_std + self._action_mean
         return action
 

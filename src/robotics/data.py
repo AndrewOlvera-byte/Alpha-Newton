@@ -26,6 +26,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.core.registry import register
+from scripts.flightmare_bc.action_norms import action_bounds, stats_mode
 
 
 class RobomimicDataset(Dataset):
@@ -583,16 +584,17 @@ class FlightmareBCStateDataset(Dataset):
     safely with ``DataLoader(num_workers>0)``.
     """
 
-    ACTION_TYPES = ("waypoint", "ctbr")
+    ACTION_TYPES = ("waypoint", "ctbr", "motor")
 
     def __init__(
         self,
         data_dir: str,
-        action_type: Literal["waypoint", "ctbr"] = "ctbr",
+        action_type: Literal["waypoint", "ctbr", "motor"] = "ctbr",
         split: Literal["train", "val", "all"] = "train",
         include_mission: bool = True,
         normalize_state: bool = True,
         normalize_action: bool = True,
+        action_normalization: Literal["auto", "standard", "bounds"] = "auto",
         normalize_mission: bool = True,
     ):
         if action_type not in self.ACTION_TYPES:
@@ -604,6 +606,7 @@ class FlightmareBCStateDataset(Dataset):
         self.normalize_state = normalize_state
         self.normalize_action = normalize_action
         self.normalize_mission = normalize_mission and include_mission
+        self.action_normalization = action_normalization
 
         with open(self.data_dir / "index.json") as f:
             manifest = json.load(f)
@@ -637,6 +640,10 @@ class FlightmareBCStateDataset(Dataset):
         self.state_std = torch.from_numpy(s["state_std"]).float()
         self.action_mean = torch.from_numpy(s[f"{action_type}_mean"]).float()
         self.action_std = torch.from_numpy(s[f"{action_type}_std"]).float()
+        self.action_norm_mode = stats_mode(s, default="standard") if action_normalization == "auto" else str(action_normalization)
+        low, high = action_bounds(action_type, s)
+        self.action_low = torch.from_numpy(low).float()
+        self.action_high = torch.from_numpy(high).float()
         if self.include_mission and "mission_mean" in s.files:
             self.mission_mean = torch.from_numpy(s["mission_mean"]).float()
             self.mission_std = torch.from_numpy(s["mission_std"]).float()
@@ -699,8 +706,13 @@ class FlightmareBCStateDataset(Dataset):
         prev_t = max(0, t - 1)
         prev_action = torch.from_numpy(h[action_key][prev_t]).float()
         if self.normalize_action:
-            action = (action - self.action_mean) / self.action_std
-            prev_action = (prev_action - self.action_mean) / self.action_std
+            if self.action_norm_mode == "bounds":
+                scale = torch.clamp(self.action_high - self.action_low, min=1e-6)
+                action = 2.0 * (action - self.action_low) / scale - 1.0
+                prev_action = 2.0 * (prev_action - self.action_low) / scale - 1.0
+            else:
+                action = (action - self.action_mean) / self.action_std
+                prev_action = (prev_action - self.action_mean) / self.action_std
 
         return {
             "images": {},  # kept for trainer-side compat (empty -> ignored)
@@ -723,10 +735,11 @@ class FlightmareBCStateDataset(Dataset):
 @register("data", "flightmare_bc_state")
 def build_flightmare_bc_state(
     data_dir: str,
-    action_type: Literal["waypoint", "ctbr"] = "ctbr",
+    action_type: Literal["waypoint", "ctbr", "motor"] = "ctbr",
     include_mission: bool = True,
     normalize_state: bool = True,
     normalize_action: bool = True,
+    action_normalization: Literal["auto", "standard", "bounds"] = "auto",
     normalize_mission: bool = True,
     **_: Any,
 ) -> Dict[str, Any]:
@@ -744,6 +757,7 @@ def build_flightmare_bc_state(
         include_mission=include_mission,
         normalize_state=normalize_state,
         normalize_action=normalize_action,
+        action_normalization=action_normalization,
         normalize_mission=normalize_mission,
     )
     train_ds = FlightmareBCStateDataset(split="train", **common)

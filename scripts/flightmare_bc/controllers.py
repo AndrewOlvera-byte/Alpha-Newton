@@ -151,18 +151,19 @@ class GeometricSE3Controller:
         kT = self.params.k_thrust
         kQ = self.params.k_torque
 
-        # X mixer (standard quadcopter):  motor 0 FR, 1 BL, 2 FL, 3 BR
-        # f_total = sum f_i;  tau_x = L*(f0 - f1 + f2 - f3)*sin45
-        # Use simple symmetric mapping:
+        # X mixer (standard quadcopter): motor 0 FR, 1 BL, 2 FL, 3 BR.
+        # Motor-normalized thrust is f_i / f_i,max, so 1.0 on all four rotors
+        # gives the configured collective thrust ceiling.
         s = np.sqrt(0.5)
-        A = np.array([
-            [1.0,  L * s, -L * s, -kQ / kT],
-            [1.0, -L * s,  L * s, -kQ / kT],
-            [1.0,  L * s,  L * s,  kQ / kT],
-            [1.0, -L * s, -L * s,  kQ / kT],
+        kappa = kQ / kT
+        mixer = np.array([
+            [1.0, 1.0, 1.0, 1.0],
+            [-L * s, L * s, L * s, -L * s],
+            [-L * s, L * s, -L * s, L * s],
+            [-kappa, -kappa, kappa, kappa],
         ])
         rhs = np.array([thrust_newton, tau[0], tau[1], tau[2]])
-        f = np.linalg.solve(A, rhs)
+        f = np.linalg.solve(mixer, rhs)
         f_max = self.params.max_collective_thrust / 4.0
         return np.clip(f / max(f_max, 1e-6), 0.0, 1.0)
 

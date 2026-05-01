@@ -12,6 +12,7 @@ Two output spaces are wired up via ``actors.py``:
     (Kaufmann et al. 2023).
   - collective-thrust + body-rates (4-dim): low-level, 50-100 Hz; the
     standard real-drone control interface used in autonomous racing.
+  - per-motor thrust (4-dim): actuator-level ablation with full mixer freedom.
 
 The same module is used for BC (no critic, NLL or MSE) and for PPO (critic
 enabled, identical actor weights). ``from_bc_checkpoint`` instantiates a

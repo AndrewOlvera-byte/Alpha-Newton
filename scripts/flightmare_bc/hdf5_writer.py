@@ -76,7 +76,7 @@ class EpisodeWriter:
                 f"action/{name}", shape=(0, 4), maxshape=(None, 4),
                 chunks=(chunk_action, 4), dtype=np.float32, **_FLOAT_KW,
             )
-            for name in ("waypoint", "ctbr")
+            for name in ("waypoint", "ctbr", "motor")
         }
         # Mission/perception-prior channels: next-K-gates in body frame +
         # progress + distance. Dim is set when first sample is appended.

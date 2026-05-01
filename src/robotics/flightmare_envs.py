@@ -20,15 +20,23 @@ import numpy as np
 from gymnasium import spaces
 
 from scripts.flightmare_bc.collect import build_state, sample_gate_course, waypoints_from_gates
+from scripts.flightmare_bc.action_norms import action_bounds, stats_mode
 from scripts.flightmare_bc.controllers import QuadParams, quat_to_R
 from scripts.flightmare_bc.expert_env import FlightmareExpertEnv
 from scripts.flightmare_bc.mission import LOOKAHEAD_GATES, MISSION_DIM, encode_mission, gates_to_views
 from src.core.registry import register
 from src.robotics.flightmare_autonomy_fsw.controllers import (
     BaseCTBRController,
+    BaseMotorController,
     WaypointLQRController,
 )
-from src.robotics.flightmare_autonomy_fsw.gates import StrictGateTracker, gate_frame
+from src.robotics.flightmare_autonomy_fsw.gates import (
+    StrictGateTracker,
+    gate_frame,
+    gate_half_extents,
+    gate_offsets,
+    signed_gate_distance,
+)
 from src.robotics.flightmare_autonomy_fsw.messages import PlannerOutput, VehicleState
 from src.robotics.flightmare_autonomy_fsw.nodes import CourseConfig
 from src.robotics.rewards import get_reward_function
@@ -42,6 +50,9 @@ class FlightmareNormStats:
     mission_std: np.ndarray | None
     action_mean: np.ndarray
     action_std: np.ndarray
+    action_low: np.ndarray | None = None
+    action_high: np.ndarray | None = None
+    action_normalization: str = "standard"
     include_mission: bool = True
     normalize_state: bool = True
     normalize_mission: bool = True
@@ -56,10 +67,13 @@ class FlightmareNormStats:
         normalize_state: bool = True,
         normalize_mission: bool = True,
         normalize_action: bool = True,
+        action_normalization: str = "auto",
     ) -> "FlightmareNormStats":
         stats = np.load(path)
         mission_mean = stats["mission_mean"].astype(np.float32) if "mission_mean" in stats.files else None
         mission_std = stats["mission_std"].astype(np.float32) if "mission_std" in stats.files else None
+        mode = stats_mode(stats, default="standard") if action_normalization == "auto" else str(action_normalization)
+        low, high = action_bounds(action_type, stats)
         return cls(
             state_mean=stats["state_mean"].astype(np.float32),
             state_std=stats["state_std"].astype(np.float32),
@@ -67,6 +81,9 @@ class FlightmareNormStats:
             mission_std=mission_std,
             action_mean=stats[f"{action_type}_mean"].astype(np.float32),
             action_std=stats[f"{action_type}_std"].astype(np.float32),
+            action_low=low,
+            action_high=high,
+            action_normalization=mode,
             include_mission=include_mission,
             normalize_state=normalize_state,
             normalize_mission=normalize_mission and include_mission,
@@ -95,7 +112,14 @@ class FlightmareNormStats:
     def denormalize_action(self, action: np.ndarray) -> np.ndarray:
         action = np.asarray(action, dtype=np.float32)
         if self.normalize_action:
-            action = action * self.action_std + self.action_mean
+            if self.action_normalization == "bounds":
+                low = self.action_low
+                high = self.action_high
+                if low is None or high is None:
+                    raise RuntimeError("Bounds action normalization selected but action bounds are missing.")
+                action = low + 0.5 * (action + 1.0) * np.maximum(high - low, 1e-6)
+            else:
+                action = action * self.action_std + self.action_mean
         return action.astype(np.float32)
 
 
@@ -107,6 +131,7 @@ class FlightmareRacingEnvConfig:
     normalize_state: bool = True
     normalize_mission: bool = True
     normalize_action: bool = True
+    action_normalization: str = "auto"
     control_hz: float = 100.0
     horizon: int = 1500
     scene: str = "industrial"
@@ -124,6 +149,8 @@ class FlightmareRacingEnvConfig:
     reward_kwargs: dict[str, Any] = field(default_factory=dict)
     max_body_rate: float = 8.0
     max_waypoint_speed: float = 15.0
+    max_collective_thrust_g: float = 4.0
+    action_clip: float = 5.0
 
 
 class FlightmareRacingEnv(gymnasium.Env):
@@ -135,6 +162,7 @@ class FlightmareRacingEnv(gymnasium.Env):
         super().__init__()
         self.cfg = cfg
         self.params = QuadParams()
+        self.params.max_collective_thrust = float(cfg.max_collective_thrust_g) * self.params.mass * self.params.g
         self.dt = 1.0 / float(cfg.control_hz)
         self.rng = np.random.default_rng(cfg.seed)
         self.norm = FlightmareNormStats.load(
@@ -144,6 +172,7 @@ class FlightmareRacingEnv(gymnasium.Env):
             normalize_state=cfg.normalize_state,
             normalize_mission=cfg.normalize_mission,
             normalize_action=cfg.normalize_action,
+            action_normalization=cfg.action_normalization,
         )
         self.reward_fn = get_reward_function(cfg.reward_fn)
         self.env = FlightmareExpertEnv(
@@ -159,12 +188,18 @@ class FlightmareRacingEnv(gymnasium.Env):
         )
         self.ctbr_controller = BaseCTBRController(params=self.params, max_body_rate=cfg.max_body_rate)
         self.waypoint_controller = WaypointLQRController(params=self.params, max_speed=cfg.max_waypoint_speed)
+        self.motor_controller = BaseMotorController(params=self.params)
 
         self.observation_space = spaces.Dict({
             "state": spaces.Box(-np.inf, np.inf, shape=(self.norm.state_dim,), dtype=np.float32),
             "images": spaces.Dict({}),
         })
-        self.action_space = spaces.Box(-5.0, 5.0, shape=(self.norm.action_dim,), dtype=np.float32)
+        self.action_space = spaces.Box(
+            -float(cfg.action_clip),
+            float(cfg.action_clip),
+            shape=(self.norm.action_dim,),
+            dtype=np.float32,
+        )
 
         self._step_count = 0
         self._episode_id = 0
@@ -228,8 +263,19 @@ class FlightmareRacingEnv(gymnasium.Env):
                 current_gate_index=self._strict_tracker.current_index,
             )
             command = self.waypoint_controller.compute(self._vehicle_state(), planner)
+        elif self.cfg.action_type == "motor":
+            planner = PlannerOutput(
+                t=self._step_count * self.dt,
+                step=self._step_count,
+                action_type="motor",
+                action=raw_action,
+                current_gate_index=self._strict_tracker.current_index,
+            )
+            command = self.motor_controller.compute(planner)
         else:
             raise ValueError(f"Unsupported Flightmare action_type={self.cfg.action_type!r}")
+        if command.source_action_type == "motor":
+            return self.env.step_motor(command.motor), command
         return self.env.step_ctbr(command.thrust_newton, command.body_rates), command
 
     def _crash_reason(self) -> str | None:
@@ -281,13 +327,28 @@ class FlightmareRacingEnv(gymnasium.Env):
         if self._obs is None:
             raise RuntimeError("Call reset() before step().")
 
-        action_norm = np.clip(np.asarray(action, dtype=np.float32), -5.0, 5.0)
+        action_norm = np.clip(
+            np.asarray(action, dtype=np.float32),
+            -float(self.cfg.action_clip),
+            float(self.cfg.action_clip),
+        )
         raw_action = self.norm.denormalize_action(action_norm)
         target_center = self._target_center_before_step()
         prev_pos = self._obs.pos.copy()
         prev_dist = float(np.linalg.norm(prev_pos - target_center))
         segment_progress = self._strict_tracker.segment_progress(prev_pos, prev_pos)
         alignment = self._alignment_to_gate(prev_pos, self._obs.quat, target_center)
+        gate_signed_distance = 0.0
+        gate_lateral_norm = 0.0
+        gate_vertical_norm = 0.0
+        if self._gates and not self._strict_tracker.completed:
+            idx = self._strict_tracker.current_index
+            target_gate = self._gates[idx]
+            gate_signed_distance = signed_gate_distance(prev_pos, target_gate)
+            lateral_m, vertical_m = gate_offsets(prev_pos, target_gate)
+            half_w, half_h = gate_half_extents(target_gate, vehicle_radius=self.cfg.gate_vehicle_radius)
+            gate_lateral_norm = float(lateral_m / max(half_w, 1e-6))
+            gate_vertical_norm = float(vertical_m / max(half_h, 1e-6))
 
         self._obs, command = self._apply_action(raw_action)
         self._step_count += 1
@@ -329,11 +390,15 @@ class FlightmareRacingEnv(gymnasium.Env):
             "distance_progress_m": float(distance_progress),
             "segment_progress_m": float(segment_progress),
             "gate_alignment": float(alignment),
+            "gate_signed_distance_m": float(gate_signed_distance),
+            "gate_lateral_norm": float(gate_lateral_norm),
+            "gate_vertical_norm": float(gate_vertical_norm),
             "crash": crash,
             "crash_reason": crash_reason,
             "raw_action": raw_action.astype(np.float32),
             "action_norm": action_norm.astype(np.float32),
             "ctbr_command": command.ctbr.astype(np.float32),
+            "motor_command": command.motor.astype(np.float32),
             "step": self._step_count,
             "dt": self.dt,
             "speed_mps": float(np.linalg.norm(self._obs.vel)),
@@ -393,6 +458,16 @@ class FlightmareVecEnv:
 
 def build_flightmare_env_config(**kwargs) -> FlightmareRacingEnvConfig:
     course_kwargs = kwargs.pop("course", {}) or {}
+    if "course_mode" in kwargs:
+        course_kwargs["course_mode"] = kwargs.pop("course_mode")
+    if "gate_layout" in kwargs:
+        course_kwargs["gate_layout"] = kwargs.pop("gate_layout")
+    if "random_start_gate" in kwargs:
+        course_kwargs["random_start_gate"] = kwargs.pop("random_start_gate")
+    if "fixed_gate_pos_noise" in kwargs:
+        course_kwargs["fixed_gate_pos_noise"] = kwargs.pop("fixed_gate_pos_noise")
+    if "fixed_gate_yaw_noise" in kwargs:
+        course_kwargs["fixed_gate_yaw_noise"] = kwargs.pop("fixed_gate_yaw_noise")
     if "gate_spacing_range" in kwargs:
         course_kwargs["gate_spacing_range"] = kwargs.pop("gate_spacing_range")
     if "gate_lateral_jitter" in kwargs:

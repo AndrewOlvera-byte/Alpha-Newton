@@ -25,6 +25,7 @@ from src.core.registry import build
 from src.robotics.flightmare_autonomy_fsw.controllers import (
     BaseAutonomyController,
     BaseCTBRController,
+    BaseMotorController,
     WaypointLQRController,
 )
 from src.robotics.flightmare_autonomy_fsw.graph import FlightmareAutonomyGraph
@@ -67,12 +68,14 @@ def _infer_action_type(cfg: Config) -> str:
         arch_action = "waypoint"
     elif "ctbr" in arch_type:
         arch_action = "ctbr"
+    elif "motor" in arch_type:
+        arch_action = "motor"
 
     action_type = data_action or arch_action
-    if action_type not in {"waypoint", "ctbr"}:
+    if action_type not in {"waypoint", "ctbr", "motor"}:
         raise ValueError(
             "Could not infer Flightmare action type. Set data.action_type to "
-            "'waypoint' or 'ctbr', or use an architecture type containing that token."
+            "'waypoint', 'ctbr', or 'motor', or use an architecture type containing that token."
         )
     if arch_action is not None and data_action is not None and arch_action != data_action:
         raise ValueError(
@@ -117,6 +120,17 @@ def _device(arg: str) -> torch.device:
     return torch.device(arg)
 
 
+def _ppo_cfg(cfg: Config) -> dict:
+    return dict(((cfg.robotics or {}).get("ppo", {}) or {}))
+
+
+def _arg_or_ppo(args: argparse.Namespace, attr: str, ppo_cfg: dict, ppo_key: str | None = None, default=None):
+    value = getattr(args, attr)
+    if value is not None:
+        return value
+    return ppo_cfg.get(ppo_key or attr, default)
+
+
 def _print_episode(result) -> None:
     time_str = f"{result.completion_time_s:.2f}s" if result.completion_time_s is not None else "-"
     print(
@@ -138,35 +152,44 @@ def main() -> None:
     config_group.add_argument("--config", type=str, help="Direct path to the training YAML config")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Path to model.pt. Defaults to <training.output_dir>/best/model.pt")
     parser.add_argument("--episodes", type=int, default=20)
-    parser.add_argument("--max-steps", type=int, default=1500)
-    parser.add_argument("--control-hz", type=float, default=100.0)
+    parser.add_argument("--max-steps", type=int, default=None, help="Defaults to robotics.ppo.horizon, then 1500.")
+    parser.add_argument("--control-hz", type=float, default=None, help="Defaults to robotics.ppo.control_hz, then 100.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--scene", type=str, default="industrial")
+    parser.add_argument("--scene", type=str, default=None, help="Defaults to robotics.ppo.scene, then industrial.")
+    parser.add_argument("--backend", choices=["auto", "numpy", "visual", "flightgym"], default=None,
+                        help="Defaults to robotics.ppo.backend, then auto.")
     parser.add_argument("--render", action="store_true", help="Connect/render Unity. Default is headless state-only evaluation.")
     parser.add_argument("--fail-on-fallback", action="store_true", help="Fail if Flightmare bindings are unavailable and numpy fallback is used.")
     parser.add_argument("--no-plot", action="store_true")
 
-    parser.add_argument("--num-gates", type=int, default=8)
-    parser.add_argument("--gate-spacing-range", nargs=2, type=float, default=[4.0, 9.0])
-    parser.add_argument("--gate-lateral-jitter", type=float, default=2.0)
-    parser.add_argument("--gate-z-range", nargs=2, type=float, default=[1.5, 4.0])
-    parser.add_argument("--gate-yaw-step", type=float, default=0.7)
-    parser.add_argument("--gate-yaw-noise", type=float, default=0.25)
-    parser.add_argument("--gate-size", type=float, default=1.0)
-    parser.add_argument("--z-min", type=float, default=1.0)
+    parser.add_argument("--num-gates", type=int, default=None)
+    parser.add_argument("--course-mode", choices=["gates", "swift_like", "fixed_gates"], default=None)
+    parser.add_argument("--gate-layout", type=str, default=None)
+    parser.add_argument("--random-start-gate", action="store_true", default=None)
+    parser.add_argument("--fixed-gate-pos-noise", type=float, default=None)
+    parser.add_argument("--fixed-gate-yaw-noise", type=float, default=None)
+    parser.add_argument("--gate-spacing-range", nargs=2, type=float, default=None)
+    parser.add_argument("--gate-lateral-jitter", type=float, default=None)
+    parser.add_argument("--gate-z-range", nargs=2, type=float, default=None)
+    parser.add_argument("--gate-yaw-step", type=float, default=None)
+    parser.add_argument("--gate-yaw-noise", type=float, default=None)
+    parser.add_argument("--gate-size", type=float, default=None)
+    parser.add_argument("--z-min", type=float, default=None)
 
-    parser.add_argument("--max-body-rate", type=float, default=8.0)
-    parser.add_argument("--max-waypoint-speed", type=float, default=15.0)
-    parser.add_argument("--max-world-radius", type=float, default=200.0)
-    parser.add_argument("--min-z", type=float, default=-0.25)
-    parser.add_argument("--gate-vehicle-radius", type=float, default=0.15)
-    parser.add_argument("--allow-gate-miss", action="store_true",
+    parser.add_argument("--max-body-rate", type=float, default=None)
+    parser.add_argument("--max-waypoint-speed", type=float, default=None)
+    parser.add_argument("--max-collective-thrust-g", type=float, default=None)
+    parser.add_argument("--max-world-radius", type=float, default=None)
+    parser.add_argument("--min-z", type=float, default=None)
+    parser.add_argument("--gate-vehicle-radius", type=float, default=None)
+    parser.add_argument("--allow-gate-miss", action="store_true", default=None,
                         help="Do not terminate when the current gate plane is crossed outside the aperture.")
     args = parser.parse_args()
 
     cfg, config_label = _load_config(args)
+    ppo_cfg = _ppo_cfg(cfg)
     action_type = _infer_action_type(cfg)
     device = _device(args.device)
     checkpoint = args.checkpoint or _default_checkpoint(cfg)
@@ -189,6 +212,49 @@ def main() -> None:
     print(f"[Ckpt]   {checkpoint}")
     print(f"[Stats]  {norm_stats}")
 
+    max_steps = int(_arg_or_ppo(args, "max_steps", ppo_cfg, "horizon", 1500))
+    control_hz = float(_arg_or_ppo(args, "control_hz", ppo_cfg, "control_hz", 100.0))
+    scene = str(_arg_or_ppo(args, "scene", ppo_cfg, "scene", "industrial"))
+    backend = str(_arg_or_ppo(args, "backend", ppo_cfg, "backend", "auto"))
+    render = bool(args.render or ppo_cfg.get("render", False))
+    course_mode = str(_arg_or_ppo(args, "course_mode", ppo_cfg, "course_mode", "gates"))
+    gate_layout = _arg_or_ppo(args, "gate_layout", ppo_cfg, "gate_layout", None)
+    random_start_gate = (
+        bool(args.random_start_gate)
+        if args.random_start_gate is not None
+        else bool(ppo_cfg.get("random_start_gate", False))
+    )
+    fixed_gate_pos_noise = float(_arg_or_ppo(args, "fixed_gate_pos_noise", ppo_cfg, "fixed_gate_pos_noise", 0.0))
+    fixed_gate_yaw_noise = float(_arg_or_ppo(args, "fixed_gate_yaw_noise", ppo_cfg, "fixed_gate_yaw_noise", 0.0))
+    num_gates = int(_arg_or_ppo(args, "num_gates", ppo_cfg, "num_gates", 8))
+    gate_spacing_range = list(_arg_or_ppo(args, "gate_spacing_range", ppo_cfg, "gate_spacing_range", [4.0, 9.0]))
+    gate_lateral_jitter = float(_arg_or_ppo(args, "gate_lateral_jitter", ppo_cfg, "gate_lateral_jitter", 2.0))
+    gate_z_range = list(_arg_or_ppo(args, "gate_z_range", ppo_cfg, "gate_z_range", [1.5, 4.0]))
+    gate_yaw_step = float(_arg_or_ppo(args, "gate_yaw_step", ppo_cfg, "gate_yaw_step", 0.7))
+    gate_yaw_noise = float(_arg_or_ppo(args, "gate_yaw_noise", ppo_cfg, "gate_yaw_noise", 0.25))
+    gate_size = float(_arg_or_ppo(args, "gate_size", ppo_cfg, "gate_size", 1.0))
+    z_min = float(_arg_or_ppo(args, "z_min", ppo_cfg, "z_min", 1.0))
+    max_body_rate = float(_arg_or_ppo(args, "max_body_rate", ppo_cfg, "max_body_rate", 8.0))
+    max_waypoint_speed = float(_arg_or_ppo(args, "max_waypoint_speed", ppo_cfg, "max_waypoint_speed", 15.0))
+    max_collective_thrust_g = float(_arg_or_ppo(args, "max_collective_thrust_g", ppo_cfg, "max_collective_thrust_g", 4.0))
+    max_world_radius = float(_arg_or_ppo(args, "max_world_radius", ppo_cfg, "max_world_radius", 200.0))
+    min_z = float(_arg_or_ppo(args, "min_z", ppo_cfg, "min_z", -0.25))
+    gate_vehicle_radius = float(_arg_or_ppo(args, "gate_vehicle_radius", ppo_cfg, "gate_vehicle_radius", 0.15))
+    terminate_on_gate_miss = (
+        not args.allow_gate_miss
+        if args.allow_gate_miss is not None
+        else bool(ppo_cfg.get("terminate_on_gate_miss", True))
+    )
+
+    print(
+        "[Eval Setup] "
+        f"backend={backend} course={course_mode} gates={num_gates} spacing={gate_spacing_range} "
+        f"yaw_step={gate_yaw_step} gate_size={gate_size} "
+        f"max_waypoint_speed={max_waypoint_speed} max_body_rate={max_body_rate} "
+        f"max_thrust={max_collective_thrust_g:.1f}g",
+        flush=True,
+    )
+
     model = _build_model(cfg, checkpoint, device)
     arch_cfg = (cfg.robotics or {}).get("architecture", {})
     include_mission = bool((cfg.data or {}).get("include_mission", True))
@@ -205,49 +271,63 @@ def main() -> None:
     )
 
     params = QuadParams()
+    params.max_collective_thrust = max_collective_thrust_g * params.mass * params.g
     course_config = CourseConfig(
-        num_gates=args.num_gates,
-        z_min=args.z_min,
-        gate_spacing_range=tuple(args.gate_spacing_range),
-        gate_lateral_jitter=args.gate_lateral_jitter,
-        gate_z_range=tuple(args.gate_z_range),
-        gate_yaw_step=args.gate_yaw_step,
-        gate_yaw_noise=args.gate_yaw_noise,
-        gate_size=args.gate_size,
+        course_mode=course_mode,
+        num_gates=num_gates,
+        z_min=z_min,
+        gate_spacing_range=tuple(gate_spacing_range),
+        gate_lateral_jitter=gate_lateral_jitter,
+        gate_z_range=tuple(gate_z_range),
+        gate_yaw_step=gate_yaw_step,
+        gate_yaw_noise=gate_yaw_noise,
+        gate_size=gate_size,
+        gate_layout=gate_layout,
+        random_start_gate=random_start_gate,
+        fixed_gate_pos_noise=fixed_gate_pos_noise,
+        fixed_gate_yaw_noise=fixed_gate_yaw_noise,
     )
     state_node = FlightmareStateNode(
-        control_hz=args.control_hz,
+        control_hz=control_hz,
         course_config=course_config,
         params=params,
-        scene=args.scene,
-        render=args.render,
+        scene=scene,
+        render=render,
         seed=args.seed,
+        backend=backend,
     )
     if state_node.using_fallback:
-        msg = (
-            "[Eval] WARNING: Flightmare bindings unavailable, using numpy fallback. "
-            "This is useful for pipeline smoke tests, not authoritative racing metrics."
-        )
-        if args.fail_on_fallback:
-            state_node.close()
-            raise RuntimeError(msg)
+        if backend == "numpy":
+            msg = (
+                "[Eval] Using configured numpy backend. This matches numpy-backend PPO "
+                "rollouts but is not a real Flightmare/Unity dynamics validation."
+            )
+        else:
+            msg = (
+                "[Eval] WARNING: Flightmare bindings unavailable, using numpy fallback. "
+                "This is useful for pipeline smoke tests, not authoritative racing metrics."
+            )
+            if args.fail_on_fallback:
+                state_node.close()
+                raise RuntimeError(msg)
         print(msg)
 
     controller = BaseAutonomyController(
         params=params,
-        waypoint_controller=WaypointLQRController(params=params, max_speed=args.max_waypoint_speed),
-        ctbr_controller=BaseCTBRController(params=params, max_body_rate=args.max_body_rate),
+        waypoint_controller=WaypointLQRController(params=params, max_speed=max_waypoint_speed),
+        ctbr_controller=BaseCTBRController(params=params, max_body_rate=max_body_rate),
+        motor_controller=BaseMotorController(params=params),
     )
     graph = FlightmareAutonomyGraph(
         state_node=state_node,
         mission_node=MissionWorldModelNode(mission_wrapper),
         planner_node=PolicyPlannerNode(mission_wrapper, action_type=action_type),
         controller_node=BaseControllerNode(controller),
-        max_steps=args.max_steps,
-        max_world_radius=args.max_world_radius,
-        min_z=args.min_z,
-        gate_vehicle_radius=args.gate_vehicle_radius,
-        terminate_on_gate_miss=not args.allow_gate_miss,
+        max_steps=max_steps,
+        max_world_radius=max_world_radius,
+        min_z=min_z,
+        gate_vehicle_radius=gate_vehicle_radius,
+        terminate_on_gate_miss=terminate_on_gate_miss,
     )
 
     rng = np.random.default_rng(args.seed)
@@ -268,19 +348,28 @@ def main() -> None:
         "run_name": run_name,
         "checkpoint": str(checkpoint),
         "action_type": action_type,
-        "control_hz": args.control_hz,
-        "max_steps": args.max_steps,
+        "backend": backend,
+        "control_hz": control_hz,
+        "max_steps": max_steps,
+        "max_waypoint_speed": max_waypoint_speed,
+        "max_body_rate": max_body_rate,
+        "max_collective_thrust_g": max_collective_thrust_g,
         "seed": args.seed,
         "course": {
-            "num_gates": args.num_gates,
-            "gate_spacing_range": args.gate_spacing_range,
-            "gate_lateral_jitter": args.gate_lateral_jitter,
-            "gate_z_range": args.gate_z_range,
-            "gate_yaw_step": args.gate_yaw_step,
-            "gate_yaw_noise": args.gate_yaw_noise,
-            "gate_size": args.gate_size,
-            "gate_vehicle_radius": args.gate_vehicle_radius,
-            "strict_gate_aperture": not args.allow_gate_miss,
+            "course_mode": course_mode,
+            "num_gates": num_gates,
+            "gate_layout": gate_layout,
+            "random_start_gate": random_start_gate,
+            "fixed_gate_pos_noise": fixed_gate_pos_noise,
+            "fixed_gate_yaw_noise": fixed_gate_yaw_noise,
+            "gate_spacing_range": gate_spacing_range,
+            "gate_lateral_jitter": gate_lateral_jitter,
+            "gate_z_range": gate_z_range,
+            "gate_yaw_step": gate_yaw_step,
+            "gate_yaw_noise": gate_yaw_noise,
+            "gate_size": gate_size,
+            "gate_vehicle_radius": gate_vehicle_radius,
+            "strict_gate_aperture": terminate_on_gate_miss,
         },
     }
     write_stats_json(results, stats_path, extra=extra)

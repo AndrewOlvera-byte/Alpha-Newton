@@ -8,7 +8,7 @@ import numpy as np
 from scripts.flightmare_bc.expert_env import GateSpec, StepResult
 
 
-ActionType = Literal["ctbr", "waypoint"]
+ActionType = Literal["ctbr", "waypoint", "motor"]
 
 
 @dataclass
@@ -72,7 +72,7 @@ class PlannerOutput:
 
 @dataclass
 class ControlCommand:
-    """CTBR command consumed by the Flightmare actuator interface."""
+    """Command consumed by the Flightmare actuator interface."""
 
     t: float
     step: int
@@ -81,6 +81,7 @@ class ControlCommand:
     thrust_normalized: float
     source_action_type: ActionType
     planner_action: np.ndarray
+    motor_normalized: np.ndarray | None = None
 
     @property
     def ctbr(self) -> np.ndarray:
@@ -93,3 +94,9 @@ class ControlCommand:
             ],
             dtype=np.float32,
         )
+
+    @property
+    def motor(self) -> np.ndarray:
+        if self.motor_normalized is not None:
+            return np.asarray(self.motor_normalized, dtype=np.float32)
+        return np.zeros(4, dtype=np.float32)

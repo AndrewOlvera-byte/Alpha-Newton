@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -122,9 +123,16 @@ def collect_flightmare_rollouts(
     ep_lengths: list[int] = []
     successes: list[bool] = []
     gate_completion: list[float] = []
+    gate_passes = 0
     gate_misses = 0
     crash_count = 0
     max_speed = 0.0
+    speed_sum = 0.0
+    speed_count = 0
+    reward_sum = 0.0
+    reward_sq_sum = 0.0
+    reward_min = float("inf")
+    reward_max = float("-inf")
 
     t0 = time.time()
     amp = torch.amp.autocast(
@@ -143,6 +151,10 @@ def collect_flightmare_rollouts(
         dones = np.logical_or(terms, truncs)
         buffer.insert(step, batch, actions, log_probs, values, rewards, dones)
 
+        reward_sum += float(np.sum(rewards))
+        reward_sq_sum += float(np.sum(np.square(rewards)))
+        reward_min = min(reward_min, float(np.min(rewards)))
+        reward_max = max(reward_max, float(np.max(rewards)))
         current_rewards += rewards
         current_lengths += 1
 
@@ -153,7 +165,12 @@ def collect_flightmare_rollouts(
             reset_obs_by_env = dict(zip(done_indices, reset_obs))
 
         for i, info in enumerate(infos):
-            max_speed = max(max_speed, float(info.get("speed_mps", 0.0)))
+            speed = float(info.get("speed_mps", 0.0))
+            max_speed = max(max_speed, speed)
+            speed_sum += speed
+            speed_count += 1
+            if info.get("gate_passed", False):
+                gate_passes += 1
             if info.get("gate_missed", False):
                 gate_misses += 1
             if info.get("crash", False):
@@ -176,15 +193,21 @@ def collect_flightmare_rollouts(
     batch = _stack_obs(obs_list, prev_actions, device)
     with torch.no_grad(), amp:
         _, _, last_values = model.act(batch)
-    buffer.compute_advantages(last_values, gamma=1.0, gae_lambda=1.0)  # overwritten by trainer
 
     elapsed = time.time() - t0
     rewards_arr = np.asarray(ep_rewards, dtype=np.float32) if ep_rewards else np.zeros(1, dtype=np.float32)
     lengths_arr = np.asarray(ep_lengths, dtype=np.float32) if ep_lengths else np.zeros(1, dtype=np.float32)
+    n_samples = max(1, n_steps * n_envs)
+    step_reward_mean = reward_sum / n_samples
+    step_reward_var = max(0.0, reward_sq_sum / n_samples - step_reward_mean ** 2)
     stats = {
         "last_values": last_values,
         "rollout_time": elapsed,
         "rollout_fps": float(n_steps * n_envs / max(elapsed, 1e-6)),
+        "step_reward_mean": float(step_reward_mean),
+        "step_reward_std": float(np.sqrt(step_reward_var)),
+        "step_reward_min": float(reward_min if np.isfinite(reward_min) else 0.0),
+        "step_reward_max": float(reward_max if np.isfinite(reward_max) else 0.0),
         "mean_reward": float(rewards_arr.mean()) if ep_rewards else 0.0,
         "reward_std": float(rewards_arr.std()) if ep_rewards else 0.0,
         "reward_min": float(rewards_arr.min()) if ep_rewards else 0.0,
@@ -193,8 +216,10 @@ def collect_flightmare_rollouts(
         "success_rate": float(np.mean(successes)) if successes else 0.0,
         "mean_gate_completion": float(np.mean(gate_completion)) if gate_completion else 0.0,
         "n_episodes": len(ep_rewards),
+        "gate_passes": int(gate_passes),
         "gate_misses": int(gate_misses),
         "crashes": int(crash_count),
+        "mean_speed_mps": float(speed_sum / max(1, speed_count)),
         "max_speed_mps": float(max_speed),
     }
     return obs_list, prev_actions, stats
@@ -230,11 +255,28 @@ class FlightmarePPOTrainer:
         self.max_iterations = int(ppo.get("max_iterations", 1000))
         self.actor_lr = float(ppo.get("actor_lr", 3e-5))
         self.critic_lr = float(ppo.get("critic_lr", 1e-4))
+        target_kl = ppo.get("target_kl")
+        self.target_kl = float(target_kl) if target_kl is not None else None
         self.max_grad_norm = float(training_cfg.get("max_grad_norm", 0.5))
         self.use_bf16 = bool(training_cfg.get("bf16", True))
         self.output_dir = training_cfg.get("output_dir", "outputs/flightmare_ppo")
         self.logging_steps = int(training_cfg.get("logging_steps", 1))
         self.save_steps = int(training_cfg.get("save_steps", 25) or 0)
+        self.best_steps = int(training_cfg.get("best_steps", self.save_steps) or 0)
+        self.selection_metric = str(training_cfg.get("selection_metric", "rollout_score"))
+        default_score_weights = {
+            "success_rate": 1.0,
+            "mean_gate_completion": 0.1,
+            "mean_reward": 0.0,
+            "mean_speed_mps": 0.0,
+        }
+        configured_weights = training_cfg.get("rollout_score_weights", {}) or {}
+        self.rollout_score_weights = {
+            key: float(configured_weights.get(key, value))
+            for key, value in default_score_weights.items()
+        }
+        self.best_score = float("-inf")
+        self.best_iteration = 0
         self.save_total_limit = training_cfg.get("save_total_limit")
         self.save_total_limit = int(self.save_total_limit) if self.save_total_limit else None
         self.save_final = bool(training_cfg.get("save_final", True))
@@ -245,6 +287,15 @@ class FlightmarePPOTrainer:
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision("high")
 
+    def _disable_dropout(self) -> int:
+        """PPO ratios assume the policy evaluated during updates matches rollout collection."""
+        disabled = 0
+        for module in self.model.modules():
+            if isinstance(module, nn.Dropout) and module.p != 0.0:
+                module.p = 0.0
+                disabled += 1
+        return disabled
+
     def _env_kwargs(self) -> dict:
         ppo = self.ppo_cfg
         return {
@@ -254,11 +305,17 @@ class FlightmarePPOTrainer:
             "normalize_state": self.data_cfg.get("normalize_state", True),
             "normalize_mission": self.data_cfg.get("normalize_mission", True),
             "normalize_action": self.data_cfg.get("normalize_action", True),
+            "action_normalization": self.data_cfg.get("action_normalization", "auto"),
             "control_hz": ppo.get("control_hz", 100.0),
             "horizon": ppo.get("horizon", 1500),
             "scene": ppo.get("scene", "industrial"),
             "render": ppo.get("render", False),
             "backend": ppo.get("backend", "auto"),
+            "course_mode": ppo.get("course_mode", "gates"),
+            "gate_layout": ppo.get("gate_layout"),
+            "random_start_gate": ppo.get("random_start_gate", False),
+            "fixed_gate_pos_noise": ppo.get("fixed_gate_pos_noise", 0.0),
+            "fixed_gate_yaw_noise": ppo.get("fixed_gate_yaw_noise", 0.0),
             "num_gates": ppo.get("num_gates", 8),
             "gate_spacing_range": ppo.get("gate_spacing_range", [4.0, 9.0]),
             "gate_lateral_jitter": ppo.get("gate_lateral_jitter", 2.0),
@@ -276,6 +333,11 @@ class FlightmarePPOTrainer:
             "reward_kwargs": ppo.get("reward_kwargs", {}),
             "max_body_rate": ppo.get("max_body_rate", 8.0),
             "max_waypoint_speed": ppo.get("max_waypoint_speed", 15.0),
+            "max_collective_thrust_g": ppo.get("max_collective_thrust_g", 4.0),
+            "action_clip": ppo.get(
+                "action_clip",
+                (self.robotics_cfg.get("architecture", {}) or {}).get("action_clip", 5.0),
+            ),
         }
 
     def _split_params(self):
@@ -286,7 +348,109 @@ class FlightmarePPOTrainer:
         actor_params = [p for p in self.model.parameters() if p.requires_grad and id(p) not in critic_ids]
         return actor_params, critic_params
 
+    def _init_wandb(self) -> None:
+        """Initialize WandB with the same interactive fallback as the BC trainer."""
+        project = self.wandb_cfg.get("project")
+        if not project:
+            print("[Flightmare PPO] No wandb project set - skipping WandB logging.")
+            self._wandb = None
+            return
+
+        mode = self.wandb_cfg.get("mode") or os.environ.get("WANDB_MODE", "").strip()
+        if mode == "disabled":
+            print("[Flightmare PPO] WandB disabled by config/env.")
+            self._wandb = None
+            return
+
+        try:
+            import wandb
+
+            api_key = (
+                os.environ.get("WANDB_API_KEY", "").strip()
+                or (wandb.api.api_key or "")
+            )
+            if not api_key and mode not in {"offline", "dryrun"}:
+                if sys.stdin.isatty():
+                    print("\n[Wandb] No API key found.")
+                    api_key = input(
+                        "[Wandb] Enter WANDB_API_KEY (or press Enter to skip): "
+                    ).strip()
+                    if api_key:
+                        os.environ["WANDB_API_KEY"] = api_key
+                        wandb.login(key=api_key, relogin=True)
+                    else:
+                        print("[Wandb] Skipping wandb logging.\n")
+                        self._wandb = None
+                        return
+                else:
+                    print("[Wandb] No API key and non-interactive session - skipping WandB.")
+                    self._wandb = None
+                    return
+
+            init_kwargs = {
+                "project": project,
+                "entity": self.wandb_cfg.get("entity"),
+                "name": self.wandb_cfg.get("run_name", "flightmare_ppo"),
+                "tags": self.wandb_cfg.get("tags", []),
+                "config": {
+                    "ppo": self.ppo_cfg,
+                    "training": self.training_cfg,
+                    "robotics": self.robotics_cfg,
+                    "data": self.data_cfg,
+                },
+            }
+            if mode:
+                init_kwargs["mode"] = mode
+            wandb.init(**init_kwargs)
+            self._wandb = wandb
+            print(f"[Wandb] Logging to {project}/{wandb.run.name}")
+        except Exception as e:
+            print(f"[Wandb] Init failed: {e}. Continuing without WandB.")
+            self._wandb = None
+
+    def _log(self, metrics: dict[str, Any], step: int) -> None:
+        if getattr(self, "_wandb", None) is not None and self._wandb.run:
+            self._wandb.log(metrics, step=step)
+
+    def _selection_score(self, stats: dict) -> float:
+        if self.selection_metric == "success_rate":
+            return float(stats["success_rate"])
+        if self.selection_metric == "mean_reward":
+            return float(stats["mean_reward"])
+        if self.selection_metric == "gate_completion":
+            return float(stats["mean_gate_completion"])
+        if self.selection_metric != "rollout_score":
+            raise ValueError(
+                "training.selection_metric must be one of "
+                "'rollout_score', 'success_rate', 'mean_reward', or 'gate_completion'."
+            )
+        return float(
+            self.rollout_score_weights["success_rate"] * stats["success_rate"]
+            + self.rollout_score_weights["mean_gate_completion"] * stats["mean_gate_completion"]
+            + self.rollout_score_weights["mean_reward"] * stats["mean_reward"]
+            + self.rollout_score_weights["mean_speed_mps"] * stats["mean_speed_mps"]
+        )
+
+    def _checkpoint_metrics(self, stats: dict, score: float) -> dict[str, float | int]:
+        return {
+            "selection_score": float(score),
+            "success_rate": float(stats["success_rate"]),
+            "mean_gate_completion": float(stats["mean_gate_completion"]),
+            "mean_reward": float(stats["mean_reward"]),
+            "step_reward_mean": float(stats["step_reward_mean"]),
+            "mean_length": float(stats["mean_length"]),
+            "n_episodes": int(stats["n_episodes"]),
+            "gate_passes": int(stats["gate_passes"]),
+            "gate_misses": int(stats["gate_misses"]),
+            "crashes": int(stats["crashes"]),
+            "mean_speed_mps": float(stats["mean_speed_mps"]),
+            "max_speed_mps": float(stats["max_speed_mps"]),
+        }
+
     def smoke_test(self) -> None:
+        disabled_dropout = self._disable_dropout()
+        if disabled_dropout:
+            print(f"[Flightmare PPO] Disabled {disabled_dropout} dropout layer(s) for PPO.")
         vec_env = make_flightmare_vec_env(n_envs=min(2, self.n_envs), seed=0, **self._env_kwargs())
         try:
             obs_list, infos = vec_env.reset(seed=0)
@@ -322,6 +486,10 @@ class FlightmarePPOTrainer:
 
     def train(self):
         os.makedirs(self.output_dir, exist_ok=True)
+        disabled_dropout = self._disable_dropout()
+        if disabled_dropout:
+            print(f"[Flightmare PPO] Disabled {disabled_dropout} dropout layer(s) for PPO.")
+        self._init_wandb()
         model = self.model.to(self.device)
         model.train()
 
@@ -330,28 +498,6 @@ class FlightmarePPOTrainer:
             {"params": actor_params, "lr": self.actor_lr, "weight_decay": 1e-4},
             {"params": critic_params, "lr": self.critic_lr, "weight_decay": 1e-4},
         ])
-
-        run = None
-        if self.wandb_cfg:
-            try:
-                import wandb
-                mode = self.wandb_cfg.get("mode") or os.environ.get("WANDB_MODE", "").strip()
-                api_key = os.environ.get("WANDB_API_KEY", "").strip()
-                if mode == "disabled" or (not api_key and mode not in {"offline", "dryrun"}):
-                    print("[Flightmare PPO] WandB disabled/skipped.")
-                else:
-                    init_kwargs = {
-                        "project": self.wandb_cfg.get("project", "flightmare-ppo"),
-                        "entity": self.wandb_cfg.get("entity"),
-                        "name": self.wandb_cfg.get("run_name", "flightmare_ppo"),
-                        "tags": self.wandb_cfg.get("tags", []),
-                        "config": {"ppo": self.ppo_cfg, "training": self.training_cfg},
-                    }
-                    if mode:
-                        init_kwargs["mode"] = mode
-                    run = wandb.init(**init_kwargs)
-            except Exception as e:
-                print(f"[Flightmare PPO] WandB init failed: {e}")
 
         env_kwargs = self._env_kwargs()
         vec_env = make_flightmare_vec_env(n_envs=self.n_envs, seed=int(self.ppo_cfg.get("seed", 0)), **env_kwargs)
@@ -364,12 +510,15 @@ class FlightmarePPOTrainer:
         prev_actions = np.zeros((self.n_envs, action_dim), dtype=np.float32)
         buffer = FlightmareRolloutBuffer(self.n_steps, self.n_envs, state_dim, action_dim, self.device)
 
-        best_score = -1.0
         t_start = time.time()
         print("\n[Flightmare PPO] Starting training")
         print(f"  Envs: {self.n_envs} | Steps/rollout: {self.n_steps} | Epochs: {self.ppo_epochs}")
         print(f"  Action: {env_kwargs['action_type']} | Reward: {env_kwargs['reward_fn']}")
         print(f"  Actor LR: {self.actor_lr} | Critic LR: {self.critic_lr}")
+        print(
+            "  Best selection: "
+            f"{self.selection_metric} every {self.best_steps or 'disabled'} iteration(s)"
+        )
         print(f"  Max iterations: {self.max_iterations} | Device: {self.device}\n")
 
         amp = torch.amp.autocast(
@@ -395,9 +544,26 @@ class FlightmarePPOTrainer:
                 buffer.compute_advantages(stats["last_values"], self.gamma, self.gae_lambda)
                 buffer.normalize_advantages()
 
+                selection_score = self._selection_score(stats)
+                is_new_best = False
+                if self.best_steps > 0 and iteration % self.best_steps == 0:
+                    if selection_score > self.best_score:
+                        self.best_score = selection_score
+                        self.best_iteration = iteration
+                        is_new_best = True
+                        self._save_checkpoint(
+                            model,
+                            optimizer,
+                            iteration,
+                            is_best=True,
+                            metrics=self._checkpoint_metrics(stats, selection_score),
+                            best_score=self.best_score,
+                        )
+
                 model.train()
                 pol_loss_sum = val_loss_sum = ent_sum = kl_sum = clip_sum = grad_sum = 0.0
                 n_updates = 0
+                early_stop = False
                 update_t0 = time.time()
                 for mb in buffer.get_minibatches(self.minibatch_size, self.ppo_epochs):
                     adv = mb["advantages"]
@@ -425,12 +591,14 @@ class FlightmarePPOTrainer:
                     clip_sum += float(clip_frac.item())
                     grad_sum += float(grad_norm)
                     n_updates += 1
+                    if self.target_kl is not None and float(approx_kl.item()) > 1.5 * self.target_kl:
+                        early_stop = True
+                        break
                 update_time = time.time() - update_t0
 
                 if iteration % self.logging_steps == 0:
                     elapsed = time.time() - t_start
                     fps = iteration * self.n_steps * self.n_envs / max(elapsed, 1e-6)
-                    rewards_flat = buffer.rewards.flatten()
                     values_flat = buffer.values.flatten()
                     returns_flat = buffer.returns.flatten()
                     var_returns = returns_flat.var()
@@ -446,54 +614,90 @@ class FlightmarePPOTrainer:
                         "ppo/clip_fraction": clip_sum / max(1, n_updates),
                         "ppo/grad_norm": grad_sum / max(1, n_updates),
                         "ppo/explained_variance": explained_var,
+                        "ppo/early_stop": float(early_stop),
                         "rollout/mean_reward": stats["mean_reward"],
                         "rollout/success_rate": stats["success_rate"],
                         "rollout/mean_gate_completion": stats["mean_gate_completion"],
                         "rollout/n_episodes": stats["n_episodes"],
+                        "rollout/mean_length": stats["mean_length"],
+                        "rollout/gate_passes": stats["gate_passes"],
                         "rollout/gate_misses": stats["gate_misses"],
                         "rollout/crashes": stats["crashes"],
+                        "rollout/mean_speed_mps": stats["mean_speed_mps"],
                         "rollout/max_speed_mps": stats["max_speed_mps"],
-                        "rollout/reward_step_mean": rewards_flat.mean().item(),
-                        "rollout/reward_step_std": rewards_flat.std().item(),
+                        "rollout/reward_step_mean": stats["step_reward_mean"],
+                        "rollout/reward_step_std": stats["step_reward_std"],
+                        "rollout/reward_step_min": stats["step_reward_min"],
+                        "rollout/reward_step_max": stats["step_reward_max"],
                         "time/fps": fps,
                         "time/rollout_fps": stats["rollout_fps"],
                         "time/rollout_time": stats["rollout_time"],
                         "time/update_time": update_time,
+                        "checkpoint/selection_score": selection_score,
+                        "checkpoint/best_score": self.best_score if np.isfinite(self.best_score) else -1.0,
+                        "checkpoint/best_iteration": self.best_iteration,
+                        "checkpoint/is_new_best": float(is_new_best),
                     }
                     print(
                         f"[{iteration}/{self.max_iterations}] "
-                        f"r={stats['mean_reward']:.2f} "
+                        f"ep_r={stats['mean_reward']:.2f} "
+                        f"step_r={stats['step_reward_mean']:+.3f} "
+                        f"eps={stats['n_episodes']} len={stats['mean_length']:.0f} "
                         f"sr={stats['success_rate']:.1%} "
                         f"gc={stats['mean_gate_completion']:.1%} "
-                        f"miss={stats['gate_misses']} crash={stats['crashes']} "
+                        f"pass={stats['gate_passes']} miss={stats['gate_misses']} crash={stats['crashes']} "
+                        f"v={stats['mean_speed_mps']:.1f}/{stats['max_speed_mps']:.1f} "
                         f"pl={pol_loss_sum/max(1,n_updates):.4f} "
                         f"vl={val_loss_sum/max(1,n_updates):.4f} "
                         f"ent={ent_sum/max(1,n_updates):.3f} "
                         f"kl={kl_sum/max(1,n_updates):.4f} "
+                        f"stop={int(early_stop)} "
                         f"ev={explained_var:+.2f} "
                         f"fps={fps:.0f} rfps={stats['rollout_fps']:.0f} "
                         f"[roll={stats['rollout_time']:.1f}s upd={update_time:.1f}s]"
                     )
-                    if run is not None:
-                        run.log(log_dict, step=iteration)
+                    self._log(log_dict, step=iteration)
+                    if is_new_best:
+                        print(
+                            "  [best] "
+                            f"score={selection_score:.3f} "
+                            f"sr={stats['success_rate']:.1%} "
+                            f"gc={stats['mean_gate_completion']:.1%}"
+                        )
 
                 if self.save_steps > 0 and iteration % self.save_steps == 0:
-                    self._save_checkpoint(model, optimizer, iteration)
+                    self._save_checkpoint(
+                        model,
+                        optimizer,
+                        iteration,
+                        metrics=self._checkpoint_metrics(stats, selection_score),
+                        best_score=self.best_score,
+                    )
                     self._prune_checkpoints()
-                    score = stats["success_rate"] + 0.1 * stats["mean_gate_completion"]
-                    if score > best_score:
-                        best_score = score
-                        self._save_checkpoint(model, optimizer, iteration, is_best=True)
-                        print(f"  [best] score={score:.3f} sr={stats['success_rate']:.1%}")
         finally:
             vec_env.close()
 
         if self.save_final:
-            self._save_checkpoint(model, optimizer, self.max_iterations, name="final")
-        if run is not None:
-            run.finish()
+            self._save_checkpoint(
+                model,
+                optimizer,
+                self.max_iterations,
+                name="final",
+                best_score=self.best_score,
+            )
+        if getattr(self, "_wandb", None) is not None and self._wandb.run:
+            self._wandb.finish()
 
-    def _save_checkpoint(self, model: nn.Module, optimizer, iteration: int, is_best: bool = False, name: str | None = None):
+    def _save_checkpoint(
+        self,
+        model: nn.Module,
+        optimizer,
+        iteration: int,
+        is_best: bool = False,
+        name: str | None = None,
+        metrics: dict[str, float | int] | None = None,
+        best_score: float | None = None,
+    ):
         if is_best:
             ckpt_dir = os.path.join(self.output_dir, "best")
         elif name is not None:
@@ -503,8 +707,24 @@ class FlightmarePPOTrainer:
         os.makedirs(ckpt_dir, exist_ok=True)
         torch.save(model.state_dict(), os.path.join(ckpt_dir, "actor_critic.pt"))
         torch.save(model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+        safe_best_score = (
+            float(best_score)
+            if best_score is not None and np.isfinite(best_score)
+            else None
+        )
         with open(os.path.join(ckpt_dir, "training_state.json"), "w") as f:
-            json.dump({"iteration": iteration, "is_best": is_best}, f, indent=2)
+            json.dump(
+                {
+                    "iteration": iteration,
+                    "is_best": is_best,
+                    "selection_metric": self.selection_metric,
+                    "best_score": safe_best_score,
+                    "best_iteration": self.best_iteration,
+                    "metrics": metrics or {},
+                },
+                f,
+                indent=2,
+            )
         if self.training_cfg.get("save_optimizer_state", False):
             torch.save({"optimizer": optimizer.state_dict(), "iteration": iteration}, os.path.join(ckpt_dir, "optimizer.pt"))
         return ckpt_dir

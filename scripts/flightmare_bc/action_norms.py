@@ -13,8 +13,8 @@ ACTION_TYPES = ("waypoint", "ctbr", "motor")
 # speed and prevent the old low-speed BC statistics from becoming a speed cap.
 DEFAULT_ACTION_BOUNDS: dict[str, tuple[np.ndarray, np.ndarray]] = {
     "waypoint": (
-        np.array([-25.0, -25.0, -12.0, 0.0], dtype=np.float32),
-        np.array([25.0, 25.0, 12.0, 35.0], dtype=np.float32),
+        np.array([-50.0, -50.0, -50.0, 0.0], dtype=np.float32),
+        np.array([50.0, 50.0, 50.0, 50.0], dtype=np.float32),
     ),
     "ctbr": (
         np.array([0.0, -12.0, -12.0, -12.0], dtype=np.float32),

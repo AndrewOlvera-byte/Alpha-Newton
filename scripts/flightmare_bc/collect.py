@@ -328,6 +328,7 @@ def collect_one_episode(
             pos=obs.pos, vel=obs.vel, quat=obs.quat,
             pos_des=ref.pos, vel_des=ref.vel, acc_des=ref.acc,
             yaw_des=ref.yaw,
+            omega=obs.omega,
         )
 
         lookahead_pos, speed_now = traj.lookahead(t, lookahead_s)

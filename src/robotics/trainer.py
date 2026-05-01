@@ -1,4 +1,3 @@
-"""Behavioral cloning trainer for robotics visuomotor policies."""
 from __future__ import annotations
 
 import os

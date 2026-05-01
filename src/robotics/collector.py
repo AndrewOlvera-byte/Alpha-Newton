@@ -1,4 +1,3 @@
-"""Rollout storage and collection utilities for on-policy robotics PPO."""
 from __future__ import annotations
 
 import time

@@ -65,6 +65,11 @@ class GeometricGains:
     kp_pos: tuple[float, float, float] = (6.0, 6.0, 8.0)
     kd_pos: tuple[float, float, float] = (4.0, 4.0, 5.0)
     kp_att: tuple[float, float, float] = (8.0, 8.0, 3.0)
+    # Inner-loop body-rate P gains (rad/s -> rad/s^2). Used only to produce
+    # the motor labels: torque = I * kp_rate * (omega_des - omega) + omega x I omega.
+    # Without this loop, motor labels collapse to near-collective (no torque
+    # signal) and motor BC has nothing to learn beyond thrust.
+    kp_rate: tuple[float, float, float] = (28.0, 28.0, 12.0)
 
 
 class GeometricSE3Controller:
@@ -76,6 +81,7 @@ class GeometricSE3Controller:
         self.kp_pos = np.asarray(gains.kp_pos)
         self.kd_pos = np.asarray(gains.kd_pos)
         self.kp_att = np.asarray(gains.kp_att)
+        self.kp_rate = np.asarray(gains.kp_rate)
 
     @property
     def hover_thrust(self) -> float:
@@ -86,6 +92,7 @@ class GeometricSE3Controller:
         pos: np.ndarray, vel: np.ndarray, quat: np.ndarray,
         pos_des: np.ndarray, vel_des: np.ndarray, acc_des: np.ndarray,
         yaw_des: float,
+        omega: np.ndarray | None = None,
     ) -> dict:
         """Return CTBR command and intermediate references.
 
@@ -128,7 +135,8 @@ class GeometricSE3Controller:
         max_T = self.params.max_collective_thrust
         thrust_norm = float(np.clip(thrust_newton / max_T, 0.0, 1.0))
 
-        motor_norm = self._mix_to_motors(thrust_newton, omega_des)
+        omega_actual = np.zeros(3) if omega is None else np.asarray(omega, dtype=np.float64)
+        motor_norm = self._mix_to_motors(thrust_newton, omega_des, omega_actual)
         return {
             "thrust_newton": thrust_newton,
             "thrust_normalized": thrust_norm,
@@ -138,15 +146,26 @@ class GeometricSE3Controller:
             "F_des": F_des,
         }
 
-    def _mix_to_motors(self, thrust_newton: float, omega_des: np.ndarray) -> np.ndarray:
-        """Approximate X-config mixer: T and torques -> per-rotor thrust normalized to [0,1].
+    def _mix_to_motors(
+        self,
+        thrust_newton: float,
+        omega_des: np.ndarray,
+        omega: np.ndarray,
+    ) -> np.ndarray:
+        """X-config mixer: collective thrust + body-rate-loop torques -> per-rotor [0,1].
 
-        We use a body-rate proxy for torque (omega_des * inertia) which is a
-        close-enough approximation when the inner-loop attitude rate tracks
-        omega_des at high bandwidth - good enough for BC labels.
+        The torque is produced by an inner-loop P controller on body-rate error
+        (alpha_des = kp_rate * (omega_des - omega)) plus the gyroscopic term
+        omega x I omega, then tau = I * alpha_des + gyro. Earlier versions used
+        I * omega_des as the torque, which is dimensionally wrong (kg*m^2*rad/s
+        vs N*m) and produced ~1% rotor spread, collapsing motor BC to near-
+        collective output.
         """
-        Ix, Iy, Iz = self.params.inertia
-        tau = np.array([Ix * omega_des[0], Iy * omega_des[1], Iz * omega_des[2]])
+        I = np.asarray(self.params.inertia, dtype=np.float64)
+        omega_err = np.asarray(omega_des, dtype=np.float64) - np.asarray(omega, dtype=np.float64)
+        alpha_des = self.kp_rate * omega_err
+        gyro = np.cross(omega, I * omega)
+        tau = I * alpha_des + gyro
         L = self.params.arm_length
         kT = self.params.k_thrust
         kQ = self.params.k_torque

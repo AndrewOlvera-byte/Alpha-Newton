@@ -488,12 +488,190 @@ def build_flightmare_env_config(**kwargs) -> FlightmareRacingEnvConfig:
     return FlightmareRacingEnvConfig(course=course, **kwargs)
 
 
-def make_flightmare_vec_env(n_envs: int, seed: int = 0, **kwargs) -> FlightmareVecEnv:
-    envs = []
-    for i in range(int(n_envs)):
-        cfg = build_flightmare_env_config(**{**kwargs, "seed": seed + i})
+def _subproc_worker(remote, env_kwargs_list: list[dict], seeds: list[int]) -> None:
+    """Subprocess worker: holds a slice of envs, services step/reset commands.
+
+    Lives at module level so it pickles under the 'spawn' start method.
+    """
+    import os
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    envs: list[FlightmareRacingEnv] = []
+    for kw, seed in zip(env_kwargs_list, seeds):
+        cfg = build_flightmare_env_config(**{**kw, "seed": int(seed)})
         envs.append(FlightmareRacingEnv(cfg))
-    return FlightmareVecEnv(envs)
+    try:
+        while True:
+            cmd, payload = remote.recv()
+            if cmd == "step":
+                actions = payload  # ndarray (m, action_dim)
+                remote.send([env.step(actions[i]) for i, env in enumerate(envs)])
+            elif cmd == "reset":
+                seed = payload
+                remote.send([
+                    env.reset(seed=None if seed is None else int(seed) + i)
+                    for i, env in enumerate(envs)
+                ])
+            elif cmd == "reset_at":
+                local_indices, seed = payload
+                remote.send([
+                    envs[li].reset(seed=None if seed is None else int(seed) + li)
+                    for li in local_indices
+                ])
+            elif cmd == "close":
+                for env in envs:
+                    try:
+                        env.close()
+                    except Exception:
+                        pass
+                remote.close()
+                return
+            else:
+                raise RuntimeError(f"SubprocFlightmareVecEnv: unknown command {cmd!r}")
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+
+class SubprocFlightmareVecEnv:
+    """Multiprocess vector env with the same API as ``FlightmareVecEnv``.
+
+    Each worker holds a contiguous slice of envs and steps them serially.
+    The parent scatters actions, gathers results, and re-orders into the
+    canonical [0..n_envs) layout so the rollout collector's episode logic
+    (``reset_at(done_indices)``) is unchanged.
+    """
+
+    def __init__(self, env_kwargs_list: list[dict], seeds: list[int], n_workers: int):
+        import multiprocessing as mp
+        n = len(env_kwargs_list)
+        n_workers = max(1, min(int(n_workers), n))
+        bins = np.array_split(np.arange(n, dtype=np.int64), n_workers)
+        self._chunks: list[list[int]] = [list(map(int, b)) for b in bins]
+        self._owner: list[tuple[int, int]] = [(-1, -1)] * n
+        for w, idxs in enumerate(self._chunks):
+            for li, gi in enumerate(idxs):
+                self._owner[gi] = (w, li)
+        ctx = mp.get_context("spawn")
+        self._procs = []
+        self._remotes = []
+        for w, idxs in enumerate(self._chunks):
+            sub_kwargs = [env_kwargs_list[i] for i in idxs]
+            sub_seeds = [seeds[i] for i in idxs]
+            parent_conn, child_conn = ctx.Pipe(duplex=True)
+            p = ctx.Process(
+                target=_subproc_worker,
+                args=(child_conn, sub_kwargs, sub_seeds),
+                daemon=True,
+            )
+            p.start()
+            child_conn.close()
+            self._procs.append(p)
+            self._remotes.append(parent_conn)
+        self.n_envs = n
+        self._closed = False
+
+    def reset(self, *, seed: Optional[int] = None):
+        for r in self._remotes:
+            r.send(("reset", seed))
+        all_obs: list = [None] * self.n_envs
+        all_info: list = [None] * self.n_envs
+        for w, r in enumerate(self._remotes):
+            results = r.recv()
+            for li, gi in enumerate(self._chunks[w]):
+                all_obs[gi] = results[li][0]
+                all_info[gi] = results[li][1]
+        return all_obs, all_info
+
+    def reset_at(self, indices: list[int], *, seed: Optional[int] = None):
+        per_worker_local: list[list[int]] = [[] for _ in self._remotes]
+        per_worker_global: list[list[int]] = [[] for _ in self._remotes]
+        for gi in indices:
+            w, li = self._owner[int(gi)]
+            per_worker_local[w].append(li)
+            per_worker_global[w].append(int(gi))
+        active = [w for w, lst in enumerate(per_worker_local) if lst]
+        for w in active:
+            self._remotes[w].send(("reset_at", (per_worker_local[w], seed)))
+        out_obs: list = [None] * len(indices)
+        out_info: list = [None] * len(indices)
+        pos = {int(gi): i for i, gi in enumerate(indices)}
+        for w in active:
+            results = self._remotes[w].recv()
+            for k, gi in enumerate(per_worker_global[w]):
+                p = pos[gi]
+                out_obs[p] = results[k][0]
+                out_info[p] = results[k][1]
+        return out_obs, out_info
+
+    def step(self, actions: np.ndarray):
+        actions = np.asarray(actions)
+        for w, r in enumerate(self._remotes):
+            r.send(("step", actions[self._chunks[w]]))
+        all_obs: list = [None] * self.n_envs
+        all_rew = np.zeros(self.n_envs, dtype=np.float32)
+        all_term = np.zeros(self.n_envs, dtype=bool)
+        all_trunc = np.zeros(self.n_envs, dtype=bool)
+        all_info: list = [None] * self.n_envs
+        for w, r in enumerate(self._remotes):
+            results = r.recv()
+            for li, gi in enumerate(self._chunks[w]):
+                obs, rew, term, trunc, info = results[li]
+                all_obs[gi] = obs
+                all_rew[gi] = float(rew)
+                all_term[gi] = bool(term)
+                all_trunc[gi] = bool(trunc)
+                all_info[gi] = info
+        return all_obs, all_rew, all_term, all_trunc, all_info
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        for r in self._remotes:
+            try:
+                r.send(("close", None))
+            except Exception:
+                pass
+        for p in self._procs:
+            try:
+                p.join(timeout=2.0)
+            except Exception:
+                pass
+            if p.is_alive():
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+        for r in self._remotes:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def make_flightmare_vec_env(
+    n_envs: int,
+    seed: int = 0,
+    n_workers: int = 0,
+    **kwargs,
+) -> FlightmareVecEnv | SubprocFlightmareVecEnv:
+    n_envs = int(n_envs)
+    n_workers = int(n_workers or 0)
+    base_kwargs = [dict(kwargs) for _ in range(n_envs)]
+    seeds = [int(seed) + i for i in range(n_envs)]
+    if n_workers <= 1 or n_envs <= 1:
+        envs = [
+            FlightmareRacingEnv(build_flightmare_env_config(**{**base_kwargs[i], "seed": seeds[i]}))
+            for i in range(n_envs)
+        ]
+        return FlightmareVecEnv(envs)
+    return SubprocFlightmareVecEnv(base_kwargs, seeds, n_workers=n_workers)
 
 
 @register("env", "flightmare_racing")

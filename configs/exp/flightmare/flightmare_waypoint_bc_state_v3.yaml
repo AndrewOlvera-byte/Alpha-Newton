@@ -44,25 +44,25 @@ robotics:
 
 training:
   trainer_type: bc_flow_matching_robosuite
-  per_device_train_batch_size: 2048
-  per_device_eval_batch_size: 2048
+  per_device_train_batch_size: 16384
+  per_device_eval_batch_size: 16384
   gradient_accumulation_steps: 1
-  learning_rate: 3.0e-4
+  learning_rate: 7.0e-4
   weight_decay: 1.0e-4
-  warmup_steps: 1000
-  max_steps: 60000
+  warmup_steps: 1500
+  max_steps: 10000
   max_grad_norm: 5.0
-  logging_steps: 100
-  save_steps: 5000
-  eval_steps: 1000
+  logging_steps: 50
+  save_steps: 1000
+  eval_steps: 250
   bf16: true
   fp8: false
   torch_compile: false
-  dataloader_num_workers: 2
+  dataloader_num_workers: 8
   dataloader_pin_memory: true
-  dataloader_prefetch_factor: 2
+  dataloader_prefetch_factor: 4
   selection_metric: eval_loss
-  early_stopping_patience: 12
+  early_stopping_patience: 8
   output_dir: outputs/${run.name}
 
 wandb:

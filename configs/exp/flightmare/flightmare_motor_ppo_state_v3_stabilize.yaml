@@ -1,15 +1,16 @@
-# PPO fine-tuning for v3 Swift-scale waypoint+speed racing.
-# Best checkpoints are evaluated every rollout and stored under outputs/${run.name}/best.
+# Conservative first-stage PPO for v3 Swift-scale per-motor racing.
+# Purpose: learn stable actuator-level flight through one large gate before
+# switching to flightmare_motor_ppo_state_v3 for the full seven-gate course.
 
 run:
-  name: flightmare_waypoint_ppo_state_v3
+  name: flightmare_motor_ppo_state_v3_stabilize
   mode: ppo
   seed: 0
 
 data:
   type: flightmare_ppo_state
   data_dir: data/flightmare/bc_v3_swift_like
-  action_type: waypoint
+  action_type: motor
   include_mission: true
   normalize_state: true
   normalize_action: true
@@ -18,8 +19,8 @@ data:
 
 robotics:
   architecture:
-    type: flightmare_waypoint_ppo_state
-    bc_checkpoint: outputs/flightmare_waypoint_bc_state_v3/best/model.pt
+    type: flightmare_motor_ppo_state
+    bc_checkpoint: outputs/flightmare_motor_bc_state_v3/best/model.pt
 
     state_dim: 27
     action_dim: 4
@@ -35,9 +36,9 @@ robotics:
     head_hidden_dim: 256
     head_depth: 2
     state_dependent_std: false
-    init_log_std: -2.0
-    log_std_min: -4.0
-    log_std_max: -1.2
+    init_log_std: -2.6
+    log_std_min: -4.5
+    log_std_max: -1.6
     with_critic: true
     critic_hidden_dim: 256
     critic_depth: 2
@@ -45,8 +46,8 @@ robotics:
     action_clip: 1.0
 
   ppo:
-    bc_checkpoint: outputs/flightmare_waypoint_bc_state_v3/best/model.pt
-    action_type: waypoint
+    bc_checkpoint: outputs/flightmare_motor_bc_state_v3/best/model.pt
+    action_type: motor
     n_envs: 128
     n_workers: 8
     n_steps: 512
@@ -54,38 +55,37 @@ robotics:
     minibatch_size: 16384
     clip_eps: 0.05
     vf_coeff: 0.5
-    ent_coeff: 0.0005
+    ent_coeff: 0.0001
     gamma: 0.995
     gae_lambda: 0.95
-    max_iterations: 6500
-    actor_lr: 7.5e-6
+    max_iterations: 2000
+    actor_lr: 5.0e-6
     critic_lr: 2.0e-4
-    target_kl: 0.015
+    target_kl: 0.012
 
     control_hz: 100.0
-    horizon: 2500
+    horizon: 700
     scene: industrial
     render: false
     backend: numpy
     course_mode: swift_like
-    random_start_gate: true
-    fixed_gate_pos_noise: 0.15
-    fixed_gate_yaw_noise: 0.05
-    num_gates: 7
+    random_start_gate: false
+    fixed_gate_pos_noise: 0.0
+    fixed_gate_yaw_noise: 0.0
+    num_gates: 1
     gate_spacing_range: [10.0, 20.0]
     gate_lateral_jitter: 0.0
     gate_z_range: [1.5, 6.0]
     gate_yaw_step: 0.0
     gate_yaw_noise: 0.0
-    gate_size: 1.6
+    gate_size: 2.4
     z_min: 1.0
 
-    gate_vehicle_radius: 0.15
-    max_world_radius: 350.0
+    gate_vehicle_radius: 0.10
+    max_world_radius: 120.0
     min_z: -0.25
     terminate_on_gate_miss: true
     terminate_on_crash: true
-    max_waypoint_speed: 35.0
     max_collective_thrust_g: 5.5
     action_clip: 1.0
 
@@ -93,32 +93,39 @@ robotics:
     reward_kwargs:
       progress_scale: 6.0
       segment_progress_scale: 1.5
-      gate_pass_bonus: 20.0
-      completion_bonus: 220.0
-      gate_miss_penalty: 90.0
-      crash_penalty: 100.0
-      time_penalty: 0.04
+      gate_pass_bonus: 18.0
+      completion_bonus: 80.0
+      gate_miss_penalty: 45.0
+      crash_penalty: 60.0
+      time_penalty: 0.01
       body_rate_penalty: 0.0
-      action_smoothness_penalty: 0.01
+      action_smoothness_penalty: 0.06
       alignment_scale: 0.05
-      gate_centering_penalty: 0.05
-      gate_violation_penalty: 0.20
+      gate_centering_penalty: 0.03
+      gate_violation_penalty: 0.10
       gate_centering_near_m: 8.0
       max_progress_reward: 5.0
+      angular_rate_penalty: 0.0015
+      tilt_penalty: 0.20
+      vertical_speed_penalty: 0.01
+      motor_spread_penalty: 0.10
+      motor_saturation_penalty: 0.03
+      collective_hover_penalty: 0.03
+      hover_motor_value: 0.1818
 
 training:
   trainer_type: ppo_flightmare
   max_grad_norm: 0.5
   logging_steps: 1
   save_steps: 50
-  save_total_limit: 12
+  save_total_limit: 8
   save_final: true
   save_optimizer_state: false
   best_steps: 1
   selection_metric: rollout_score
   rollout_score_weights:
     success_rate: 1.0
-    mean_gate_completion: 0.1
+    mean_gate_completion: 0.25
     mean_speed_mps: 0.0
     mean_reward: 0.0
 
@@ -133,8 +140,8 @@ wandb:
     - flightmare
     - ppo
     - state-only
-    - waypoint
+    - motor
     - v3
-    - swift-like
+    - stabilize
+    - single-gate
     - bounds-norm
-    - best-every-rollout

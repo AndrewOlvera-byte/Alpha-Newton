@@ -122,6 +122,19 @@ class FlightmareNormStats:
                 action = action * self.action_std + self.action_mean
         return action.astype(np.float32)
 
+    def normalize_action_value(self, action: np.ndarray) -> np.ndarray:
+        action = np.asarray(action, dtype=np.float32)
+        if self.normalize_action:
+            if self.action_normalization == "bounds":
+                low = self.action_low
+                high = self.action_high
+                if low is None or high is None:
+                    raise RuntimeError("Bounds action normalization selected but action bounds are missing.")
+                action = 2.0 * (action - low) / np.maximum(high - low, 1e-6) - 1.0
+            else:
+                action = (action - self.action_mean) / self.action_std
+        return action.astype(np.float32)
+
 
 @dataclass
 class FlightmareRacingEnvConfig:
@@ -318,9 +331,13 @@ class FlightmareRacingEnv(gymnasium.Env):
         self._prev_pos = self._obs.pos.copy()
         self._step_count = 0
         self._episode_id += 1
+        initial_prev_action = self.norm.normalize_action_value(
+            np.zeros(self.norm.action_dim, dtype=np.float32)
+        )
         return self._make_obs(), {
             "using_fallback": self.using_fallback,
             "num_gates": len(self._gates),
+            "initial_prev_action_norm": initial_prev_action,
         }
 
     def step(self, action: np.ndarray):
@@ -371,6 +388,7 @@ class FlightmareRacingEnv(gymnasium.Env):
         gate_passed = bool(event is not None and event.passed)
         success = bool(self._strict_tracker.completed)
         crash = crash_reason is not None
+        body_z_world = quat_to_R(self._obs.quat)[:, 2]
 
         terminated = success
         if gate_missed and self.cfg.terminate_on_gate_miss:
@@ -397,8 +415,14 @@ class FlightmareRacingEnv(gymnasium.Env):
             "crash_reason": crash_reason,
             "raw_action": raw_action.astype(np.float32),
             "action_norm": action_norm.astype(np.float32),
+            "source_action_type": command.source_action_type,
             "ctbr_command": command.ctbr.astype(np.float32),
             "motor_command": command.motor.astype(np.float32),
+            "quat": self._obs.quat.astype(np.float32),
+            "omega": self._obs.omega.astype(np.float32),
+            "body_z_world_z": float(body_z_world[2]),
+            "vertical_speed_mps": float(self._obs.vel[2]),
+            "angular_rate_norm": float(np.linalg.norm(self._obs.omega)),
             "step": self._step_count,
             "dt": self.dt,
             "speed_mps": float(np.linalg.norm(self._obs.vel)),

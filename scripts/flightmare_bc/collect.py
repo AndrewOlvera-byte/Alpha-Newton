@@ -56,6 +56,7 @@ from scripts.flightmare_bc.trajectories import (
     MinJerkTrajectory,
     random_waypoint_path,
 )
+from src.robotics.flightmare_autonomy_fsw.gates import StrictGateTracker
 
 
 # State vector layout used everywhere downstream (13-dim):
@@ -300,7 +301,11 @@ def collect_one_episode(
         for g in gates:
             g.gate_id = f"ep{episode_id:06d}_{g.gate_id}"
         env.add_gates(gates)
-        waypoints = waypoints_from_gates(gates, cfg.z_min)
+        waypoints = waypoints_from_gates(
+            gates,
+            cfg.z_min,
+            d_approach=float(_cfg(cfg, "gate_approach_m", 1.2)),
+        )
         obs = env.reset(init_pos=waypoints[0], yaw=float(gates[0].yaw))
     else:
         obs = env.reset(init_pos=np.zeros(3), yaw=0.0)
@@ -313,7 +318,12 @@ def collect_one_episode(
             origin=obs.pos,
         )
     avg_speed = float(rng.uniform(cfg.speed_range[0], cfg.speed_range[1]))
-    traj = MinJerkTrajectory(waypoints, avg_speed=avg_speed, yaw_mode="tangent")
+    traj = MinJerkTrajectory(
+        waypoints,
+        avg_speed=avg_speed,
+        yaw_mode="tangent",
+        min_segment_s=float(_cfg(cfg, "trajectory_min_segment_s", 1e-2)),
+    )
     mission = MissionTracker(gates, lookahead=LOOKAHEAD_GATES)
 
     n_steps = int(traj.total_time / env.dt)
@@ -374,6 +384,47 @@ def collect_one_episode(
             }
             for g in gates
         ],
+    }
+
+
+def episode_gate_quality(out_dir: Path, ep: dict, vehicle_radius: float = 0.15) -> dict:
+    """Recompute gate quality from recorded positions using strict apertures.
+
+    ``mission/gate_index`` is a loose mission-progress signal: it advances on
+    gate-plane crossings. Racing success requires crossing inside the aperture,
+    so dataset filtering must use the same strict validator as PPO/eval.
+    """
+    import h5py
+
+    n_gates = max(1, len(ep.get("gates", [])))
+    h5_path = out_dir / ep["path"]
+    with h5py.File(h5_path, "r") as h:
+        pos = h["obs/state"][:, 0:3]
+        gi = h["mission/gate_index"][...] if "mission/gate_index" in h else np.zeros(0, dtype=np.int32)
+
+    plane_gates_passed = int(gi[-1]) if gi.size else 0
+    strict_tracker = StrictGateTracker(ep.get("gates", []), vehicle_radius=vehicle_radius)
+    for k in range(1, int(pos.shape[0])):
+        strict_tracker.update(pos[k - 1], pos[k])
+        if strict_tracker.completed:
+            break
+
+    strict_gates_passed = int(strict_tracker.current_index)
+    completion = strict_gates_passed / n_gates
+    last_event = strict_tracker.last_event
+    return {
+        "plane_gates_passed": plane_gates_passed,
+        "strict_gates_passed": strict_gates_passed,
+        "strict_gate_completion": float(completion),
+        "strict_gate_misses": int(strict_tracker.misses),
+        "last_strict_gate_margin_m": (
+            None if last_event is None else float(last_event.clearance_margin_m)
+        ),
+        "last_strict_gate_index": (
+            None if last_event is None else int(last_event.gate_index)
+        ),
+        "gates_passed": strict_gates_passed,
+        "gate_completion": float(completion),
     }
 
 
@@ -456,6 +507,12 @@ def main():
     p.add_argument("--gate-yaw-step", type=float, default=0.7)
     p.add_argument("--gate-yaw-noise", type=float, default=0.25)
     p.add_argument("--gate-size", type=float, default=1.0)
+    p.add_argument("--gate-approach-m", type=float, default=1.2,
+                   help="Distance before/after each gate center used for local straight-through waypoints.")
+    p.add_argument("--trajectory-min-segment-s", type=float, default=0.01,
+                   help="Minimum min-jerk segment duration. Increase for dense/high-speed gate waypoints.")
+    p.add_argument("--gate-vehicle-radius", type=float, default=0.15,
+                   help="Vehicle clearance radius used for strict gate-aperture dataset filtering.")
     p.add_argument("--max-world-radius", type=float, default=350.0)
     p.add_argument("--max-collective-thrust-g", type=float, default=4.0,
                    help="Total thrust ceiling in multiples of vehicle weight.")
@@ -528,6 +585,10 @@ def main():
         "params": asdict(params),
         "lookahead_s": args.lookahead_s,
         "course_mode": args.course_mode,
+        "gate_approach_m": args.gate_approach_m,
+        "trajectory_min_segment_s": args.trajectory_min_segment_s,
+        "gate_vehicle_radius": args.gate_vehicle_radius,
+        "min_gate_completion": args.min_gate_completion,
         "seed": args.seed,
         "episodes": [],
     }
@@ -609,20 +670,11 @@ def main():
         print(f"[collect][shard{args.shard_id}] wrote {len(manifest['episodes'])} eps -> {args.shard_manifest}", flush=True)
         return
 
-    # Quality filter: episodes that didn't pass enough gates are discarded.
+    # Quality filter: episodes that didn't pass enough strict gate apertures are discarded.
     keep_idx: list[int] = []
     for i, ep in enumerate(manifest["episodes"]):
-        n_gates = max(1, len(ep.get("gates", [])))
-        # gates_passed is recorded as the final mission gate_index in the H5;
-        # we approximate it via episode meta (recompute from H5 to be safe).
-        import h5py
-        with h5py.File(out / ep["path"], "r") as h:
-            gi = h["mission/gate_index"][...]
-            gates_passed = int(gi[-1]) if gi.size else 0
-        ep["gates_passed"] = gates_passed
-        completion = gates_passed / n_gates
-        ep["gate_completion"] = float(completion)
-        if completion >= args.min_gate_completion:
+        ep.update(episode_gate_quality(out, ep, vehicle_radius=args.gate_vehicle_radius))
+        if float(ep["gate_completion"]) >= args.min_gate_completion:
             keep_idx.append(i)
         else:
             ep["split"] = "discard"

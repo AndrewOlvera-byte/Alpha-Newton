@@ -106,6 +106,18 @@ def _stack_obs(obs_list: list[dict], prev_actions: np.ndarray, device: torch.dev
     }
 
 
+def _initial_prev_actions(infos: list[dict], n_envs: int, action_dim: int) -> np.ndarray:
+    prev_actions = np.zeros((n_envs, action_dim), dtype=np.float32)
+    for i, info in enumerate(infos):
+        initial = info.get("initial_prev_action_norm")
+        if initial is None:
+            continue
+        initial = np.asarray(initial, dtype=np.float32)
+        if initial.shape == (action_dim,):
+            prev_actions[i] = initial
+    return prev_actions
+
+
 def collect_flightmare_rollouts(
     vec_env,
     model: nn.Module,
@@ -160,9 +172,14 @@ def collect_flightmare_rollouts(
 
         done_indices = np.flatnonzero(dones).tolist()
         reset_obs_by_env = {}
+        reset_prev_by_env = {}
         if done_indices:
-            reset_obs, _ = vec_env.reset_at(done_indices)
+            reset_obs, reset_infos = vec_env.reset_at(done_indices)
             reset_obs_by_env = dict(zip(done_indices, reset_obs))
+            reset_prev_by_env = {
+                env_i: np.asarray(info.get("initial_prev_action_norm", np.zeros(buffer.action_dim)), dtype=np.float32)
+                for env_i, info in zip(done_indices, reset_infos)
+            }
 
         for i, info in enumerate(infos):
             speed = float(info.get("speed_mps", 0.0))
@@ -184,9 +201,21 @@ def collect_flightmare_rollouts(
                 current_rewards[i] = 0.0
                 current_lengths[i] = 0
                 next_obs[i] = reset_obs_by_env[i]
-                prev_actions[i] = 0.0
+                reset_prev = reset_prev_by_env.get(i)
+                if reset_prev is not None and reset_prev.shape == prev_actions[i].shape:
+                    prev_actions[i] = reset_prev
+                else:
+                    prev_actions[i] = 0.0
             else:
-                prev_actions[i] = actions_np[i]
+                applied_action = info.get("action_norm")
+                if applied_action is not None:
+                    applied_action = np.asarray(applied_action, dtype=np.float32)
+                    if applied_action.shape == prev_actions[i].shape:
+                        prev_actions[i] = applied_action
+                    else:
+                        prev_actions[i] = actions_np[i]
+                else:
+                    prev_actions[i] = actions_np[i]
 
         obs_list = next_obs
 
@@ -458,7 +487,7 @@ class FlightmarePPOTrainer:
             print(f"[Flightmare PPO Test] envs={len(obs_list)} fallback={infos[0].get('using_fallback')}")
             print(f"[Flightmare PPO Test] state shape={obs_list[0]['state'].shape}")
             model = self.model.to(self.device).eval()
-            prev_actions = np.zeros((len(obs_list), int(self.model.action_dim)), dtype=np.float32)
+            prev_actions = _initial_prev_actions(infos, len(obs_list), int(self.model.action_dim))
             buffer = FlightmareRolloutBuffer(
                 n_steps=8,
                 n_envs=len(obs_list),
@@ -508,7 +537,7 @@ class FlightmarePPOTrainer:
 
         state_dim = int(self.robotics_cfg.get("architecture", {}).get("state_dim", obs_list[0]["state"].shape[0]))
         action_dim = int(self.model.action_dim)
-        prev_actions = np.zeros((self.n_envs, action_dim), dtype=np.float32)
+        prev_actions = _initial_prev_actions(infos, self.n_envs, action_dim)
         buffer = FlightmareRolloutBuffer(self.n_steps, self.n_envs, state_dim, action_dim, self.device)
 
         t_start = time.time()

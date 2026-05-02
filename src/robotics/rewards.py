@@ -209,6 +209,13 @@ def flightmare_racing_v1(
     gate_violation_penalty: float = 0.0,
     gate_centering_near_m: float = 4.0,
     max_progress_reward: float = 2.0,
+    angular_rate_penalty: float = 0.0,
+    tilt_penalty: float = 0.0,
+    vertical_speed_penalty: float = 0.0,
+    motor_spread_penalty: float = 0.0,
+    motor_saturation_penalty: float = 0.0,
+    collective_hover_penalty: float = 0.0,
+    hover_motor_value: float | None = None,
     **_,
 ) -> float:
     """Dense gate-progress reward for state-only autonomous drone racing.
@@ -235,6 +242,43 @@ def flightmare_racing_v1(
         if prev_action is not None:
             pa = np.asarray(prev_action, dtype=np.float32)
             r -= float(action_smoothness_penalty) * float(np.sum((a - pa) ** 2))
+
+    if angular_rate_penalty > 0.0:
+        omega = info.get("omega")
+        if omega is not None:
+            omega_sq = float(np.sum(np.asarray(omega, dtype=np.float32) ** 2))
+        else:
+            omega_sq = float(info.get("angular_rate_norm", 0.0)) ** 2
+        r -= float(angular_rate_penalty) * omega_sq
+
+    if tilt_penalty > 0.0:
+        upright = float(np.clip(info.get("body_z_world_z", 1.0), -1.0, 1.0))
+        r -= float(tilt_penalty) * max(0.0, 1.0 - upright)
+
+    if vertical_speed_penalty > 0.0:
+        vz = float(info.get("vertical_speed_mps", 0.0))
+        r -= float(vertical_speed_penalty) * vz * vz
+
+    if (
+        info.get("source_action_type") == "motor"
+        and (
+            motor_spread_penalty > 0.0
+            or motor_saturation_penalty > 0.0
+            or collective_hover_penalty > 0.0
+        )
+    ):
+        motors = np.asarray(info.get("motor_command", np.zeros(4, dtype=np.float32)), dtype=np.float32)
+        if motors.size:
+            mean_motor = float(np.mean(motors))
+            if motor_spread_penalty > 0.0:
+                r -= float(motor_spread_penalty) * float(np.sum((motors - mean_motor) ** 2))
+            if motor_saturation_penalty > 0.0:
+                low_sat = np.maximum(0.05 - motors, 0.0)
+                high_sat = np.maximum(motors - 0.95, 0.0)
+                r -= float(motor_saturation_penalty) * float(np.sum(low_sat ** 2 + high_sat ** 2))
+            if collective_hover_penalty > 0.0 and hover_motor_value is not None:
+                err = mean_motor - float(hover_motor_value)
+                r -= float(collective_hover_penalty) * err * err
 
     # Alignment is in [0, 1] where 1 means body/camera forward points at next gate.
     r += float(alignment_scale) * float(info.get("gate_alignment", 0.0))

@@ -28,6 +28,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 
+from src.robotics.flightmare_autonomy_fsw.gates import StrictGateTracker
+
 
 def _gate_corners(pos: np.ndarray, yaw: float, size: float) -> np.ndarray:
     """4 corners of a gate square in world frame, plus the center, for plotting."""
@@ -59,6 +61,22 @@ def _load_episode(h5_path: Path) -> dict:
             "ref_vel": f["reference/vel_des"][...],
             "dt": float(f.attrs["dt"]),
         }
+
+
+def _strict_gate_stats(pos: np.ndarray, gates: list[dict], vehicle_radius: float) -> dict:
+    tracker = StrictGateTracker(gates, vehicle_radius=vehicle_radius)
+    for k in range(1, int(pos.shape[0])):
+        tracker.update(pos[k - 1], pos[k])
+        if tracker.completed:
+            break
+    last_event = tracker.last_event
+    return {
+        "strict_gates_passed": int(tracker.current_index),
+        "strict_gate_misses": int(tracker.misses),
+        "last_strict_gate_margin_m": (
+            None if last_event is None else float(last_event.clearance_margin_m)
+        ),
+    }
 
 
 def plot_trajectory(ep: dict, gates: list[dict], title: str, out_path: Path) -> None:
@@ -141,7 +159,7 @@ def plot_signals(ep: dict, gates: list[dict], title: str, out_path: Path) -> Non
     ax.plot(t, waypoint[:, 3], label="speed", color="C3")
     ax.set_ylabel("waypoint+speed"); ax.set_xlabel("t [s]")
     ax.legend(fontsize=8, ncol=2); ax.grid(alpha=0.3)
-    ax.set_title(f"waypoint label (gates passed: {int(gate_idx[-1])}/{len(gates)})")
+    ax.set_title(f"waypoint label (plane crossings: {int(gate_idx[-1])}/{len(gates)})")
 
     for a in axes.ravel():
         # shade gate-passing transitions
@@ -169,7 +187,7 @@ def plot_aggregate(per_ep: list[dict], out_path: Path) -> None:
     axes[0, 1].hist(track_max, bins=20); axes[0, 1].set_title("max tracking err [m]")
     axes[0, 1].set_xlabel("m"); axes[0, 1].grid(alpha=0.3)
     completion = gates_passed / np.maximum(gates_total, 1)
-    axes[0, 2].hist(completion, bins=np.linspace(0, 1, 21)); axes[0, 2].set_title("gate completion frac")
+    axes[0, 2].hist(completion, bins=np.linspace(0, 1, 21)); axes[0, 2].set_title("strict gate completion frac")
     axes[0, 2].grid(alpha=0.3)
     axes[1, 0].hist(speeds, bins=20); axes[1, 0].set_title("mean speed [m/s]")
     axes[1, 0].set_xlabel("m/s"); axes[1, 0].grid(alpha=0.3)
@@ -192,6 +210,8 @@ def main() -> None:
                    help="Output dir for plots; defaults to <data-dir>/_analysis")
     p.add_argument("--episodes", type=int, nargs="*", default=None,
                    help="Episode indices to render in detail (default: first 3 + worst-tracking)")
+    p.add_argument("--gate-vehicle-radius", type=float, default=0.15,
+                   help="Vehicle clearance radius for strict gate-aperture analysis.")
     args = p.parse_args()
 
     data_dir: Path = args.data_dir
@@ -213,7 +233,9 @@ def main() -> None:
         ref = ep["ref_pos"]
         track = np.linalg.norm(pos - ref, axis=1)
         gates = em.get("gates", [])
-        gates_passed = int(ep["gate_index"][-1]) if ep["gate_index"].size else 0
+        plane_gates_passed = int(ep["gate_index"][-1]) if ep["gate_index"].size else 0
+        strict = _strict_gate_stats(pos, gates, vehicle_radius=args.gate_vehicle_radius)
+        gates_passed = int(strict["strict_gates_passed"])
         per_ep.append({
             "episode_id": em["episode_id"],
             "h5": h5_path,
@@ -223,8 +245,11 @@ def main() -> None:
             "mean_track_err": float(track.mean()),
             "max_track_err": float(track.max()),
             "mean_speed": float(np.linalg.norm(vel, axis=1).mean()),
+            "plane_gates_passed": plane_gates_passed,
             "gates_passed": gates_passed,
             "gates_total": len(gates),
+            "strict_gate_misses": int(strict["strict_gate_misses"]),
+            "last_strict_gate_margin_m": strict["last_strict_gate_margin_m"],
             "ctbr_min": ep["ctbr"].min(axis=0).tolist(),
             "ctbr_max": ep["ctbr"].max(axis=0).tolist(),
             "waypoint_speed_range": (float(ep["waypoint"][:, 3].min()),
@@ -258,7 +283,7 @@ def main() -> None:
     nan_total = sum(e["nan_state"] + e["nan_ctbr"] for e in per_ep)
     print(f"  mean track err  : mean={track_means.mean():.3f} m  p50={np.median(track_means):.3f}  p95={np.percentile(track_means, 95):.3f}  max={track_means.max():.3f}")
     print(f"  max  track err  : mean={track_max.mean():.3f} m   p95={np.percentile(track_max, 95):.3f}  max={track_max.max():.3f}")
-    print(f"  gate completion : mean={completion.mean()*100:.1f}%  median={np.median(completion)*100:.1f}%  full-runs={int((completion >= 0.999).sum())}/{len(per_ep)}")
+    print(f"  strict gate completion : mean={completion.mean()*100:.1f}%  median={np.median(completion)*100:.1f}%  full-runs={int((completion >= 0.999).sum())}/{len(per_ep)}")
     print(f"  mean speed      : mean={speeds.mean():.2f} m/s  range=[{speeds.min():.2f}, {speeds.max():.2f}]")
     print(f"  episode length  : mean={lengths.mean():.0f} steps  range=[{int(lengths.min())}, {int(lengths.max())}]")
     print(f"  NaN/Inf samples : {nan_total}")
@@ -266,7 +291,8 @@ def main() -> None:
     print(f"=== per-episode (first 10) ===")
     for e in per_ep[:10]:
         print(f"  ep{e['episode_id']:04d}  T={e['length']:4d}  track(mean/max)={e['mean_track_err']:.2f}/{e['max_track_err']:.2f}m  "
-              f"v={e['mean_speed']:.1f}m/s  gates={e['gates_passed']}/{e['gates_total']}  "
+              f"v={e['mean_speed']:.1f}m/s  strict_gates={e['gates_passed']}/{e['gates_total']}  "
+              f"plane={e['plane_gates_passed']}/{e['gates_total']}  "
               f"ctbr_thrust=[{e['ctbr_min'][0]:.2f},{e['ctbr_max'][0]:.2f}]")
 
     # === Plots ===
@@ -277,7 +303,8 @@ def main() -> None:
         title = (f"ep {e['episode_id']}  T={e['length']}  "
                  f"track={e['mean_track_err']:.2f}/{e['max_track_err']:.2f}m  "
                  f"v={e['mean_speed']:.1f}m/s  "
-                 f"gates={e['gates_passed']}/{e['gates_total']}")
+                 f"strict_gates={e['gates_passed']}/{e['gates_total']}  "
+                 f"plane={e['plane_gates_passed']}/{e['gates_total']}")
         plot_trajectory(e["ep"], e["gates"], title,
                         out_dir / f"episode_{e['episode_id']:04d}_traj.png")
         plot_signals(e["ep"], e["gates"], title,
@@ -296,7 +323,7 @@ def main() -> None:
     print(f"=== verdict ===")
     print(f"  no NaN/Inf            : {nan_total == 0}")
     print(f"  mean track err < 1m   : {track_means.mean() < 1.0}  ({track_means.mean():.3f})")
-    print(f"  gate completion >=70% : {completion.mean() >= 0.7}  ({completion.mean()*100:.1f}%)")
+    print(f"  strict gate completion >=70% : {completion.mean() >= 0.7}  ({completion.mean()*100:.1f}%)")
     print(f"  -> {'PASS - dataset healthy for BC warmup' if verdict_ok else 'REVIEW - tune speed/max_steps/spacing or controller gains'}")
 
 

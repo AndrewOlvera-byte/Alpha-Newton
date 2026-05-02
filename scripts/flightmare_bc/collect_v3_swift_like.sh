@@ -15,12 +15,15 @@ python -m scripts.flightmare_bc.collect \
   --gate-size 1.6 \
   --fixed-gate-pos-noise 0.15 \
   --fixed-gate-yaw-noise 0.05 \
-  --speed-range 8.0 28.0 \
+  --speed-range 4.0 8.0 \
   --lookahead-s 0.35 \
+  --gate-approach-m 3.0 \
+  --trajectory-min-segment-s 0.60 \
   --control-hz 100 \
   --max-steps 2500 \
   --max-world-radius 350.0 \
   --max-collective-thrust-g 5.5 \
+  --gate-vehicle-radius 0.15 \
   --action-normalization bounds \
   --no-render \
   --val-frac 0.1 \

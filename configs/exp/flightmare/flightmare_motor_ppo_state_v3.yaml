@@ -35,14 +35,14 @@ robotics:
     head_hidden_dim: 256
     head_depth: 2
     state_dependent_std: false
-    init_log_std: -0.65
-    log_std_min: -5.0
-    log_std_max: 0.4
+    init_log_std: -2.3
+    log_std_min: -4.0
+    log_std_max: -1.3
     with_critic: true
     critic_hidden_dim: 256
     critic_depth: 2
     bc_loss_type: gnll
-    action_clip: 1.2
+    action_clip: 1.0
 
   ppo:
     bc_checkpoint: outputs/flightmare_motor_bc_state_v3/best/model.pt
@@ -50,17 +50,17 @@ robotics:
     n_envs: 128
     n_workers: 8
     n_steps: 512
-    ppo_epochs: 6
+    ppo_epochs: 4
     minibatch_size: 16384
-    clip_eps: 0.10
+    clip_eps: 0.05
     vf_coeff: 0.5
-    ent_coeff: 0.003
+    ent_coeff: 0.0002
     gamma: 0.995
     gae_lambda: 0.95
     max_iterations: 8000
-    actor_lr: 1.5e-5
-    critic_lr: 3.0e-4
-    target_kl: 0.035
+    actor_lr: 7.5e-6
+    critic_lr: 2.0e-4
+    target_kl: 0.015
 
     control_hz: 100.0
     horizon: 2500
@@ -86,7 +86,7 @@ robotics:
     terminate_on_gate_miss: true
     terminate_on_crash: true
     max_collective_thrust_g: 5.5
-    action_clip: 1.2
+    action_clip: 1.0
 
     reward_fn: flightmare_racing_v1
     reward_kwargs:
@@ -98,12 +98,19 @@ robotics:
       crash_penalty: 100.0
       time_penalty: 0.04
       body_rate_penalty: 0.0
-      action_smoothness_penalty: 0.02
+      action_smoothness_penalty: 0.04
       alignment_scale: 0.05
       gate_centering_penalty: 0.05
       gate_violation_penalty: 0.20
       gate_centering_near_m: 8.0
       max_progress_reward: 5.0
+      angular_rate_penalty: 0.001
+      tilt_penalty: 0.15
+      vertical_speed_penalty: 0.01
+      motor_spread_penalty: 0.08
+      motor_saturation_penalty: 0.02
+      collective_hover_penalty: 0.02
+      hover_motor_value: 0.1818
 
 training:
   trainer_type: ppo_flightmare
@@ -118,7 +125,7 @@ training:
   rollout_score_weights:
     success_rate: 1.0
     mean_gate_completion: 0.1
-    mean_speed_mps: 0.05
+    mean_speed_mps: 0.0
     mean_reward: 0.0
 
   bf16: true

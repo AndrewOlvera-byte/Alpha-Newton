@@ -49,6 +49,7 @@ from scripts.flightmare_bc.parallel_unity import (
     allocate_ports,
 )
 from scripts.flightmare_bc.action_norms import ACTION_TYPES, DEFAULT_ACTION_BOUNDS
+from scripts.flightmare_bc.collect import episode_gate_quality
 
 
 PASSTHROUGH_FLAGS = {
@@ -72,6 +73,9 @@ PASSTHROUGH_FLAGS = {
     "gate_yaw_step": ("--gate-yaw-step", 1),
     "gate_yaw_noise": ("--gate-yaw-noise", 1),
     "gate_size": ("--gate-size", 1),
+    "gate_approach_m": ("--gate-approach-m", 1),
+    "trajectory_min_segment_s": ("--trajectory-min-segment-s", 1),
+    "gate_vehicle_radius": ("--gate-vehicle-radius", 1),
     "max_world_radius": ("--max-world-radius", 1),
     "max_collective_thrust_g": ("--max-collective-thrust-g", 1),
     "unity_startup_s": ("--unity-startup-s", 1),
@@ -121,7 +125,8 @@ def build_worker_cmd(args: argparse.Namespace, worker_id: int,
 
 
 def merge_manifests(out_dir: Path, shard_manifests: list[Path], seed: int,
-                    val_frac: float) -> dict:
+                    val_frac: float, min_gate_completion: float,
+                    gate_vehicle_radius: float) -> dict:
     episodes: list[dict] = []
     header = None
     for sm in shard_manifests:
@@ -132,14 +137,24 @@ def merge_manifests(out_dir: Path, shard_manifests: list[Path], seed: int,
         episodes.extend(data["episodes"])
     episodes.sort(key=lambda e: e["episode_id"])
 
-    n = len(episodes)
-    perm = np.random.default_rng(seed).permutation(n)
-    n_val = int(round(val_frac * n))
-    val_ids = set(int(i) for i in perm[:n_val])
+    keep_idx: list[int] = []
     for i, ep in enumerate(episodes):
-        ep["split"] = "val" if i in val_ids else "train"
+        ep.update(episode_gate_quality(out_dir, ep, vehicle_radius=gate_vehicle_radius))
+        if float(ep["gate_completion"]) >= float(min_gate_completion):
+            keep_idx.append(i)
+        else:
+            ep["split"] = "discard"
+
+    n_keep = len(keep_idx)
+    perm = np.random.default_rng(seed).permutation(n_keep)
+    n_val = int(round(val_frac * n_keep))
+    val_ids = set(int(i) for i in perm[:n_val])
+    for local_i, global_i in enumerate(keep_idx):
+        episodes[global_i]["split"] = "val" if local_i in val_ids else "train"
 
     manifest = dict(header or {})
+    manifest["gate_vehicle_radius"] = float(gate_vehicle_radius)
+    manifest["min_gate_completion"] = float(min_gate_completion)
     manifest["episodes"] = episodes
     with open(out_dir / "index.json", "w") as f:
         json.dump(manifest, f, indent=2)
@@ -234,8 +249,13 @@ def main() -> None:
     p.add_argument("--gate-yaw-step", type=float, default=0.5)
     p.add_argument("--gate-yaw-noise", type=float, default=0.25)
     p.add_argument("--gate-size", type=float, default=1.0)
+    p.add_argument("--gate-approach-m", type=float, default=1.2)
+    p.add_argument("--trajectory-min-segment-s", type=float, default=0.01)
+    p.add_argument("--gate-vehicle-radius", type=float, default=0.15)
     p.add_argument("--max-world-radius", type=float, default=350.0)
     p.add_argument("--max-collective-thrust-g", type=float, default=4.0)
+    p.add_argument("--min-gate-completion", type=float, default=0.999,
+                   help="Strict aperture completion required to keep episodes.")
     args = p.parse_args()
 
     out: Path = args.out
@@ -292,7 +312,9 @@ def main() -> None:
 
     print(f"[parallel] merging {len(shard_manifests)} shard manifests")
     manifest = merge_manifests(out, shard_manifests, seed=args.seed,
-                               val_frac=args.val_frac)
+                               val_frac=args.val_frac,
+                               min_gate_completion=args.min_gate_completion,
+                               gate_vehicle_radius=args.gate_vehicle_radius)
     write_norm_stats_from_index(out, manifest)
     if not args.keep_shard_manifests:
         for sm in shard_manifests:

@@ -50,13 +50,15 @@ class MinJerkTrajectory:
         avg_speed: float,
         yaw_mode: str = "tangent",    # "tangent" or "zero"
         boundary_vel: np.ndarray | None = None,
+        min_segment_s: float = 1e-2,
     ):
         assert waypoints.ndim == 2 and waypoints.shape[1] == 3
         self.waypoints = waypoints.astype(np.float64)
         self.yaw_mode = yaw_mode
 
         seg_lens = np.linalg.norm(np.diff(self.waypoints, axis=0), axis=1)
-        seg_durations = np.maximum(seg_lens / max(avg_speed, 0.1), 1e-2)
+        min_segment_s = max(1e-2, float(min_segment_s))
+        seg_durations = np.maximum(seg_lens / max(avg_speed, 0.1), min_segment_s)
         self.seg_t0 = np.concatenate([[0.0], np.cumsum(seg_durations)])
         self.seg_dur = seg_durations
         self.total_time = float(self.seg_t0[-1])

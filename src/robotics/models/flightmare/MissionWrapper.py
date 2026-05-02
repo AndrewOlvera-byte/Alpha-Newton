@@ -232,7 +232,10 @@ class MissionWrapper:
     ) -> torch.Tensor:
         if prev_action is None:
             if self._prev_action is None:
-                return torch.zeros(1, self._action_dim(), device=self.device)
+                prev = torch.zeros(1, self._action_dim(), device=self.device)
+                if self._action_mean is not None:
+                    prev = self._normalize_action(prev)
+                return prev
             return self._prev_action.to(self.device)
 
         if isinstance(prev_action, torch.Tensor):

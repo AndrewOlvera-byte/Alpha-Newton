@@ -235,7 +235,8 @@ def main() -> None:
     p.add_argument("--speed-range", nargs=2, type=float, default=[2.5, 5.5])
     p.add_argument("--lookahead-s", type=float, default=0.3)
     p.add_argument("--scene", type=str, default="warehouse")
-    p.add_argument("--backend", choices=["numpy", "auto", "visual", "flightgym"], default="numpy")
+    p.add_argument("--backend", choices=["numpy", "auto", "visual", "flightgym"], default="flightgym",
+                   help="Default 'flightgym' (headless Flightmare). 'numpy' is DEPRECATED.")
     p.add_argument("--action-normalization", choices=["standard", "bounds"], default="standard")
     p.add_argument("--course-mode", choices=["random", "gates", "swift_like", "fixed_gates"], default="gates")
     p.add_argument("--gate-layout", type=Path, default=None)

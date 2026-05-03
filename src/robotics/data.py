@@ -623,11 +623,17 @@ class FlightmareBCStateDataset(Dataset):
             )
 
         self._episode_paths = [str(self.data_dir / e["path"]) for e in episodes]
+        # Drop the controller/sim warmup transient (state at rest, action
+        # already non-hover) from the BC index. Recorded at collection time so
+        # PPO/eval don't need to know - only training samples are filtered.
+        skip = int(manifest.get("skip_initial_frames", 0))
+        self.skip_initial_frames = max(0, skip)
         # Flat (episode_idx, t) sample index.
         self._index: List[tuple[int, int]] = []
         for ei, ep in enumerate(episodes):
             T = int(ep["length"])
-            self._index.extend((ei, t) for t in range(T))
+            t0 = min(self.skip_initial_frames, T)
+            self._index.extend((ei, t) for t in range(t0, T))
 
         # Load + cache normalization stats as torch tensors (cheap; reused per item).
         stats_path = self.data_dir / "norm_stats.npz"
@@ -703,8 +709,10 @@ class FlightmareBCStateDataset(Dataset):
 
         action_key = f"action/{self.action_type}"
         action = torch.from_numpy(h[action_key][t]).float()
-        prev_t = max(0, t - 1)
-        prev_action = torch.from_numpy(h[action_key][prev_t]).float()
+        if t == 0:
+            prev_action = torch.zeros_like(action)
+        else:
+            prev_action = torch.from_numpy(h[action_key][t - 1]).float()
         if self.normalize_action:
             if self.action_norm_mode == "bounds":
                 scale = torch.clamp(self.action_high - self.action_low, min=1e-6)

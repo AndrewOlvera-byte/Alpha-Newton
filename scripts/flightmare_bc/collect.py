@@ -44,7 +44,11 @@ from scripts.flightmare_bc.controllers import (
     QuadParams,
     world_to_body,
 )
-from scripts.flightmare_bc.action_norms import ACTION_TYPES, DEFAULT_ACTION_BOUNDS
+from scripts.flightmare_bc.action_norms import (
+    ACTION_TYPES,
+    DEFAULT_ACTION_BOUNDS,
+    empirical_action_bounds,
+)
 from scripts.flightmare_bc.expert_env import FlightmareExpertEnv, GateSpec
 from scripts.flightmare_bc.hdf5_writer import EpisodeWriter
 from scripts.flightmare_bc.mission import (
@@ -133,10 +137,19 @@ def _gates_from_centers(
         if sizes is not None:
             sizes = list(np.roll(np.asarray(sizes, dtype=np.float64), -offset, axis=0))
 
-    pos_noise = float(_cfg(cfg, "fixed_gate_pos_noise", 0.0))
-    if pos_noise > 0.0:
-        centers += rng.normal(0.0, pos_noise, size=centers.shape)
-        centers[:, 2] = np.maximum(centers[:, 2], float(_cfg(cfg, "z_min", 1.0)))
+    pos_noise_xyz = _cfg(cfg, "fixed_gate_pos_noise_xyz", None)
+    if pos_noise_xyz is not None:
+        sigmas = np.asarray(pos_noise_xyz, dtype=np.float64).reshape(-1)
+        if sigmas.shape[0] != 3:
+            raise ValueError(f"fixed_gate_pos_noise_xyz must be length 3, got {sigmas.shape[0]}")
+        if np.any(sigmas > 0.0):
+            centers += rng.normal(0.0, 1.0, size=centers.shape) * sigmas[None, :]
+            centers[:, 2] = np.maximum(centers[:, 2], float(_cfg(cfg, "z_min", 1.0)))
+    else:
+        pos_noise = float(_cfg(cfg, "fixed_gate_pos_noise", 0.0))
+        if pos_noise > 0.0:
+            centers += rng.normal(0.0, pos_noise, size=centers.shape)
+            centers[:, 2] = np.maximum(centers[:, 2], float(_cfg(cfg, "z_min", 1.0)))
 
     if yaws is None:
         yaws = _compute_path_yaws(centers)
@@ -428,32 +441,66 @@ def episode_gate_quality(out_dir: Path, ep: dict, vehicle_radius: float = 0.15) 
     }
 
 
-def write_norm_stats(out_dir: Path, train_files: list[Path], action_normalization: str = "standard") -> None:
-    """Per-channel mean/std for state and each action type, computed over train split."""
+def write_norm_stats(
+    out_dir: Path,
+    train_files: list[Path],
+    action_normalization: str = "standard",
+    skip_initial_frames: int = 0,
+    bounds_margin: float = 0.10,
+) -> None:
+    """Per-channel mean/std for state and each action type over the train split.
+
+    When ``action_normalization == "bounds"``, per-channel low/high are taken
+    from the empirical extrema of the (trimmed) train actions plus
+    ``bounds_margin`` on each side, clamped to physical limits. Otherwise the
+    wide ``DEFAULT_ACTION_BOUNDS`` are written for backward compatibility.
+
+    ``skip_initial_frames`` discards the first N samples of each episode from
+    statistic accumulation. Use this to drop the controller/sim warmup
+    transient where state is at rest while the controller is already issuing
+    non-hover commands - those (state, action) pairs are physically
+    inconsistent and corrupt both the means and the empirical bounds.
+    """
     import h5py
 
     sums = {"state": None, "mission": None, **{action_type: None for action_type in ACTION_TYPES}}
     sq_sums = {k: None for k in sums}
     counts = {k: 0 for k in sums}
+    action_extrema: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _trim(arr: np.ndarray) -> np.ndarray:
+        if skip_initial_frames <= 0:
+            return arr
+        return arr[skip_initial_frames:] if arr.shape[0] > skip_initial_frames else arr[:0]
 
     def acc(key: str, arr: np.ndarray) -> None:
         nonlocal sums, sq_sums, counts
+        if arr.shape[0] == 0:
+            return
         if sums[key] is None:
             sums[key] = np.zeros(arr.shape[1], dtype=np.float64)
             sq_sums[key] = np.zeros(arr.shape[1], dtype=np.float64)
         sums[key] += arr.sum(axis=0)
         sq_sums[key] += (arr.astype(np.float64) ** 2).sum(axis=0)
         counts[key] += arr.shape[0]
+        if key in ACTION_TYPES:
+            mn = arr.min(axis=0)
+            mx = arr.max(axis=0)
+            if key in action_extrema:
+                p_mn, p_mx = action_extrema[key]
+                action_extrema[key] = (np.minimum(p_mn, mn), np.maximum(p_mx, mx))
+            else:
+                action_extrema[key] = (mn.copy(), mx.copy())
 
     for fp in train_files:
         with h5py.File(fp, "r") as f:
-            acc("state", f["obs/state"][...])
+            acc("state", _trim(f["obs/state"][...]))
             for action_type in ACTION_TYPES:
                 key = f"action/{action_type}"
                 if key in f:
-                    acc(action_type, f[key][...])
+                    acc(action_type, _trim(f[key][...]))
             if "mission/vec" in f:
-                acc("mission", f["mission/vec"][...])
+                acc("mission", _trim(f["mission/vec"][...]))
 
     out = {}
     for k in sums:
@@ -465,7 +512,20 @@ def write_norm_stats(out_dir: Path, train_files: list[Path], action_normalizatio
         out[f"{k}_mean"] = mean.astype(np.float32)
         out[f"{k}_std"] = std.astype(np.float32)
     out["action_normalization"] = np.array(str(action_normalization))
-    for action_type, (low, high) in DEFAULT_ACTION_BOUNDS.items():
+
+    use_empirical = action_normalization == "bounds"
+    for action_type in ACTION_TYPES:
+        if use_empirical and action_type in action_extrema:
+            mn, mx = action_extrema[action_type]
+            # Pack as a [2, dim] "fake batch" of two extremal rows so the
+            # margin/clamp logic in empirical_action_bounds applies once.
+            low, high = empirical_action_bounds(
+                action_type,
+                np.stack([mn, mx], axis=0),
+                margin=bounds_margin,
+            )
+        else:
+            low, high = DEFAULT_ACTION_BOUNDS[action_type]
         out[f"{action_type}_low"] = low.astype(np.float32)
         out[f"{action_type}_high"] = high.astype(np.float32)
     np.savez(out_dir / "norm_stats.npz", **out)
@@ -487,10 +547,19 @@ def main():
     p.add_argument("--lookahead-s", type=float, default=0.3,
                    help="Look-ahead horizon for the waypoint+speed action label.")
     p.add_argument("--scene", type=str, default="industrial")
-    p.add_argument("--backend", choices=["numpy", "auto", "visual", "flightgym"], default="numpy",
-                   help="Simulation backend. v3 state-only collection defaults to numpy for speed/reproducibility.")
+    p.add_argument("--backend", choices=["numpy", "auto", "visual", "flightgym"], default="flightgym",
+                   help="Simulation backend. Default 'flightgym' = headless real Flightmare C++ dynamics. "
+                        "'visual' adds Unity rendering. 'numpy' is DEPRECATED — it is a stripped-down "
+                        "rigid-body fallback that bypasses motor dynamics, the thrust map, and aero, "
+                        "and is intentionally rejected unless ALPHA_NEWTON_ALLOW_NUMPY_FALLBACK=1.")
     p.add_argument("--action-normalization", choices=["standard", "bounds"], default="standard",
                    help="Action normalization metadata written to norm_stats.npz. v3 configs use bounds.")
+    p.add_argument("--skip-initial-frames", type=int, default=0,
+                   help="Drop the first N samples of each episode from norm-stats AND from the BC index. "
+                        "Use 8-16 (~80-160 ms @ 100 Hz) to remove the controller/sim warmup transient where "
+                        "state is at rest while the controller already issues non-hover commands.")
+    p.add_argument("--bounds-margin", type=float, default=0.10,
+                   help="Per-channel margin added to empirical action min/max when --action-normalization=bounds.")
     p.add_argument("--course-mode", choices=["random", "gates", "swift_like", "fixed_gates"], default="random")
     p.add_argument("--gate-layout", type=Path, default=None,
                    help="JSON gate layout for --course-mode fixed_gates. Entries need pos and optional yaw/size.")
@@ -568,6 +637,8 @@ def main():
         "state_dim": STATE_DIM,
         "state_layout": ["pos(3)", "vel(3)", "quat_wxyz(4)", "omega_body(3)"],
         "action_normalization": args.action_normalization,
+        "skip_initial_frames": int(args.skip_initial_frames),
+        "bounds_margin": float(args.bounds_margin),
         "backend": args.backend,
         "action_types": {
             "waypoint": {"dim": 4, "layout": ["dx_body", "dy_body", "dz_body", "speed"]},
@@ -585,6 +656,18 @@ def main():
         "params": asdict(params),
         "lookahead_s": args.lookahead_s,
         "course_mode": args.course_mode,
+        "gate_layout": str(args.gate_layout) if args.gate_layout is not None else None,
+        "random_start_gate": args.random_start_gate,
+        "fixed_gate_pos_noise": args.fixed_gate_pos_noise,
+        "fixed_gate_yaw_noise": args.fixed_gate_yaw_noise,
+        "num_gates": args.num_gates,
+        "gate_spacing_range": args.gate_spacing_range,
+        "gate_lateral_jitter": args.gate_lateral_jitter,
+        "gate_z_range": args.gate_z_range,
+        "gate_yaw_step": args.gate_yaw_step,
+        "gate_yaw_noise": args.gate_yaw_noise,
+        "gate_size": args.gate_size,
+        "z_min": args.z_min,
         "gate_approach_m": args.gate_approach_m,
         "trajectory_min_segment_s": args.trajectory_min_segment_s,
         "gate_vehicle_radius": args.gate_vehicle_radius,
@@ -664,7 +747,14 @@ def main():
                     "version", "controller", "image_size", "cameras", "control_hz",
                     "state_dim", "state_layout", "action_types", "mission",
                     "params", "lookahead_s", "course_mode", "backend",
-                    "action_normalization", "seed",
+                    "action_normalization", "skip_initial_frames", "bounds_margin",
+                    "seed", "gate_layout",
+                    "random_start_gate", "fixed_gate_pos_noise",
+                    "fixed_gate_yaw_noise", "num_gates", "gate_spacing_range",
+                    "gate_lateral_jitter", "gate_z_range", "gate_yaw_step",
+                    "gate_yaw_noise", "gate_size", "z_min", "gate_approach_m",
+                    "trajectory_min_segment_s", "gate_vehicle_radius",
+                    "min_gate_completion",
                 )
             }}, f)
         print(f"[collect][shard{args.shard_id}] wrote {len(manifest['episodes'])} eps -> {args.shard_manifest}", flush=True)
@@ -693,7 +783,13 @@ def main():
 
     train_files = [out / ep["path"] for ep in manifest["episodes"] if ep["split"] == "train"]
     if train_files:
-        write_norm_stats(out, train_files, action_normalization=args.action_normalization)
+        write_norm_stats(
+            out,
+            train_files,
+            action_normalization=args.action_normalization,
+            skip_initial_frames=int(args.skip_initial_frames),
+            bounds_margin=float(args.bounds_margin),
+        )
 
     print(f"[collect] done. {len(manifest['episodes'])} episodes "
           f"(train+val={n_keep}, discarded={n_discard}) -> {out}")

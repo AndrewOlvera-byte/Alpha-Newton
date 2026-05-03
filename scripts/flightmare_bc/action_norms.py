@@ -8,13 +8,14 @@ import numpy as np
 
 ACTION_TYPES = ("waypoint", "ctbr", "motor")
 
-# Bounds are intentionally policy-interface bounds, not empirical dataset
-# extrema. They keep normalized actions comparable when we recollect at higher
-# speed and prevent the old low-speed BC statistics from becoming a speed cap.
+# Fallback policy-interface bounds, used only when norm_stats.npz lacks
+# per-channel low/high. Prefer empirical bounds (see ``empirical_action_bounds``)
+# computed at norm_stats time, since these wide defaults under-utilize the
+# normalized [-1, 1] range and starve bounds-mode BC of resolution.
 DEFAULT_ACTION_BOUNDS: dict[str, tuple[np.ndarray, np.ndarray]] = {
     "waypoint": (
-        np.array([-50.0, -50.0, -50.0, 0.0], dtype=np.float32),
-        np.array([50.0, 50.0, 50.0, 50.0], dtype=np.float32),
+        np.array([-10.0, -10.0, -10.0, 0.0], dtype=np.float32),
+        np.array([ 10.0,  10.0,  10.0, 35.0], dtype=np.float32),
     ),
     "ctbr": (
         np.array([0.0, -12.0, -12.0, -12.0], dtype=np.float32),
@@ -25,6 +26,52 @@ DEFAULT_ACTION_BOUNDS: dict[str, tuple[np.ndarray, np.ndarray]] = {
         np.ones(4, dtype=np.float32),
     ),
 }
+
+
+# Hard physical bounds. Empirical limits are clamped to these so motor PWM
+# stays in [0, 1] and waypoint speed stays non-negative regardless of data.
+PHYSICAL_ACTION_BOUNDS: dict[str, tuple[np.ndarray, np.ndarray]] = {
+    "waypoint": (
+        np.array([-np.inf, -np.inf, -np.inf, 0.0], dtype=np.float32),
+        np.array([ np.inf,  np.inf,  np.inf, np.inf], dtype=np.float32),
+    ),
+    "ctbr": (
+        np.array([0.0, -np.inf, -np.inf, -np.inf], dtype=np.float32),
+        np.array([1.0,  np.inf,  np.inf,  np.inf], dtype=np.float32),
+    ),
+    "motor": (
+        np.zeros(4, dtype=np.float32),
+        np.ones(4, dtype=np.float32),
+    ),
+}
+
+
+def empirical_action_bounds(
+    action_type: str,
+    actions: np.ndarray,
+    margin: float = 0.10,
+    min_span: float = 1e-3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-channel low/high from observed actions, expanded by ``margin``.
+
+    Bounds are clamped to ``PHYSICAL_ACTION_BOUNDS``. Use this at norm_stats
+    write time so that bounds-mode normalization actually fills [-1, 1].
+    """
+    actions = np.asarray(actions, dtype=np.float32)
+    if actions.ndim != 2:
+        raise ValueError(f"actions must be [N, dim], got shape={actions.shape}")
+    lo = actions.min(axis=0)
+    hi = actions.max(axis=0)
+    span = np.maximum(hi - lo, min_span)
+    lo = lo - margin * span
+    hi = hi + margin * span
+    plo, phi = PHYSICAL_ACTION_BOUNDS.get(
+        action_type,
+        (np.full_like(lo, -np.inf), np.full_like(hi, np.inf)),
+    )
+    lo = np.maximum(lo, plo)
+    hi = np.minimum(hi, phi)
+    return lo.astype(np.float32), hi.astype(np.float32)
 
 
 def action_bounds(action_type: str, stats: Mapping | None = None) -> tuple[np.ndarray, np.ndarray]:

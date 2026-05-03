@@ -78,6 +78,7 @@ robotics:
     gate_yaw_step: 0.0
     gate_yaw_noise: 0.0
     gate_size: 1.6
+    gate_approach_m: 3.0
     z_min: 1.0
 
     gate_vehicle_radius: 0.15

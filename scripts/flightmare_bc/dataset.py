@@ -154,8 +154,10 @@ class FlightmareBCDataset(Dataset):
         state = torch.from_numpy(h["obs/state"][t]).float()
         action_key = f"action/{self.action_type}"
         action = torch.from_numpy(h[action_key][t]).float()
-        prev_t = max(0, t - 1)
-        prev_action = torch.from_numpy(h[action_key][prev_t]).float()
+        if t == 0:
+            prev_action = torch.zeros_like(action)
+        else:
+            prev_action = torch.from_numpy(h[action_key][t - 1]).float()
 
         images: dict[str, torch.Tensor] = {}
         for cam in self.cameras:

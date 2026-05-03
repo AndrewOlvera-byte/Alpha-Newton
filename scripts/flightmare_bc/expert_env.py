@@ -81,11 +81,20 @@ class FlightmareExpertEnv:
     def _build_impl(self):
         try:
             if self.backend == "numpy":
-                return _NumpyFallbackImpl(
-                    image_size=self.image_size,
-                    cameras=self.cameras,
-                    dt=self.dt,
-                    params=self.params,
+                # DEPRECATED: this is NOT a Flightmare backend. It is a hand-rolled
+                # rigid-body integrator with no motor lag, no aero, and no Unity. It
+                # exists only as a smoke-test fallback for environments where the
+                # Flightmare bindings cannot be loaded. Do NOT use it for BC data
+                # collection, PPO training, or evaluation that will appear in the
+                # paper — switch to ``flightgym`` (headless Flightmare C++ dynamics)
+                # or ``visual`` (Flightmare + Unity rendering).
+                raise RuntimeError(
+                    "backend='numpy' is deprecated and intentionally disabled. "
+                    "It is not a Flightmare backend — it's a stripped-down rigid-body "
+                    "fallback that bypasses motor dynamics, the thrust map, and aero. "
+                    "Use backend='flightgym' (headless real dynamics) or 'visual' (with Unity). "
+                    "If you are intentionally running a smoke test outside the Docker image "
+                    "where flightgym is unavailable, set ALPHA_NEWTON_ALLOW_NUMPY_FALLBACK=1."
                 )
             if self.backend == "flightgym":
                 impl_cls = _FlightgymImpl
@@ -105,10 +114,12 @@ class FlightmareExpertEnv:
                 seed=self.seed,
             )
         except Exception as e:  # pragma: no cover - depends on host install
+            if os.environ.get("ALPHA_NEWTON_ALLOW_NUMPY_FALLBACK", "0") != "1":
+                raise
             warnings.warn(
-                f"Flightmare bindings unavailable ({e!r}); falling back to "
-                "pure-numpy rigid-body sim with blank images. Useful only for "
-                "pipeline tests, NOT for real BC training data.",
+                f"Flightmare bindings unavailable ({e!r}); ALPHA_NEWTON_ALLOW_NUMPY_FALLBACK=1 "
+                "is set so falling back to deprecated pure-numpy rigid-body sim with blank "
+                "images. NOT VALID for any data that will be reported in the paper.",
                 stacklevel=2,
             )
             return _NumpyFallbackImpl(
@@ -229,10 +240,44 @@ env:
 
     def reset(self, init_pos, yaw):
         self.env.reset(self.obs)
+        self._last_omega = np.zeros(3, dtype=np.float64)
         return self._observe(done=False)
 
     def step_ctbr(self, thrust_newton, omega_des):
-        raise NotImplementedError("Flightmare's Python QuadrotorEnv_v1 accepts motor thrust actions, not CTBR.")
+        # Flightgym's QuadrotorEnv_v1 only accepts per-motor thrusts, so we run
+        # the same X-mixer + body-rate inner loop the codebase uses for motor BC
+        # (see controllers.py:GeometricSE3Controller._mix_to_motors). Inputs:
+        #   thrust_newton: collective thrust in Newtons.
+        #   omega_des:     desired body angular velocity (rad/s), 3-vector.
+        motor_normalized = self._ctbr_to_motor(float(thrust_newton), np.asarray(omega_des, dtype=np.float64))
+        return self.step_motor(motor_normalized)
+
+    def _ctbr_to_motor(self, thrust_newton: float, omega_des: np.ndarray) -> np.ndarray:
+        I = np.asarray(self.params.inertia, dtype=np.float64)
+        omega = self._last_omega
+        omega_err = omega_des - omega
+        # Inner-loop body-rate gains match GeometricGains.kp_rate so the
+        # flightgym dynamics see the same rate-loop characteristics as the
+        # numpy/visual paths' motor labels were generated with.
+        kp_rate = np.array([28.0, 28.0, 12.0], dtype=np.float64)
+        alpha_des = kp_rate * omega_err
+        gyro = np.cross(omega, I * omega)
+        tau = I * alpha_des + gyro
+        L = self.params.arm_length
+        kT = self.params.k_thrust
+        kQ = self.params.k_torque
+        s = np.sqrt(0.5)
+        kappa = kQ / kT
+        mixer = np.array([
+            [1.0, 1.0, 1.0, 1.0],
+            [-L * s, L * s, L * s, -L * s],
+            [-L * s, L * s, -L * s, L * s],
+            [-kappa, -kappa, kappa, kappa],
+        ])
+        rhs = np.array([thrust_newton, tau[0], tau[1], tau[2]])
+        f = np.linalg.solve(mixer, rhs)
+        f_max = self.params.max_collective_thrust / 4.0
+        return np.clip(f / max(f_max, 1e-6), 0.0, 1.0)
 
     def step_motor(self, motor_normalized):
         # Flightgym's bundled wrapper has its own motor-action normalization.
@@ -247,6 +292,7 @@ env:
         quat = _quat_from_euler_zyx(row[3:6])
         vel = row[6:9]
         omega = row[9:12]
+        self._last_omega = omega.copy()
         images = {cam_name: self._zero_img.copy() for cam_name in self.cameras}
         return StepResult(pos=pos, vel=vel, quat=quat, omega=omega, images=images, done=done)
 

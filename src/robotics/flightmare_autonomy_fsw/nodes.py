@@ -36,7 +36,9 @@ class CourseConfig:
     gate_layout: str | None = None
     random_start_gate: bool = False
     fixed_gate_pos_noise: float = 0.0
+    fixed_gate_pos_noise_xyz: Sequence[float] | None = None
     fixed_gate_yaw_noise: float = 0.0
+    gate_approach_m: float = 1.2
 
 
 class FlightmareStateNode:
@@ -92,7 +94,11 @@ class FlightmareStateNode:
         for gate in gates:
             gate.gate_id = f"eval_ep{episode_id:06d}_{gate.gate_id}"
         self.env.add_gates(gates)
-        waypoints = waypoints_from_gates(gates, self.course_config.z_min)
+        waypoints = waypoints_from_gates(
+            gates,
+            self.course_config.z_min,
+            d_approach=float(self.course_config.gate_approach_m),
+        )
         yaw = float(gates[0].yaw) if gates else 0.0
         obs = self.env.reset(init_pos=waypoints[0], yaw=yaw)
 

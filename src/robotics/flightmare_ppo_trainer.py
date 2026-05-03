@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from src.core.registry import register
+from src.robotics.curriculum import Curriculum
 from src.robotics.flightmare_envs import make_flightmare_vec_env
 from src.robotics.loss import compute_gae, ppo_clip_loss, value_loss
 
@@ -311,6 +312,17 @@ class FlightmarePPOTrainer:
         self.save_final = bool(training_cfg.get("save_final", True))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Optional course curriculum. When enabled, the trainer rebuilds the
+        # vec env at stage transitions to update num_gates / start randomness /
+        # gate noise. Stage 0 is applied at training start.
+        cur_cfg = ppo.get("curriculum", {}) or {}
+        if cur_cfg.get("enabled", False):
+            self.curriculum = Curriculum.from_config(cur_cfg)
+            self._base_ent_coeff = self.ent_coeff
+        else:
+            self.curriculum = None
+            self._base_ent_coeff = self.ent_coeff
+
         if self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
@@ -369,6 +381,21 @@ class FlightmarePPOTrainer:
                 (self.robotics_cfg.get("architecture", {}) or {}).get("action_clip", 5.0),
             ),
         }
+
+    def _apply_curriculum_overrides(self, env_kwargs: dict) -> dict:
+        """Layer the active curriculum stage onto a base env_kwargs dict."""
+        if self.curriculum is None:
+            return env_kwargs
+        env_overrides = self.curriculum.env_overrides()
+        merged = dict(env_kwargs)
+        merged.update(env_overrides)
+        # Trainer-side overrides (entropy coefficient).
+        trainer_overrides = self.curriculum.trainer_overrides()
+        if "ent_coeff_override" in trainer_overrides:
+            self.ent_coeff = float(trainer_overrides["ent_coeff_override"])
+        else:
+            self.ent_coeff = float(self._base_ent_coeff)
+        return merged
 
     def _split_params(self):
         critic_params = []
@@ -529,9 +556,13 @@ class FlightmarePPOTrainer:
             {"params": critic_params, "lr": self.critic_lr, "weight_decay": 1e-4},
         ])
 
-        env_kwargs = self._env_kwargs()
-        vec_env = make_flightmare_vec_env(n_envs=self.n_envs, seed=int(self.ppo_cfg.get("seed", 0)), **env_kwargs)
-        obs_list, infos = vec_env.reset(seed=int(self.ppo_cfg.get("seed", 0)))
+        base_env_kwargs = self._env_kwargs()
+        env_seed = int(self.ppo_cfg.get("seed", 0))
+        if self.curriculum is not None:
+            print(f"[Flightmare PPO] Curriculum enabled: {self.curriculum.describe()}")
+        env_kwargs = self._apply_curriculum_overrides(base_env_kwargs)
+        vec_env = make_flightmare_vec_env(n_envs=self.n_envs, seed=env_seed, **env_kwargs)
+        obs_list, infos = vec_env.reset(seed=env_seed)
         if infos and infos[0].get("using_fallback"):
             print("[Flightmare PPO] WARNING: using numpy fallback; metrics are not authoritative.")
 
@@ -557,8 +588,26 @@ class FlightmarePPOTrainer:
             enabled=self.use_bf16 and self.device.type == "cuda",
         )
 
+        last_rollout_stats: dict | None = None
         try:
             for iteration in range(1, self.max_iterations + 1):
+                # Curriculum: advance stage if the iteration window expired or
+                # the early-advance metric crossed its threshold last rollout.
+                if self.curriculum is not None and self.curriculum.update(
+                    iteration, last_rollout_stats
+                ):
+                    new_kwargs = self._apply_curriculum_overrides(base_env_kwargs)
+                    print(
+                        f"[Flightmare PPO] Curriculum transition at iter {iteration}: "
+                        f"{self.curriculum.describe()} (ent_coeff={self.ent_coeff})"
+                    )
+                    try:
+                        vec_env.close()
+                    except Exception:
+                        pass
+                    vec_env = make_flightmare_vec_env(n_envs=self.n_envs, seed=env_seed + iteration, **new_kwargs)
+                    obs_list, infos = vec_env.reset(seed=env_seed + iteration)
+                    prev_actions = _initial_prev_actions(infos, self.n_envs, action_dim)
                 iter_t0 = time.time()
                 model.eval()
                 obs_list, prev_actions, stats = collect_flightmare_rollouts(
@@ -571,6 +620,7 @@ class FlightmarePPOTrainer:
                     self.device,
                     self.use_bf16,
                 )
+                last_rollout_stats = stats
                 buffer.compute_advantages(stats["last_values"], self.gamma, self.gae_lambda)
                 buffer.normalize_advantages()
 
@@ -667,6 +717,15 @@ class FlightmarePPOTrainer:
                         "checkpoint/best_score": self.best_score if np.isfinite(self.best_score) else -1.0,
                         "checkpoint/best_iteration": self.best_iteration,
                         "checkpoint/is_new_best": float(is_new_best),
+                        **(
+                            {
+                                "curriculum/stage_idx": float(self.curriculum.active_index),
+                                "curriculum/num_stages": float(self.curriculum.num_stages),
+                                "curriculum/ent_coeff": float(self.ent_coeff),
+                            }
+                            if self.curriculum is not None
+                            else {}
+                        ),
                     }
                     print(
                         f"[{iteration}/{self.max_iterations}] "

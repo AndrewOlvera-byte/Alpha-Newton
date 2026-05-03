@@ -1,0 +1,191 @@
+# Aero-complex stage of the v3 Swift-scale waypoint pipeline.
+#
+# Differences vs flightmare_waypoint_ppo_state_v3.yaml:
+#   1. Full-fidelity Flightmare/flightgym backend (real dynamics, not numpy
+#      kinematic). Aero, motor lag, and integrator behavior all engaged.
+#   2. Anisotropic Swift-scale layout jitter via ``fixed_gate_pos_noise_xyz``
+#      so vertical differentiation between gates is much larger than lateral
+#      — same total course length, but Split-S-style verticality. The 3-gate
+#      mission obs (yaw_rel only) cannot represent inverted gates, so we keep
+#      gate normals upright and create the maneuver demand purely through
+#      large dz between consecutive gates.
+#   3. Stronger yaw_noise (gate facing variation) so the policy actually
+#      conditions on the yaw_rel channel.
+#   4. Selector weights include mean_speed_mps so the saved best is updated
+#      by speed gains once success_rate saturates.
+#   5. bc_checkpoint pulls from the user-selected late checkpoint of the
+#      v3 randomized run — not the saved 'best' (which is locked at the
+#      first iter that hit SR=1.0).
+#
+# Intended use: continuation curriculum step (stage 4) on top of the v3
+# random-slalom checkpoint, evaluated under real dynamics. Will inform the
+# 4-stage (2g → 4g → 7g → aero_complex) curriculum that the paper ablation
+# rerun is built around.
+
+run:
+  name: flightmare_waypoint_ppo_state_v3_aero_complex
+  mode: ppo
+  seed: 0
+
+data:
+  type: flightmare_ppo_state
+  data_dir: data/flightmare/bc_v3_swift_like
+  action_type: waypoint
+  include_mission: true
+  normalize_state: true
+  normalize_action: true
+  action_normalization: bounds
+  normalize_mission: true
+
+robotics:
+  architecture:
+    type: flightmare_waypoint_ppo_state
+    # Replace with the late-iteration v3 checkpoint you select before launch.
+    # Example: outputs/flightmare_waypoint_ppo_state_v3/checkpoint-6500/model.pt
+    bc_checkpoint: outputs/flightmare_waypoint_ppo_state_v3/checkpoint-6500/model.pt
+
+    state_dim: 27
+    action_dim: 4
+    use_vision: false
+    include_prev_action: true
+
+    state_hidden_dim: 256
+    state_embed_dim: 256
+    trunk_hidden_dim: 512
+    trunk_depth: 3
+    dropout: 0.05
+
+    head_hidden_dim: 256
+    head_depth: 2
+    state_dependent_std: false
+    init_log_std: -2.0
+    log_std_min: -4.0
+    log_std_max: -1.2
+    with_critic: true
+    critic_hidden_dim: 256
+    critic_depth: 2
+    bc_loss_type: gnll
+    action_clip: 1.0
+
+  ppo:
+    # Same as architecture.bc_checkpoint — train_ppo reads either.
+    bc_checkpoint: outputs/flightmare_waypoint_ppo_state_v3/best/model.pt
+    action_type: waypoint
+
+    # Full-fidelity sim. flightgym requires the Unity binary not to be needed
+    # for state-only runs (render: false). If bindings are unavailable the
+    # trainer will raise instead of silently falling back — that's intentional
+    # for this stage (the whole point is real dynamics).
+    backend: flightgym
+    render: false
+    scene: industrial
+
+    n_envs: 64
+    n_workers: 8
+    n_steps: 512
+    ppo_epochs: 4
+    minibatch_size: 8192
+    clip_eps: 0.05
+    vf_coeff: 0.5
+    ent_coeff: 0.001
+    gamma: 0.995
+    gae_lambda: 0.95
+    max_iterations: 4000
+    actor_lr: 5.0e-6
+    critic_lr: 1.5e-4
+    target_kl: 0.015
+
+    control_hz: 100.0
+    horizon: 2500
+
+    # Swift-scale fixed-layout course (same 7 gates, same total length).
+    course_mode: swift_like
+    num_gates: 7
+    random_start_gate: true
+    gate_size: 1.6
+    gate_approach_m: 3.0
+    z_min: 1.0
+
+    # *** The aero_complex differentiator. ***
+    # Per-axis position jitter (sigma in meters): small in xy, large in z.
+    # Mean course length is preserved, but consecutive-gate dz can hit
+    # ~3-4 m, forcing pitch reversals that approximate a Split-S without
+    # requiring inverted gate normals (the 14-d mission obs can't encode
+    # those anyway — see scripts/flightmare_bc/mission.py).
+    fixed_gate_pos_noise_xyz: [0.40, 0.40, 1.50]
+    fixed_gate_yaw_noise: 0.30
+
+    gate_vehicle_radius: 0.15
+    max_world_radius: 350.0
+    min_z: -0.25
+    terminate_on_gate_miss: true
+    terminate_on_crash: true
+    max_waypoint_speed: 35.0
+    max_collective_thrust_g: 5.5
+    action_clip: 1.0
+
+    reward_fn: flightmare_racing_v1
+    reward_kwargs:
+      progress_scale: 6.0
+      segment_progress_scale: 1.5
+      gate_pass_bonus: 20.0
+      completion_bonus: 220.0
+      gate_miss_penalty: 90.0
+      crash_penalty: 100.0
+      time_penalty: 0.05            # slightly higher to push speed
+      body_rate_penalty: 0.0
+      action_smoothness_penalty: 0.01
+      alignment_scale: 0.05
+      gate_centering_penalty: 0.05
+      gate_violation_penalty: 0.20
+      gate_centering_near_m: 8.0
+      max_progress_reward: 5.0
+
+    # Single-stage: this run *is* the aero_complex curriculum step.
+    # The 4-stage version (2g → 4g → 7g → aero_complex) lives in the
+    # paper-ablation config that you'll build from this one.
+    curriculum:
+      enabled: false
+
+training:
+  trainer_type: ppo_flightmare
+  max_grad_norm: 0.5
+  logging_steps: 1
+  save_steps: 50
+  save_total_limit: 12
+  save_final: true
+  save_optimizer_state: false
+  best_steps: 1
+  selection_metric: rollout_score
+
+  # Speed-aware selector. Once SR and gate_completion both hit 1.0 the
+  # base score is 1.10; mean_speed_mps weight 0.03 contributes:
+  #   12 m/s -> +0.36 (total 1.46)
+  #   15 m/s -> +0.45 (total 1.55)
+  #   20 m/s -> +0.60 (total 1.70)
+  # While SR < 1.0 the success term still dominates ties, so the selector
+  # won't promote a fast-but-unreliable checkpoint over a perfect-but-slow
+  # one until SR catches up. This avoids the v3 lock-in we saw at iter 2664.
+  rollout_score_weights:
+    success_rate: 1.0
+    mean_gate_completion: 0.1
+    mean_speed_mps: 0.03
+    mean_reward: 0.0
+
+  bf16: true
+  output_dir: outputs/${run.name}
+
+wandb:
+  project: flightmare-ppo
+  entity: andrewolvera
+  run_name: ${run.name}
+  tags:
+    - flightmare
+    - ppo
+    - state-only
+    - waypoint
+    - v3
+    - swift-like
+    - aero-complex
+    - flightgym-backend
+    - speed-aware-selector

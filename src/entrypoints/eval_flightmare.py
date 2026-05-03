@@ -131,6 +131,47 @@ def _arg_or_ppo(args: argparse.Namespace, attr: str, ppo_cfg: dict, ppo_key: str
     return ppo_cfg.get(ppo_key or attr, default)
 
 
+def _load_dataset_manifest(data_dir: Path) -> dict:
+    index_path = data_dir / "index.json"
+    if not index_path.exists():
+        return {}
+    import json
+
+    with open(index_path) as f:
+        return json.load(f)
+
+
+def _manifest_first_gates(manifest: dict) -> list[dict]:
+    for ep in manifest.get("episodes", []):
+        gates = ep.get("gates", [])
+        if gates:
+            return gates
+    return []
+
+
+def _manifest_num_gates(manifest: dict, default: int) -> int:
+    gates = _manifest_first_gates(manifest)
+    return len(gates) if gates else int(default)
+
+
+def _manifest_gate_size(manifest: dict, default: float) -> float:
+    gates = _manifest_first_gates(manifest)
+    if not gates:
+        return float(default)
+    size = gates[0].get("size", default)
+    if isinstance(size, list):
+        return float(size[0])
+    return float(size)
+
+
+def _manifest_thrust_g(manifest: dict, default: float) -> float:
+    params = manifest.get("params", {}) or {}
+    try:
+        return float(params["max_collective_thrust"]) / (float(params["mass"]) * float(params["g"]))
+    except Exception:
+        return float(default)
+
+
 def _print_episode(result) -> None:
     time_str = f"{result.completion_time_s:.2f}s" if result.completion_time_s is not None else "-"
     print(
@@ -176,6 +217,7 @@ def main() -> None:
     parser.add_argument("--gate-yaw-step", type=float, default=None)
     parser.add_argument("--gate-yaw-noise", type=float, default=None)
     parser.add_argument("--gate-size", type=float, default=None)
+    parser.add_argument("--gate-approach-m", type=float, default=None)
     parser.add_argument("--z-min", type=float, default=None)
 
     parser.add_argument("--max-body-rate", type=float, default=None)
@@ -200,6 +242,7 @@ def main() -> None:
     norm_stats = data_dir / "norm_stats.npz"
     if not norm_stats.exists():
         raise FileNotFoundError(f"norm_stats.npz not found: {norm_stats}")
+    dataset_manifest = _load_dataset_manifest(data_dir)
 
     run_name = cfg.run.get("name", Path(config_label).stem)
     output_dir = args.output_dir or (Path(cfg.training["output_dir"]) / "eval")
@@ -213,33 +256,34 @@ def main() -> None:
     print(f"[Stats]  {norm_stats}")
 
     max_steps = int(_arg_or_ppo(args, "max_steps", ppo_cfg, "horizon", 1500))
-    control_hz = float(_arg_or_ppo(args, "control_hz", ppo_cfg, "control_hz", 100.0))
+    control_hz = float(_arg_or_ppo(args, "control_hz", ppo_cfg, "control_hz", dataset_manifest.get("control_hz", 100.0)))
     scene = str(_arg_or_ppo(args, "scene", ppo_cfg, "scene", "industrial"))
-    backend = str(_arg_or_ppo(args, "backend", ppo_cfg, "backend", "auto"))
+    backend = str(_arg_or_ppo(args, "backend", ppo_cfg, "backend", dataset_manifest.get("backend", "auto")))
     render = bool(args.render or ppo_cfg.get("render", False))
-    course_mode = str(_arg_or_ppo(args, "course_mode", ppo_cfg, "course_mode", "gates"))
+    course_mode = str(_arg_or_ppo(args, "course_mode", ppo_cfg, "course_mode", dataset_manifest.get("course_mode", "gates")))
     gate_layout = _arg_or_ppo(args, "gate_layout", ppo_cfg, "gate_layout", None)
     random_start_gate = (
         bool(args.random_start_gate)
         if args.random_start_gate is not None
-        else bool(ppo_cfg.get("random_start_gate", False))
+        else bool(ppo_cfg.get("random_start_gate", dataset_manifest.get("random_start_gate", False)))
     )
-    fixed_gate_pos_noise = float(_arg_or_ppo(args, "fixed_gate_pos_noise", ppo_cfg, "fixed_gate_pos_noise", 0.0))
-    fixed_gate_yaw_noise = float(_arg_or_ppo(args, "fixed_gate_yaw_noise", ppo_cfg, "fixed_gate_yaw_noise", 0.0))
-    num_gates = int(_arg_or_ppo(args, "num_gates", ppo_cfg, "num_gates", 8))
+    fixed_gate_pos_noise = float(_arg_or_ppo(args, "fixed_gate_pos_noise", ppo_cfg, "fixed_gate_pos_noise", dataset_manifest.get("fixed_gate_pos_noise", 0.0)))
+    fixed_gate_yaw_noise = float(_arg_or_ppo(args, "fixed_gate_yaw_noise", ppo_cfg, "fixed_gate_yaw_noise", dataset_manifest.get("fixed_gate_yaw_noise", 0.0)))
+    num_gates = int(_arg_or_ppo(args, "num_gates", ppo_cfg, "num_gates", _manifest_num_gates(dataset_manifest, 8)))
     gate_spacing_range = list(_arg_or_ppo(args, "gate_spacing_range", ppo_cfg, "gate_spacing_range", [4.0, 9.0]))
     gate_lateral_jitter = float(_arg_or_ppo(args, "gate_lateral_jitter", ppo_cfg, "gate_lateral_jitter", 2.0))
     gate_z_range = list(_arg_or_ppo(args, "gate_z_range", ppo_cfg, "gate_z_range", [1.5, 4.0]))
     gate_yaw_step = float(_arg_or_ppo(args, "gate_yaw_step", ppo_cfg, "gate_yaw_step", 0.7))
     gate_yaw_noise = float(_arg_or_ppo(args, "gate_yaw_noise", ppo_cfg, "gate_yaw_noise", 0.25))
-    gate_size = float(_arg_or_ppo(args, "gate_size", ppo_cfg, "gate_size", 1.0))
+    gate_size = float(_arg_or_ppo(args, "gate_size", ppo_cfg, "gate_size", _manifest_gate_size(dataset_manifest, 1.0)))
+    gate_approach_m = float(_arg_or_ppo(args, "gate_approach_m", ppo_cfg, "gate_approach_m", dataset_manifest.get("gate_approach_m", 1.2)))
     z_min = float(_arg_or_ppo(args, "z_min", ppo_cfg, "z_min", 1.0))
     max_body_rate = float(_arg_or_ppo(args, "max_body_rate", ppo_cfg, "max_body_rate", 8.0))
     max_waypoint_speed = float(_arg_or_ppo(args, "max_waypoint_speed", ppo_cfg, "max_waypoint_speed", 15.0))
-    max_collective_thrust_g = float(_arg_or_ppo(args, "max_collective_thrust_g", ppo_cfg, "max_collective_thrust_g", 4.0))
+    max_collective_thrust_g = float(_arg_or_ppo(args, "max_collective_thrust_g", ppo_cfg, "max_collective_thrust_g", _manifest_thrust_g(dataset_manifest, 4.0)))
     max_world_radius = float(_arg_or_ppo(args, "max_world_radius", ppo_cfg, "max_world_radius", 200.0))
     min_z = float(_arg_or_ppo(args, "min_z", ppo_cfg, "min_z", -0.25))
-    gate_vehicle_radius = float(_arg_or_ppo(args, "gate_vehicle_radius", ppo_cfg, "gate_vehicle_radius", 0.15))
+    gate_vehicle_radius = float(_arg_or_ppo(args, "gate_vehicle_radius", ppo_cfg, "gate_vehicle_radius", dataset_manifest.get("gate_vehicle_radius", 0.15)))
     terminate_on_gate_miss = (
         not args.allow_gate_miss
         if args.allow_gate_miss is not None
@@ -249,7 +293,7 @@ def main() -> None:
     print(
         "[Eval Setup] "
         f"backend={backend} course={course_mode} gates={num_gates} spacing={gate_spacing_range} "
-        f"yaw_step={gate_yaw_step} gate_size={gate_size} "
+        f"yaw_step={gate_yaw_step} gate_size={gate_size} approach={gate_approach_m} "
         f"max_waypoint_speed={max_waypoint_speed} max_body_rate={max_body_rate} "
         f"max_thrust={max_collective_thrust_g:.1f}g",
         flush=True,
@@ -286,6 +330,7 @@ def main() -> None:
         random_start_gate=random_start_gate,
         fixed_gate_pos_noise=fixed_gate_pos_noise,
         fixed_gate_yaw_noise=fixed_gate_yaw_noise,
+        gate_approach_m=gate_approach_m,
     )
     state_node = FlightmareStateNode(
         control_hz=control_hz,
@@ -368,6 +413,7 @@ def main() -> None:
             "gate_yaw_step": gate_yaw_step,
             "gate_yaw_noise": gate_yaw_noise,
             "gate_size": gate_size,
+            "gate_approach_m": gate_approach_m,
             "gate_vehicle_radius": gate_vehicle_radius,
             "strict_gate_aperture": terminate_on_gate_miss,
         },

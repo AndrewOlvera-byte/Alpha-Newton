@@ -231,7 +231,11 @@ class FlightmareRacingEnv(gymnasium.Env):
         gates = sample_gate_course(self.rng, self.cfg.course)
         for gate in gates:
             gate.gate_id = f"ppo_ep{self._episode_id:08d}_{gate.gate_id}"
-        waypoints = waypoints_from_gates(gates, self.cfg.course.z_min)
+        waypoints = waypoints_from_gates(
+            gates,
+            self.cfg.course.z_min,
+            d_approach=float(self.cfg.course.gate_approach_m),
+        )
         return gates, waypoints
 
     def _mission(self, pos: np.ndarray, quat: np.ndarray) -> np.ndarray:
@@ -490,6 +494,8 @@ def build_flightmare_env_config(**kwargs) -> FlightmareRacingEnvConfig:
         course_kwargs["random_start_gate"] = kwargs.pop("random_start_gate")
     if "fixed_gate_pos_noise" in kwargs:
         course_kwargs["fixed_gate_pos_noise"] = kwargs.pop("fixed_gate_pos_noise")
+    if "fixed_gate_pos_noise_xyz" in kwargs:
+        course_kwargs["fixed_gate_pos_noise_xyz"] = kwargs.pop("fixed_gate_pos_noise_xyz")
     if "fixed_gate_yaw_noise" in kwargs:
         course_kwargs["fixed_gate_yaw_noise"] = kwargs.pop("fixed_gate_yaw_noise")
     if "gate_spacing_range" in kwargs:

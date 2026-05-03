@@ -78,6 +78,7 @@ robotics:
     gate_yaw_step: 0.0
     gate_yaw_noise: 0.0
     gate_size: 1.6
+    gate_approach_m: 3.0
     z_min: 1.0
 
     gate_vehicle_radius: 0.15
@@ -105,6 +106,39 @@ robotics:
       gate_violation_penalty: 0.20
       gate_centering_near_m: 8.0
       max_progress_reward: 5.0
+
+    # Course curriculum: start short and easy so the BC warm-start gets dense
+    # gate-pass reward, then ramp to the full 7-gate Swift-scale course. Stage
+    # transitions trigger a vec-env rebuild. ``advance_metric`` lets a stage
+    # finish early once a success threshold is reached.
+    curriculum:
+      enabled: true
+      advance_metric: success_rate
+      advance_threshold: 0.5
+      stages:
+        - name: warmup_2gates
+          until_iter: 400
+          num_gates: 2
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.05
+          fixed_gate_yaw_noise: 0.0
+          horizon: 1200
+          ent_coeff_override: 0.002
+        - name: ramp_4gates
+          until_iter: 1500
+          num_gates: 4
+          random_start_gate: true
+          fixed_gate_pos_noise: 0.10
+          fixed_gate_yaw_noise: 0.03
+          horizon: 1800
+          ent_coeff_override: 0.001
+        - name: full_7gates
+          until_iter: 6500
+          num_gates: 7
+          random_start_gate: true
+          fixed_gate_pos_noise: 0.15
+          fixed_gate_yaw_noise: 0.05
+          horizon: 2500
 
 training:
   trainer_type: ppo_flightmare

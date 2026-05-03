@@ -8,7 +8,7 @@ set -euo pipefail
 python -m scripts.flightmare_bc.collect \
   --out data/flightmare/bc_v3_swift_like \
   --episodes 2000 \
-  --backend numpy \
+  --backend flightgym \
   --course-mode swift_like \
   --random-start-gate \
   --num-gates 7 \

@@ -26,14 +26,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.robotics.models.flightmare.GaussianActionExpert import GaussianActionExpert
-from src.robotics.models.flightmare.MLP import MLPFusion
+from src.robotics.models.flightmare.MLP import MLPFusion, MLPSwiftFusion
 
 
 class MLPFusionGaussianExpertActor(nn.Module):
     def __init__(
         self,
-        state_dim: int,
         action_dim: int,
+        # --- legacy single-branch fusion (kept for v2 + vision configs) ---
+        state_dim: int | None = None,
+        # --- Swift split-then-fuse selector + dims ---
+        fusion: str = "legacy",
+        proprio_core_dim: int | None = None,
+        gate_dim: int | None = None,
+        aux_dim: int | None = None,
+        proprio_hidden_dim: int = 128,
+        proprio_embed_dim: int = 128,
+        gate_hidden_dim: int = 128,
+        gate_embed_dim: int = 128,
+        # --- shared / legacy ---
         backbone: str = "resnet18",
         img_size: int = 224,
         pretrained: bool = True,
@@ -60,28 +71,56 @@ class MLPFusionGaussianExpertActor(nn.Module):
         bc_loss_type: str = "gnll",
     ):
         super().__init__()
-        self.state_dim = state_dim
         self.action_dim = action_dim
         self.bc_loss_type = bc_loss_type
         self.action_clip = action_clip
+        self.fusion_kind = fusion
 
-        self.fusion = MLPFusion(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            backbone=backbone,
-            img_size=img_size,
-            pretrained=pretrained,
-            freeze_vision=freeze_vision,
-            n_cameras=n_cameras,
-            use_vision=use_vision,
-            include_prev_action=include_prev_action,
-            state_hidden_dim=state_hidden_dim,
-            state_embed_dim=state_embed_dim,
-            trunk_hidden_dim=trunk_hidden_dim,
-            trunk_depth=trunk_depth,
-            dropout=dropout,
-            channels_last=channels_last,
-        )
+        if fusion == "swift":
+            if proprio_core_dim is None or gate_dim is None or aux_dim is None:
+                raise ValueError(
+                    "fusion='swift' requires proprio_core_dim, gate_dim, aux_dim."
+                )
+            if use_vision:
+                raise ValueError("Swift fusion is state-only; set use_vision=False.")
+            self.state_dim = proprio_core_dim + gate_dim + aux_dim
+            self.fusion = MLPSwiftFusion(
+                proprio_core_dim=proprio_core_dim,
+                gate_dim=gate_dim,
+                aux_dim=aux_dim,
+                action_dim=action_dim,
+                include_prev_action=include_prev_action,
+                proprio_hidden_dim=proprio_hidden_dim,
+                proprio_embed_dim=proprio_embed_dim,
+                gate_hidden_dim=gate_hidden_dim,
+                gate_embed_dim=gate_embed_dim,
+                trunk_hidden_dim=trunk_hidden_dim,
+                trunk_depth=trunk_depth,
+                dropout=dropout,
+            )
+        elif fusion == "legacy":
+            if state_dim is None:
+                raise ValueError("fusion='legacy' requires state_dim.")
+            self.state_dim = state_dim
+            self.fusion = MLPFusion(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                backbone=backbone,
+                img_size=img_size,
+                pretrained=pretrained,
+                freeze_vision=freeze_vision,
+                n_cameras=n_cameras,
+                use_vision=use_vision,
+                include_prev_action=include_prev_action,
+                state_hidden_dim=state_hidden_dim,
+                state_embed_dim=state_embed_dim,
+                trunk_hidden_dim=trunk_hidden_dim,
+                trunk_depth=trunk_depth,
+                dropout=dropout,
+                channels_last=channels_last,
+            )
+        else:
+            raise ValueError(f"Unknown fusion={fusion!r}; expected 'legacy' or 'swift'.")
         self.head = GaussianActionExpert(
             feature_dim=trunk_hidden_dim,
             action_dim=action_dim,

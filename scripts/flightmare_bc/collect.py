@@ -221,11 +221,101 @@ def _layout_gate_course(rng: np.random.Generator, cfg: argparse.Namespace) -> li
     return _gates_from_centers(centers_arr, rng, cfg, prefix="fixed_gate", yaws=resolved_yaws, sizes=sizes)
 
 
+def _quat_from_yaw_pitch_roll(yaw: float, pitch: float, roll: float) -> np.ndarray:
+    """ZYX intrinsic Euler -> quaternion (w, x, y, z), world-from-gate."""
+    cy, sy = np.cos(0.5 * yaw), np.sin(0.5 * yaw)
+    cp, sp = np.cos(0.5 * pitch), np.sin(0.5 * pitch)
+    cr, sr = np.cos(0.5 * roll), np.sin(0.5 * roll)
+    return np.array([
+        cy * cp * cr + sy * sp * sr,
+        cy * cp * sr - sy * sp * cr,
+        sy * cp * sr + cy * sp * cr,
+        sy * cp * cr - cy * sp * sr,
+    ], dtype=np.float64)
+
+
+def _swift_v4_gate_course(rng: np.random.Generator, cfg: argparse.Namespace) -> list[GateSpec]:
+    """v4 Swift-scale racing course with the canonical Split-S inverted gate.
+
+    Layout (real Swift Split-S geometry, ~75 m total):
+        gate 0: entry, upright
+        gate 1: forward, upright, climbing
+        gate 2: top of the loop — INVERTED (rolled 180°), entered from above
+                going forward, exited downward upside-down
+        gate 3-6: descent + finish leg, upright, with S-switches
+
+    Per-episode randomization:
+        * small per-gate xyz position noise (sigma ~0.20 m)
+        * small per-gate yaw noise (sigma ~0.05 rad)
+        * inverted-gate roll perturbation in [165°, 195°] so the policy
+          generalizes around true-180° inversion
+
+    The 20-d v2 mission obs (full 3D gate-forward vectors per lookahead gate)
+    is required for the policy to know which side of the inverted gate to
+    approach from. With v1 yaw-only obs the inverted gate would be invisible.
+    """
+    n = int(_cfg(cfg, "num_gates", 7))
+    pos_noise = float(_cfg(cfg, "fixed_gate_pos_noise", 0.20))
+    yaw_noise = float(_cfg(cfg, "fixed_gate_yaw_noise", 0.05))
+    inverted_idx = int(_cfg(cfg, "inverted_gate_index", 2))
+    inverted_roll_jitter = float(_cfg(cfg, "inverted_roll_jitter_rad", 0.2618))  # ~15 deg
+
+    # Canonical Split-S Swift-scale layout (centers and yaws). Roughly:
+    # entry at (0,0,2), short forward leg up to (12,0,3.2), climb-and-curve
+    # to the inverted top at (24,4,5.5), then loop down and back through
+    # (28,12,3.2), (20,18,2.4), (8,16,2.0), finish at (0,8,2.0).
+    centers = np.array([
+        [ 0.0,  0.0, 2.0],
+        [12.0,  0.0, 3.2],
+        [24.0,  4.0, 5.5],
+        [28.0, 12.0, 3.2],
+        [20.0, 18.0, 2.4],
+        [ 8.0, 16.0, 2.0],
+        [ 0.0,  8.0, 2.0],
+    ], dtype=np.float64)
+    if 0 < n < len(centers):
+        idx = np.linspace(0, len(centers) - 1, max(1, n)).round().astype(int)
+        centers = centers[idx]
+    # Yaw is tangent direction along the path; helper handles endpoints.
+    yaws = _compute_path_yaws(centers)
+
+    if pos_noise > 0.0:
+        centers = centers + rng.normal(0.0, pos_noise, size=centers.shape)
+        centers[:, 2] = np.maximum(centers[:, 2], float(_cfg(cfg, "z_min", 1.0)))
+    if yaw_noise > 0.0:
+        yaws = [y + float(rng.uniform(-yaw_noise, yaw_noise)) for y in yaws]
+
+    gates: list[GateSpec] = []
+    for i, center in enumerate(centers):
+        size = _gate_size_array(cfg)
+        yaw = float(yaws[i])
+        if 0 <= inverted_idx < len(centers) and i == inverted_idx:
+            # Roll the gate ~180° about its forward axis so the up vector
+            # points world-down. Add bounded jitter so policies see roll
+            # variation rather than a deterministic 180°.
+            roll = np.pi + float(rng.uniform(-inverted_roll_jitter, inverted_roll_jitter))
+            quat = _quat_from_yaw_pitch_roll(yaw, 0.0, roll)
+        else:
+            quat = _quat_from_yaw_pitch_roll(yaw, 0.0, 0.0)
+        gates.append(
+            GateSpec(
+                gate_id=f"swift_v4_{i:03d}",
+                pos=center.copy(),
+                yaw=yaw,
+                size=np.asarray(size, dtype=np.float64).copy(),
+                quat=quat,
+            )
+        )
+    return gates
+
+
 def sample_gate_course(rng: np.random.Generator, cfg: argparse.Namespace) -> list[GateSpec]:
     """Generate a forward-progressing randomized gate course."""
     course_mode = str(_cfg(cfg, "course_mode", "gates"))
     if course_mode == "swift_like":
         return _swift_like_gate_course(rng, cfg)
+    if course_mode == "swift_v4":
+        return _swift_v4_gate_course(rng, cfg)
     if course_mode == "fixed_gates":
         return _layout_gate_course(rng, cfg)
 
@@ -255,31 +345,47 @@ def sample_gate_course(rng: np.random.Generator, cfg: argparse.Namespace) -> lis
     return gates
 
 
+def _gate_forward(g) -> np.ndarray:
+    """Approach normal of a gate (world frame). Honors the full quaternion if
+    set on the GateSpec (Split-S inverted gates rely on this); otherwise falls
+    back to yaw-only."""
+    quat = getattr(g, "quat", None)
+    if quat is not None:
+        from src.robotics.flightmare_autonomy_fsw.gates import _quat_to_R  # noqa: PLC0415
+        return _quat_to_R(np.asarray(quat, dtype=np.float64))[:, 0]
+    return np.array([np.cos(g.yaw), np.sin(g.yaw), 0.0], dtype=np.float64)
+
+
 def waypoints_from_gates(
     gates: list[GateSpec], z_min: float, d_approach: float = 1.2,
 ) -> np.ndarray:
     """Pre / center / exit waypoints aligned with each gate's forward axis.
 
     Inserting an approach point ``d_approach`` meters before the gate and an
-    exit point ``d_approach`` meters after, both along the gate's forward
-    direction, forces the min-jerk polynomial to be locally straight and
-    aligned with the gate normal at the crossing. This eliminates corner-
-    cutting through gate frames and (because tangent yaw equals gate yaw
-    when the velocity is along the gate forward axis) auto-aligns the body
-    yaw with each gate.
+    exit point ``d_approach`` meters after, both along the gate's actual
+    forward direction (from quat if present, yaw otherwise), forces the
+    min-jerk polynomial to be locally straight and aligned with the gate
+    normal at the crossing. This eliminates corner-cutting through gate
+    frames and — for inverted/tilted gates — places the pre/exit waypoints
+    on the correct side of the gate plane so the polynomial naturally
+    crosses through the aperture.
     """
     if not gates:
         return np.array([[0.0, 0.0, max(z_min, 2.0)]], dtype=np.float64)
     points: list[np.ndarray] = []
-    f0 = np.array([np.cos(gates[0].yaw), np.sin(gates[0].yaw), 0.0])
-    points.append(gates[0].pos - 3.0 * f0)  # lead-in
+    f0 = _gate_forward(gates[0])
+    # Lead-in is placed strictly further than the pre-gate approach point so
+    # the polynomial sees a non-degenerate first segment regardless of how
+    # large d_approach is configured.
+    lead_dist = max(d_approach + 2.0, 3.0)
+    points.append(gates[0].pos - lead_dist * f0)
     for g in gates:
-        f = np.array([np.cos(g.yaw), np.sin(g.yaw), 0.0])
+        f = _gate_forward(g)
         points.append(g.pos - d_approach * f)
         points.append(g.pos.copy())
         points.append(g.pos + d_approach * f)
-    fN = np.array([np.cos(gates[-1].yaw), np.sin(gates[-1].yaw), 0.0])
-    points.append(gates[-1].pos + 3.0 * fN)  # lead-out
+    fN = _gate_forward(gates[-1])
+    points.append(gates[-1].pos + lead_dist * fN)
     return np.stack(points, axis=0)
 
 
@@ -306,7 +412,7 @@ def collect_one_episode(
     lookahead_s: float,
 ) -> dict:
     gates: list[GateSpec] = []
-    if cfg.course_mode in {"gates", "swift_like", "fixed_gates"}:
+    if cfg.course_mode in {"gates", "swift_like", "swift_v4", "fixed_gates"}:
         gates = sample_gate_course(rng, cfg)
         # Prefix gate IDs with episode index so reused Unity instances don't
         # collide on object IDs across episodes (older gates remain in the
@@ -560,7 +666,7 @@ def main():
                         "state is at rest while the controller already issues non-hover commands.")
     p.add_argument("--bounds-margin", type=float, default=0.10,
                    help="Per-channel margin added to empirical action min/max when --action-normalization=bounds.")
-    p.add_argument("--course-mode", choices=["random", "gates", "swift_like", "fixed_gates"], default="random")
+    p.add_argument("--course-mode", choices=["random", "gates", "swift_like", "swift_v4", "fixed_gates"], default="random")
     p.add_argument("--gate-layout", type=Path, default=None,
                    help="JSON gate layout for --course-mode fixed_gates. Entries need pos and optional yaw/size.")
     p.add_argument("--random-start-gate", action="store_true",
@@ -616,7 +722,7 @@ def main():
         if args.cameras:
             print(f"[collect] state-only mode: ignoring --cameras {args.cameras}")
         args.cameras = []
-        if args.course_mode in {"gates", "swift_like", "fixed_gates"}:
+        if args.course_mode in {"gates", "swift_like", "swift_v4", "fixed_gates"}:
             print("[collect] state-only gate course: gates logged but not visualized.")
 
     out: Path = args.out
@@ -691,7 +797,7 @@ def main():
         scene=args.scene,
         render=args.render,
         seed=args.seed,
-        visual_backend=(args.course_mode in {"gates", "swift_like", "fixed_gates"}) or state_only,
+        visual_backend=(args.course_mode in {"gates", "swift_like", "swift_v4", "fixed_gates"}) or state_only,
         backend=args.backend,
     )
     if env.using_fallback:

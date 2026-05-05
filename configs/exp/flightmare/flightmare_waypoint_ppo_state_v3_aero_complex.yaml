@@ -1,3 +1,4 @@
+# DEPRECATED NOW USING FLIGHTMARE BACKEND IN /paper
 # Aero-complex stage of the v3 Swift-scale waypoint pipeline.
 #
 # Differences vs flightmare_waypoint_ppo_state_v3.yaml:

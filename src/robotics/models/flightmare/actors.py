@@ -1,33 +1,43 @@
-"""Registered Flightmare drone actor architectures.
+"""Unified Flightmare actor registration.
 
-Two action spaces are wired up separately so ablations can swap them via the
-config ``architecture.type`` field without code changes:
+A single ``flightmare_actor`` builder configurable via YAML for all action
+spaces (waypoint, ctbr, motor) and both BC and PPO defaults. Earlier versions
+shipped 12 near-identical builders (``flightmare_waypoint_bc``,
+``flightmare_motor_ppo_state``, ...) which are now consolidated.
 
-  * ``flightmare_waypoint_bc`` / ``flightmare_waypoint_ppo``
-        Action = (Δx_body, Δy_body, Δz_body, v_norm), 4-dim. High-level
-        waypoint+speed reference, ~10-30 Hz, easy to learn from MPC traces.
-        Used in "High-Speed Flight in the Wild" (Loquercio et al., Sci.
-        Robotics 2021) and Swift (Kaufmann et al., Nature 2023).
+Required config keys
+--------------------
+``type: flightmare_actor``
+``mode: bc | ppo``
+``action_type: waypoint | ctbr | motor``
 
-  * ``flightmare_ctbr_bc`` / ``flightmare_ctbr_ppo``
-        Action = (T_norm, ω_x, ω_y, ω_z), 4-dim. Collective thrust + body
-        rates, the de-facto low-level interface for real autonomous drone
-        racing (50-100 Hz). Harder to BC-fit but enables tighter trajectories
-        and is what onboard inner-loop controllers consume directly.
+Mode defaults
+-------------
+``bc``  -> with_critic=False, state_dependent_std=True,  bc_loss_type=gnll
+``ppo`` -> with_critic=True,  state_dependent_std=False, bc_loss_type=gnll
 
-  * ``flightmare_motor_bc`` / ``flightmare_motor_ppo``
-        Action = four normalized per-rotor thrust commands, 4-dim. This is
-        the lowest-level ablation: full actuator authority, but harder credit
-        assignment and more reliance on accurate motor/dynamics modeling.
-
-A generic builder ``flightmare_mlp_actor`` is also registered for arbitrary
-``action_dim``, e.g. 4-rotor individual-motor control (4-dim) or higher-level
-formulations (e.g. 6-dim with attitude).
-
-BC builds default to: no critic, state-dependent log_std (for proper Gaussian
-NLL), gnll loss. PPO builds default to: critic enabled, state-independent
-learnable log_std parameter (PPO-stable per SB3/OpenAI Baselines convention).
 PPO builds optionally take ``bc_checkpoint`` to warm-start from a BC run.
+
+Action spaces
+-------------
+``waypoint`` (Loquercio Sci. Robotics 2021, Swift Nature 2023):
+    4-dim (Δx_body, Δy_body, Δz_body, v_norm). Decoded by
+    ``WaypointLQRController`` -> SE3 inner loop -> CTBR -> Flightmare's C++
+    motor mixer.
+
+``ctbr`` (Foehn et al., Kaufmann et al.):
+    4-dim (T_norm, ω_x, ω_y, ω_z). The de-facto low-level interface for
+    real autonomous drone racing. Sent directly to ``env.stepCtbr``.
+
+``motor``:
+    4-dim per-rotor normalized thrust. Maximum actuator authority, hardest
+    credit assignment. Sent directly to ``env.stepMotor``.
+
+Backward-compatibility shim
+---------------------------
+The old per-action / per-mode names are kept as registry aliases so existing
+configs that have not been migrated still build. New work should use
+``flightmare_actor`` exclusively.
 """
 from __future__ import annotations
 
@@ -41,7 +51,7 @@ from src.robotics.models.flightmare.MLPFusionGaussianExpertActor import (
 
 _ACTOR_PARAMS = set(inspect.signature(MLPFusionGaussianExpertActor.__init__).parameters)
 _ACTOR_PARAMS.discard("self")
-_ACTOR_PARAMS.add("bc_checkpoint")  # consumed by PPO builders before construction
+_ACTOR_PARAMS.update({"bc_checkpoint", "mode", "action_type"})
 
 
 def _strip(kwargs: dict) -> dict:
@@ -53,129 +63,69 @@ def _strip(kwargs: dict) -> dict:
     return cfg
 
 
-def _bc_defaults(cfg: dict, action_dim: int) -> dict:
-    cfg.setdefault("action_dim", action_dim)
-    cfg.setdefault("with_critic", False)
-    cfg.setdefault("state_dependent_std", True)
-    cfg.setdefault("bc_loss_type", "gnll")
-    return cfg
+def _build(mode: str, action_type: str, kwargs: dict):
+    cfg = _strip(kwargs)
+    cfg.pop("mode", None)
+    cfg.pop("action_type", None)
+    bc_ckpt = cfg.pop("bc_checkpoint", None)
+
+    if action_type not in {"waypoint", "ctbr", "motor"}:
+        raise ValueError(
+            f"flightmare_actor.action_type must be one of 'waypoint', 'ctbr', 'motor', "
+            f"got {action_type!r}."
+        )
+    cfg.setdefault("action_dim", 4)
+    cfg.setdefault("use_vision", False)
+
+    if mode == "bc":
+        cfg.setdefault("with_critic", False)
+        cfg.setdefault("state_dependent_std", True)
+        cfg.setdefault("bc_loss_type", "gnll")
+    elif mode == "ppo":
+        cfg.setdefault("with_critic", True)
+        cfg.setdefault("state_dependent_std", False)
+        cfg.setdefault("bc_loss_type", "gnll")
+    else:
+        raise ValueError(f"flightmare_actor.mode must be 'bc' or 'ppo', got {mode!r}.")
+
+    if bc_ckpt is not None:
+        if mode != "ppo":
+            raise ValueError("bc_checkpoint is only valid for mode='ppo'.")
+        return MLPFusionGaussianExpertActor.from_bc_checkpoint(bc_ckpt, cfg)
+    return MLPFusionGaussianExpertActor(**cfg)
 
 
-def _ppo_defaults(cfg: dict, action_dim: int) -> dict:
-    cfg.setdefault("action_dim", action_dim)
-    cfg.setdefault("with_critic", True)
-    cfg.setdefault("state_dependent_std", False)
-    cfg.setdefault("bc_loss_type", "gnll")
-    return cfg
+@register("architecture", "flightmare_actor")
+def build_flightmare_actor(**kwargs):
+    mode = kwargs.get("mode")
+    action_type = kwargs.get("action_type")
+    if mode is None or action_type is None:
+        raise ValueError(
+            "flightmare_actor requires 'mode' (bc|ppo) and 'action_type' "
+            "(waypoint|ctbr|motor) in the architecture config."
+        )
+    return _build(str(mode), str(action_type), kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Deprecated aliases. Existing configs that still reference the long names are
+# routed through the unified builder. New work should use ``flightmare_actor``.
+# ---------------------------------------------------------------------------
+def _alias(name: str, mode: str, action_type: str):
+    @register("architecture", name)
+    def _builder(**kwargs):
+        return _build(mode, action_type, kwargs)
+    _builder.__name__ = f"build_{name}"
+    return _builder
+
+
+for _action in ("waypoint", "ctbr", "motor"):
+    for _mode in ("bc", "ppo"):
+        _alias(f"flightmare_{_action}_{_mode}", _mode, _action)
+        _alias(f"flightmare_{_action}_{_mode}_state", _mode, _action)
+
+
+# Generic MLP actor registration kept for arbitrary action_dim experiments.
 @register("architecture", "flightmare_mlp_actor")
 def build_flightmare_mlp_actor(**kwargs):
     return MLPFusionGaussianExpertActor(**_strip(kwargs))
-
-
-@register("architecture", "flightmare_waypoint_bc")
-def build_flightmare_waypoint_bc(**kwargs):
-    cfg = _bc_defaults(_strip(kwargs), action_dim=4)
-    return MLPFusionGaussianExpertActor(**cfg)
-
-
-@register("architecture", "flightmare_waypoint_ppo")
-def build_flightmare_waypoint_ppo(**kwargs):
-    cfg = _strip(kwargs)
-    bc_ckpt = cfg.pop("bc_checkpoint", None)
-    cfg = _ppo_defaults(cfg, action_dim=4)
-    if bc_ckpt is not None:
-        return MLPFusionGaussianExpertActor.from_bc_checkpoint(bc_ckpt, cfg)
-    return MLPFusionGaussianExpertActor(**cfg)
-
-
-@register("architecture", "flightmare_ctbr_bc")
-def build_flightmare_ctbr_bc(**kwargs):
-    cfg = _bc_defaults(_strip(kwargs), action_dim=4)
-    return MLPFusionGaussianExpertActor(**cfg)
-
-
-@register("architecture", "flightmare_ctbr_ppo")
-def build_flightmare_ctbr_ppo(**kwargs):
-    cfg = _strip(kwargs)
-    bc_ckpt = cfg.pop("bc_checkpoint", None)
-    cfg = _ppo_defaults(cfg, action_dim=4)
-    if bc_ckpt is not None:
-        return MLPFusionGaussianExpertActor.from_bc_checkpoint(bc_ckpt, cfg)
-    return MLPFusionGaussianExpertActor(**cfg)
-
-
-@register("architecture", "flightmare_motor_bc")
-def build_flightmare_motor_bc(**kwargs):
-    cfg = _bc_defaults(_strip(kwargs), action_dim=4)
-    return MLPFusionGaussianExpertActor(**cfg)
-
-
-@register("architecture", "flightmare_motor_ppo")
-def build_flightmare_motor_ppo(**kwargs):
-    cfg = _strip(kwargs)
-    bc_ckpt = cfg.pop("bc_checkpoint", None)
-    cfg = _ppo_defaults(cfg, action_dim=4)
-    if bc_ckpt is not None:
-        return MLPFusionGaussianExpertActor.from_bc_checkpoint(bc_ckpt, cfg)
-    return MLPFusionGaussianExpertActor(**cfg)
-
-
-# ---------------------------------------------------------------------------
-# State-only variants (no vision encoder). Used for vectorized RL at scale
-# where running many Unity instances is infeasible. Inputs: proprio state +
-# privileged mission vector (concatenated into ``state`` upstream).
-# ---------------------------------------------------------------------------
-@register("architecture", "flightmare_waypoint_bc_state")
-def build_flightmare_waypoint_bc_state(**kwargs):
-    cfg = _bc_defaults(_strip(kwargs), action_dim=4)
-    cfg.setdefault("use_vision", False)
-    return MLPFusionGaussianExpertActor(**cfg)
-
-
-@register("architecture", "flightmare_waypoint_ppo_state")
-def build_flightmare_waypoint_ppo_state(**kwargs):
-    cfg = _strip(kwargs)
-    bc_ckpt = cfg.pop("bc_checkpoint", None)
-    cfg = _ppo_defaults(cfg, action_dim=4)
-    cfg.setdefault("use_vision", False)
-    if bc_ckpt is not None:
-        return MLPFusionGaussianExpertActor.from_bc_checkpoint(bc_ckpt, cfg)
-    return MLPFusionGaussianExpertActor(**cfg)
-
-
-@register("architecture", "flightmare_ctbr_bc_state")
-def build_flightmare_ctbr_bc_state(**kwargs):
-    cfg = _bc_defaults(_strip(kwargs), action_dim=4)
-    cfg.setdefault("use_vision", False)
-    return MLPFusionGaussianExpertActor(**cfg)
-
-
-@register("architecture", "flightmare_ctbr_ppo_state")
-def build_flightmare_ctbr_ppo_state(**kwargs):
-    cfg = _strip(kwargs)
-    bc_ckpt = cfg.pop("bc_checkpoint", None)
-    cfg = _ppo_defaults(cfg, action_dim=4)
-    cfg.setdefault("use_vision", False)
-    if bc_ckpt is not None:
-        return MLPFusionGaussianExpertActor.from_bc_checkpoint(bc_ckpt, cfg)
-    return MLPFusionGaussianExpertActor(**cfg)
-
-
-@register("architecture", "flightmare_motor_bc_state")
-def build_flightmare_motor_bc_state(**kwargs):
-    cfg = _bc_defaults(_strip(kwargs), action_dim=4)
-    cfg.setdefault("use_vision", False)
-    return MLPFusionGaussianExpertActor(**cfg)
-
-
-@register("architecture", "flightmare_motor_ppo_state")
-def build_flightmare_motor_ppo_state(**kwargs):
-    cfg = _strip(kwargs)
-    bc_ckpt = cfg.pop("bc_checkpoint", None)
-    cfg = _ppo_defaults(cfg, action_dim=4)
-    cfg.setdefault("use_vision", False)
-    if bc_ckpt is not None:
-        return MLPFusionGaussianExpertActor.from_bc_checkpoint(bc_ckpt, cfg)
-    return MLPFusionGaussianExpertActor(**cfg)

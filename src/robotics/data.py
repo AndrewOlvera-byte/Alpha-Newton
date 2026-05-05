@@ -577,8 +577,9 @@ class FlightmareBCStateDataset(Dataset):
         images:       {}                           (empty - kept for trainer compat)
 
     All values are mean/std normalized using ``norm_stats.npz`` written by the
-    collector. ``state_dim = 13 (pos+vel+quat+omega) + 14 (next-3-gates body
-    frame + progress + dist) = 27`` when ``include_mission=True`` (default).
+    collector. ``state_dim = 13 (pos+vel+quat+omega) + 20 (mission v2:
+    3-lookahead-gates body frame [pos:3, fwd:3] each + progress + dist) = 33``
+    when ``include_mission=True`` (default).
 
     HDF5 handles are opened lazily per worker and cached, so this composes
     safely with ``DataLoader(num_workers>0)``.
@@ -796,4 +797,229 @@ def build_flightmare_bc_state(
         "_task_names": ["flightmare"],
         "_state_dim": getattr(train_ds, "state_dim", 27),
         "_action_dim": getattr(train_ds, "action_dim", 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Flightmare drone BC (state-only, obs v3 — Swift-style split-then-fuse)
+# ---------------------------------------------------------------------------
+class FlightmareBCStateV3Dataset(Dataset):
+    """Per-timestep Flightmare BC dataset emitting Swift-style obs v3 blocks.
+
+    Each sample is a flat dict consumed by ``MLPFusionGaussianExpertActor``
+    when configured with ``fusion=swift``:
+
+        proprio_core: [9]      v_body, omega_body, gravity_body
+        gate:         [24]     2 lookahead gates × 4 corners × 3 (body-frame)
+        aux:          [3]      progress, dist_to_current, time_since_pass
+        prev_actions: [4]      last commanded action (per action_type)
+        action:       [4]      target action
+
+    Mean/std normalization uses the v3 stats appended to ``norm_stats.npz``
+    by ``transform_to_v3.py``. Action normalization shares the v2 path
+    (``bounds`` or ``standard``) so action-type ablations stay comparable
+    between v2 and v3 datasets.
+    """
+
+    ACTION_TYPES = ("waypoint", "ctbr", "motor")
+
+    def __init__(
+        self,
+        data_dir: str,
+        action_type: Literal["waypoint", "ctbr", "motor"] = "ctbr",
+        split: Literal["train", "val", "all"] = "train",
+        normalize_obs: bool = True,
+        normalize_action: bool = True,
+        action_normalization: Literal["auto", "standard", "bounds"] = "auto",
+    ):
+        if action_type not in self.ACTION_TYPES:
+            raise ValueError(f"action_type must be one of {self.ACTION_TYPES}, got {action_type!r}")
+        self.data_dir = Path(data_dir)
+        self.action_type = action_type
+        self.split = split
+        self.normalize_obs = normalize_obs
+        self.normalize_action = normalize_action
+        self.action_normalization = action_normalization
+
+        with open(self.data_dir / "index.json") as f:
+            manifest = json.load(f)
+        self._meta = manifest
+
+        if "obs_v3" not in manifest:
+            raise RuntimeError(
+                f"{data_dir} has no obs_v3 block in index.json — run "
+                f"`python -m scripts.flightmare_bc.transform_to_v3 --data-dir {data_dir}` first."
+            )
+        v3 = manifest["obs_v3"]
+        self.proprio_core_dim = int(v3["proprio_core"]["dim"])
+        self.gate_dim = int(v3["gate"]["dim"])
+        self.aux_dim = int(v3["aux"]["dim"])
+
+        if split == "all":
+            episodes = manifest["episodes"]
+        else:
+            episodes = [e for e in manifest["episodes"] if e.get("split", "train") == split]
+        if not episodes:
+            raise RuntimeError(
+                f"No episodes for split={split!r} under {data_dir}. "
+                f"Counts: {FlightmareBCStateDataset._split_counts(manifest)}"
+            )
+
+        self._episode_paths = [str(self.data_dir / e["path"]) for e in episodes]
+        skip = int(manifest.get("skip_initial_frames", 0))
+        self.skip_initial_frames = max(0, skip)
+        self._index: List[tuple[int, int]] = []
+        for ei, ep in enumerate(episodes):
+            T = int(ep["length"])
+            t0 = min(self.skip_initial_frames, T)
+            self._index.extend((ei, t) for t in range(t0, T))
+
+        stats_path = self.data_dir / "norm_stats.npz"
+        if not stats_path.exists():
+            raise FileNotFoundError(f"norm_stats.npz missing in {data_dir}.")
+        s = np.load(stats_path)
+        for needed in ("proprio_core_mean", "gate_mean", "aux_mean"):
+            if needed not in s.files:
+                raise RuntimeError(
+                    f"{stats_path} missing v3 stats key {needed!r} — rerun transform_to_v3.py."
+                )
+        self.proprio_mean = torch.from_numpy(s["proprio_core_mean"]).float()
+        self.proprio_std = torch.from_numpy(s["proprio_core_std"]).float()
+        self.gate_mean = torch.from_numpy(s["gate_mean"]).float()
+        self.gate_std = torch.from_numpy(s["gate_std"]).float()
+        self.aux_mean = torch.from_numpy(s["aux_mean"]).float()
+        self.aux_std = torch.from_numpy(s["aux_std"]).float()
+
+        self.action_mean = torch.from_numpy(s[f"{action_type}_mean"]).float()
+        self.action_std = torch.from_numpy(s[f"{action_type}_std"]).float()
+        self.action_norm_mode = (
+            stats_mode(s, default="standard")
+            if action_normalization == "auto"
+            else str(action_normalization)
+        )
+        low, high = action_bounds(action_type, s)
+        self.action_low = torch.from_numpy(low).float()
+        self.action_high = torch.from_numpy(high).float()
+
+        # Composite "state" dim used by the architecture builder when it wants
+        # a single number to log. The Swift fusion model consumes the three
+        # blocks separately, but trainers/loggers like a scalar.
+        self.state_dim = self.proprio_core_dim + self.gate_dim + self.aux_dim
+        self.action_dim = 4
+
+        self._handles: Dict[int, h5py.File] = {}
+        self._owner_pid: Optional[int] = None
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def _get_handle(self, ep_idx: int) -> h5py.File:
+        pid = os.getpid()
+        if self._owner_pid is None:
+            self._owner_pid = pid
+        elif self._owner_pid != pid:
+            self._handles = {}
+            self._owner_pid = pid
+        h = self._handles.get(ep_idx)
+        if h is None:
+            h = h5py.File(self._episode_paths[ep_idx], "r", swmr=False, libver="latest")
+            self._handles[ep_idx] = h
+        return h
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        ep_idx, t = self._index[idx]
+        h = self._get_handle(ep_idx)
+
+        proprio = torch.from_numpy(h["obs/proprio_core"][t]).float()
+        gate = torch.from_numpy(h["obs/gate"][t]).float()
+        aux = torch.from_numpy(h["obs/aux"][t]).float()
+        if self.normalize_obs:
+            proprio = (proprio - self.proprio_mean) / self.proprio_std
+            gate = (gate - self.gate_mean) / self.gate_std
+            aux = (aux - self.aux_mean) / self.aux_std
+
+        action_key = f"action/{self.action_type}"
+        action = torch.from_numpy(h[action_key][t]).float()
+        if t == 0:
+            prev_action = torch.zeros_like(action)
+        else:
+            prev_action = torch.from_numpy(h[action_key][t - 1]).float()
+        if self.normalize_action:
+            if self.action_norm_mode == "bounds":
+                scale = torch.clamp(self.action_high - self.action_low, min=1e-6)
+                action = 2.0 * (action - self.action_low) / scale - 1.0
+                prev_action = 2.0 * (prev_action - self.action_low) / scale - 1.0
+            else:
+                action = (action - self.action_mean) / self.action_std
+                prev_action = (prev_action - self.action_mean) / self.action_std
+
+        # Single flat ``state`` tensor (proprio_core ++ gate ++ aux). The
+        # Swift fusion model splits it internally using stored dims. Emitting
+        # one tensor here keeps the rollout collector / history buffer paths
+        # unchanged from the v2 schema.
+        state = torch.cat([proprio, gate, aux], dim=0)
+        return {
+            "images": {},
+            "state": state,
+            "prev_actions": prev_action,
+            "action": action,
+        }
+
+    @property
+    def task_id(self) -> int:
+        return 0
+
+    @task_id.setter
+    def task_id(self, value: int) -> None:
+        pass
+
+
+@register("data", "flightmare_bc_state_v3")
+def build_flightmare_bc_state_v3(
+    data_dir: str,
+    action_type: Literal["waypoint", "ctbr", "motor"] = "ctbr",
+    normalize_obs: bool = True,
+    normalize_action: bool = True,
+    action_normalization: Literal["auto", "standard", "bounds"] = "auto",
+    **_: Any,
+) -> Dict[str, Any]:
+    """Build train/val Swift-obs-v3 Flightmare BC datasets."""
+    common = dict(
+        data_dir=data_dir,
+        action_type=action_type,
+        normalize_obs=normalize_obs,
+        normalize_action=normalize_action,
+        action_normalization=action_normalization,
+    )
+    train_ds = FlightmareBCStateV3Dataset(split="train", **common)
+    try:
+        eval_ds = FlightmareBCStateV3Dataset(split="val", **common)
+    except RuntimeError:
+        print("[FlightmareBCStateV3] No val split in manifest; using last 10% of train as eval.")
+        from torch.utils.data import Subset
+        n = len(train_ds)
+        n_eval = max(1, int(0.1 * n))
+        eval_idx = list(range(n - n_eval, n))
+        train_idx = list(range(0, n - n_eval))
+        eval_ds = Subset(train_ds, eval_idx)
+        train_ds = Subset(train_ds, train_idx)
+
+    base_ds = train_ds.dataset if hasattr(train_ds, "dataset") else train_ds
+    print(
+        f"[FlightmareBCStateV3] {data_dir}  action={action_type}  "
+        f"proprio={base_ds.proprio_core_dim}  gate={base_ds.gate_dim}  aux={base_ds.aux_dim}  "
+        f"action_dim=4  train={len(train_ds)}  eval={len(eval_ds)}"
+    )
+    return {
+        "train": train_ds,
+        "eval": eval_ds,
+        "_obs_keys_low_dim": [],
+        "_obs_keys_image": [],
+        "_image_size": 0,
+        "_task_names": ["flightmare"],
+        "_state_dim": base_ds.state_dim,
+        "_action_dim": base_ds.action_dim,
+        "_proprio_core_dim": base_ds.proprio_core_dim,
+        "_gate_dim": base_ds.gate_dim,
+        "_aux_dim": base_ds.aux_dim,
     }

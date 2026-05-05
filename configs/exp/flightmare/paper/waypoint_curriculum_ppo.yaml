@@ -1,35 +1,48 @@
-# DEPRECATED NOW USING FLIGHTMARE BACKEND IN /paper
-# PPO fine-tuning for v3 Swift-scale waypoint+speed racing.
-# Best checkpoints are evaluated every rollout and stored under outputs/${run.name}/best.
+# Paper ablation — PPO curriculum on REAL Flightmare dynamics, waypoint actions.
+# Warm-started from outputs/paper_waypoint_bc_v4/best/model.pt.
+#
+# Curriculum: 2g warmup -> 4g ramp -> 7g full Swift-scale. Per-stage env
+# rebuild with looser early gate noise; speed pushed via reward + speed-aware
+# selector once SR saturates.
+#
+# Run after BC training:
+#   docker compose exec alpha-newton python -m src.entrypoints.train_ppo \
+#     --exp flightmare/paper/waypoint_curriculum_ppo
 
 run:
-  name: flightmare_waypoint_ppo_state_v3
+  name: paper_waypoint_curriculum_ppo_v4
   mode: ppo
   seed: 0
 
 data:
   type: flightmare_ppo_state
-  data_dir: data/flightmare/bc_v3_swift_like
+  data_dir: data/flightmare/bc_v4
   action_type: waypoint
-  include_mission: true
+  obs_schema: v3
   normalize_state: true
   normalize_action: true
   action_normalization: bounds
-  normalize_mission: true
 
 robotics:
   architecture:
-    type: flightmare_waypoint_ppo_state
-    bc_checkpoint: outputs/flightmare_waypoint_bc_state_v3/best/model.pt
+    type: flightmare_actor
+    mode: ppo
+    action_type: waypoint
+    bc_checkpoint: outputs/paper_waypoint_bc_v4/best/model.pt
 
-    state_dim: 27
+    fusion: swift
+    proprio_core_dim: 9
+    gate_dim: 24
+    aux_dim: 3
     action_dim: 4
     use_vision: false
     include_prev_action: true
 
-    state_hidden_dim: 256
-    state_embed_dim: 256
-    trunk_hidden_dim: 512
+    proprio_hidden_dim: 128
+    proprio_embed_dim: 128
+    gate_hidden_dim: 128
+    gate_embed_dim: 128
+    trunk_hidden_dim: 768
     trunk_depth: 3
     dropout: 0.05
 
@@ -46,43 +59,42 @@ robotics:
     action_clip: 1.0
 
   ppo:
-    bc_checkpoint: outputs/flightmare_waypoint_bc_state_v3/best/model.pt
+    bc_checkpoint: outputs/paper_waypoint_bc_v4/best/model.pt
     action_type: waypoint
-    n_envs: 128
+
+    obs_schema: v3
+    backend: flightgym
+    render: false
+    scene: industrial
+
+    n_envs: 8
     n_workers: 8
-    n_steps: 512
+    n_steps: 1024
     ppo_epochs: 4
-    minibatch_size: 16384
+    minibatch_size: 2048
     clip_eps: 0.05
     vf_coeff: 0.5
-    ent_coeff: 0.0005
+    ent_coeff: 0.001
     gamma: 0.995
     gae_lambda: 0.95
-    max_iterations: 6500
-    actor_lr: 7.5e-6
-    critic_lr: 2.0e-4
+    max_iterations: 8000
+    actor_lr: 5.0e-6
+    critic_lr: 1.5e-4
     target_kl: 0.015
 
     control_hz: 100.0
     horizon: 2500
-    scene: industrial
-    render: false
-    backend: numpy
-    course_mode: swift_like
-    random_start_gate: true
-    fixed_gate_pos_noise: 0.15
-    fixed_gate_yaw_noise: 0.05
+
+    course_mode: swift_v4
     num_gates: 7
-    gate_spacing_range: [10.0, 20.0]
-    gate_lateral_jitter: 0.0
-    gate_z_range: [1.5, 6.0]
-    gate_yaw_step: 0.0
-    gate_yaw_noise: 0.0
     gate_size: 1.6
     gate_approach_m: 3.0
     z_min: 1.0
+    fixed_gate_pos_noise: 0.20
+    fixed_gate_yaw_noise: 0.05
+    random_start_gate: true
 
-    gate_vehicle_radius: 0.15
+    gate_vehicle_radius: 0.20
     max_world_radius: 350.0
     min_z: -0.25
     terminate_on_gate_miss: true
@@ -99,7 +111,7 @@ robotics:
       completion_bonus: 220.0
       gate_miss_penalty: 90.0
       crash_penalty: 100.0
-      time_penalty: 0.04
+      time_penalty: 0.05
       body_rate_penalty: 0.0
       action_smoothness_penalty: 0.01
       alignment_scale: 0.05
@@ -108,17 +120,13 @@ robotics:
       gate_centering_near_m: 8.0
       max_progress_reward: 5.0
 
-    # Course curriculum: start short and easy so the BC warm-start gets dense
-    # gate-pass reward, then ramp to the full 7-gate Swift-scale course. Stage
-    # transitions trigger a vec-env rebuild. ``advance_metric`` lets a stage
-    # finish early once a success threshold is reached.
     curriculum:
       enabled: true
       advance_metric: success_rate
       advance_threshold: 0.5
       stages:
         - name: warmup_2gates
-          until_iter: 400
+          until_iter: 800
           num_gates: 2
           random_start_gate: false
           fixed_gate_pos_noise: 0.05
@@ -126,7 +134,7 @@ robotics:
           horizon: 1200
           ent_coeff_override: 0.002
         - name: ramp_4gates
-          until_iter: 1500
+          until_iter: 2500
           num_gates: 4
           random_start_gate: true
           fixed_gate_pos_noise: 0.10
@@ -134,10 +142,10 @@ robotics:
           horizon: 1800
           ent_coeff_override: 0.001
         - name: full_7gates
-          until_iter: 6500
+          until_iter: 8000
           num_gates: 7
           random_start_gate: true
-          fixed_gate_pos_noise: 0.15
+          fixed_gate_pos_noise: 0.20
           fixed_gate_yaw_noise: 0.05
           horizon: 2500
 
@@ -154,7 +162,7 @@ training:
   rollout_score_weights:
     success_rate: 1.0
     mean_gate_completion: 0.1
-    mean_speed_mps: 0.0
+    mean_speed_mps: 0.03
     mean_reward: 0.0
 
   bf16: true
@@ -164,12 +172,4 @@ wandb:
   project: flightmare-ppo
   entity: andrewolvera
   run_name: ${run.name}
-  tags:
-    - flightmare
-    - ppo
-    - state-only
-    - waypoint
-    - v3
-    - swift-like
-    - bounds-norm
-    - best-every-rollout
+  tags: [flightmare, ppo, state-only, waypoint, v4, paper, flightgym-backend, curriculum]

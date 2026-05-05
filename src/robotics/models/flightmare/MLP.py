@@ -236,3 +236,108 @@ class MLPFusion(nn.Module):
             parts.append(self.action_encoder(batch["prev_actions"]))
         fused = torch.cat(parts, dim=-1)
         return self.trunk(fused)
+
+
+class MLPSwiftFusion(nn.Module):
+    """Swift-style split-then-fuse trunk for state-only racing policies.
+
+    Two encoder branches (proprio, gate), then a wide trunk:
+
+      proprio_core(9) ++ aux(3) ++ prev_action(4)
+                                       └── MLP[128, 128] ── 128 ──┐
+                                                                  ├── trunk MLP[512, 512, 512] ── 512
+      gate(24)                       ── MLP[128, 128] ── 128 ────┘
+
+    Letting the gate branch and the proprio branch learn their own
+    representations and normalization, with the trunk fusing them, beats a
+    single ``[obs → MLP]`` baseline by a small but consistent margin in
+    racing (Kaufmann et al., Swift, Nature 2023). Vision is intentionally
+    absent — this trunk is for state-only ablations.
+
+    Expected ``forward`` batch keys:
+      * ``proprio_core``  ``[B, proprio_core_dim]``
+      * ``gate``          ``[B, gate_dim]``
+      * ``aux``           ``[B, aux_dim]``
+      * ``prev_actions``  ``[B, action_dim]`` (optional, controlled by
+                          ``include_prev_action``)
+    """
+
+    def __init__(
+        self,
+        proprio_core_dim: int,
+        gate_dim: int,
+        aux_dim: int,
+        action_dim: int,
+        include_prev_action: bool = True,
+        proprio_hidden_dim: int = 128,
+        proprio_embed_dim: int = 128,
+        gate_hidden_dim: int = 128,
+        gate_embed_dim: int = 128,
+        trunk_hidden_dim: int = 512,
+        trunk_depth: int = 3,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.proprio_core_dim = proprio_core_dim
+        self.gate_dim = gate_dim
+        self.aux_dim = aux_dim
+        self.action_dim = action_dim
+        self.include_prev_action = include_prev_action
+
+        proprio_in = proprio_core_dim + aux_dim + (action_dim if include_prev_action else 0)
+        self.proprio_encoder = nn.Sequential(
+            nn.LayerNorm(proprio_in),
+            nn.Linear(proprio_in, proprio_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(proprio_hidden_dim, proprio_embed_dim),
+        )
+        self.gate_encoder = nn.Sequential(
+            nn.LayerNorm(gate_dim),
+            nn.Linear(gate_dim, gate_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(gate_hidden_dim, gate_embed_dim),
+        )
+
+        fused_in = proprio_embed_dim + gate_embed_dim
+        layers: list[nn.Module] = [
+            nn.LayerNorm(fused_in),
+            nn.Linear(fused_in, trunk_hidden_dim),
+            nn.SiLU(),
+        ]
+        for _ in range(max(0, trunk_depth - 1)):
+            layers.append(nn.Linear(trunk_hidden_dim, trunk_hidden_dim))
+            layers.append(nn.SiLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+        self.trunk = nn.Sequential(*layers)
+        self.feature_dim = trunk_hidden_dim
+
+    def _split_state(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split a flat ``state`` tensor (proprio_core ++ gate ++ aux) into
+        the three branches. Layout matches ``FlightmareBCStateV3Dataset``
+        and the v3 PPO env."""
+        p_end = self.proprio_core_dim
+        g_end = p_end + self.gate_dim
+        a_end = g_end + self.aux_dim
+        if state.shape[-1] != a_end:
+            raise ValueError(
+                f"state dim {state.shape[-1]} != proprio({self.proprio_core_dim}) + "
+                f"gate({self.gate_dim}) + aux({self.aux_dim}) = {a_end}"
+            )
+        return state[..., :p_end], state[..., p_end:g_end], state[..., g_end:a_end]
+
+    def forward(self, batch: dict) -> torch.Tensor:
+        if "proprio_core" in batch:
+            proprio_core = batch["proprio_core"]
+            gate = batch["gate"]
+            aux = batch["aux"]
+        else:
+            proprio_core, gate, aux = self._split_state(batch["state"])
+        proprio_parts = [proprio_core, aux]
+        if self.include_prev_action:
+            proprio_parts.append(batch["prev_actions"])
+        proprio_in = torch.cat(proprio_parts, dim=-1)
+        z_p = self.proprio_encoder(proprio_in)
+        z_g = self.gate_encoder(gate)
+        fused = torch.cat([z_p, z_g], dim=-1)
+        return self.trunk(fused)

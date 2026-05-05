@@ -20,7 +20,6 @@ import src.robotics.models.VLA_MLP
 import src.robotics.models.VLA_Gaussian
 import src.robotics.models.ActorCritic
 import src.robotics.models.flightmare
-import src.robotics.ppo_trainer
 import src.robotics.flightmare_envs
 import src.robotics.flightmare_ppo_trainer
 

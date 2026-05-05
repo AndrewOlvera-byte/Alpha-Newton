@@ -13,7 +13,7 @@ from src.core.registry import build
 
 # Register builders
 import src.robotics.data
-import src.robotics.trainer
+import src.robotics.bc_trainer
 import src.robotics.models.VLA_like
 import src.robotics.models.VLA_MLP
 import src.robotics.models.VLA_Gaussian

@@ -24,6 +24,16 @@ from scripts.flightmare_bc.action_norms import action_bounds, stats_mode
 from scripts.flightmare_bc.controllers import QuadParams, quat_to_R
 from scripts.flightmare_bc.expert_env import FlightmareExpertEnv
 from scripts.flightmare_bc.mission import LOOKAHEAD_GATES, MISSION_DIM, encode_mission, gates_to_views
+from scripts.flightmare_bc.obs_v3 import (
+    AUX_DIM,
+    GATE_DIM,
+    LOOKAHEAD_GATES_V3,
+    PROPRIO_CORE_DIM,
+    GateSpec,
+    build_proprio_core,
+    encode_aux,
+    encode_gate_corners,
+)
 from src.core.registry import register
 from src.robotics.flightmare_autonomy_fsw.controllers import (
     BaseCTBRController,
@@ -57,6 +67,14 @@ class FlightmareNormStats:
     normalize_state: bool = True
     normalize_mission: bool = True
     normalize_action: bool = True
+    # --- obs v3 (Swift split-then-fuse) ---
+    obs_schema: str = "v2"  # "v2" or "v3"
+    proprio_mean: np.ndarray | None = None
+    proprio_std: np.ndarray | None = None
+    gate_mean: np.ndarray | None = None
+    gate_std: np.ndarray | None = None
+    aux_mean: np.ndarray | None = None
+    aux_std: np.ndarray | None = None
 
     @classmethod
     def load(
@@ -68,12 +86,31 @@ class FlightmareNormStats:
         normalize_mission: bool = True,
         normalize_action: bool = True,
         action_normalization: str = "auto",
+        obs_schema: str = "v2",
     ) -> "FlightmareNormStats":
         stats = np.load(path)
         mission_mean = stats["mission_mean"].astype(np.float32) if "mission_mean" in stats.files else None
         mission_std = stats["mission_std"].astype(np.float32) if "mission_std" in stats.files else None
         mode = stats_mode(stats, default="standard") if action_normalization == "auto" else str(action_normalization)
         low, high = action_bounds(action_type, stats)
+
+        v3_kwargs: dict[str, Any] = {}
+        if obs_schema == "v3":
+            for needed in ("proprio_core_mean", "gate_mean", "aux_mean"):
+                if needed not in stats.files:
+                    raise RuntimeError(
+                        f"{path} missing v3 stats {needed!r} — rerun "
+                        f"`python -m scripts.flightmare_bc.transform_to_v3`."
+                    )
+            v3_kwargs = dict(
+                proprio_mean=stats["proprio_core_mean"].astype(np.float32),
+                proprio_std=stats["proprio_core_std"].astype(np.float32),
+                gate_mean=stats["gate_mean"].astype(np.float32),
+                gate_std=stats["gate_std"].astype(np.float32),
+                aux_mean=stats["aux_mean"].astype(np.float32),
+                aux_std=stats["aux_std"].astype(np.float32),
+            )
+
         return cls(
             state_mean=stats["state_mean"].astype(np.float32),
             state_std=stats["state_std"].astype(np.float32),
@@ -88,10 +125,14 @@ class FlightmareNormStats:
             normalize_state=normalize_state,
             normalize_mission=normalize_mission and include_mission,
             normalize_action=normalize_action,
+            obs_schema=obs_schema,
+            **v3_kwargs,
         )
 
     @property
     def state_dim(self) -> int:
+        if self.obs_schema == "v3":
+            return PROPRIO_CORE_DIM + GATE_DIM + AUX_DIM
         return int(self.state_mean.shape[0] + (MISSION_DIM if self.include_mission else 0))
 
     @property
@@ -108,6 +149,16 @@ class FlightmareNormStats:
                 mission = (mission - self.mission_mean) / self.mission_std
             state = np.concatenate([state, mission], axis=0)
         return state.astype(np.float32)
+
+    def normalize_observation_v3(
+        self, proprio_core: np.ndarray, gate: np.ndarray, aux: np.ndarray
+    ) -> np.ndarray:
+        """Normalize and concat the three v3 blocks into a 36-d state vector."""
+        if self.normalize_state:
+            proprio_core = (proprio_core - self.proprio_mean) / self.proprio_std
+            gate = (gate - self.gate_mean) / self.gate_std
+            aux = (aux - self.aux_mean) / self.aux_std
+        return np.concatenate([proprio_core, gate, aux], axis=0).astype(np.float32)
 
     def denormalize_action(self, action: np.ndarray) -> np.ndarray:
         action = np.asarray(action, dtype=np.float32)
@@ -140,6 +191,7 @@ class FlightmareNormStats:
 class FlightmareRacingEnvConfig:
     data_dir: str = "data/flightmare/bc_v1"
     action_type: str = "ctbr"
+    obs_schema: str = "v2"  # "v2" (state+mission, 33-d) or "v3" (Swift split-then-fuse, 36-d)
     include_mission: bool = True
     normalize_state: bool = True
     normalize_mission: bool = True
@@ -186,7 +238,11 @@ class FlightmareRacingEnv(gymnasium.Env):
             normalize_mission=cfg.normalize_mission,
             normalize_action=cfg.normalize_action,
             action_normalization=cfg.action_normalization,
+            obs_schema=cfg.obs_schema,
         )
+        self._gate_specs: list[GateSpec] = []
+        self._gate_index_v3 = 0
+        self._last_pass_step = 0
         self.reward_fn = get_reward_function(cfg.reward_fn)
         self.env = FlightmareExpertEnv(
             image_size=cfg.image_size,
@@ -243,6 +299,20 @@ class FlightmareRacingEnv(gymnasium.Env):
         return encode_mission(pos, quat, self._gate_views, current, LOOKAHEAD_GATES)
 
     def _make_obs(self) -> dict:
+        if self.cfg.obs_schema == "v3":
+            current = 0 if self._strict_tracker is None else self._strict_tracker.current_index
+            # Update time_since_pass tracker on gate-index advance.
+            if current != self._gate_index_v3:
+                self._last_pass_step = self._step_count
+                self._gate_index_v3 = current
+            time_since_pass = float(self._step_count - self._last_pass_step) * self.dt
+            proprio = build_proprio_core(self._obs.vel, self._obs.quat, self._obs.omega)
+            gate = encode_gate_corners(
+                self._obs.pos, self._obs.quat, self._gate_specs, current, LOOKAHEAD_GATES_V3
+            )
+            aux = encode_aux(self._obs.pos, self._gate_specs, current, time_since_pass)
+            state = self.norm.normalize_observation_v3(proprio, gate, aux)
+            return {"state": state, "images": {}}
         mission = self._mission(self._obs.pos, self._obs.quat)
         state = build_state(self._obs.pos, self._obs.vel, self._obs.quat, self._obs.omega)
         return {
@@ -331,6 +401,17 @@ class FlightmareRacingEnv(gymnasium.Env):
         self._obs = self.env.reset(init_pos=waypoints[0], yaw=yaw)
         self._gate_views = gates_to_views(self._gates)
         self._strict_tracker = StrictGateTracker(self._gates, vehicle_radius=self.cfg.gate_vehicle_radius)
+        self._gate_specs = [
+            GateSpec(
+                pos=np.asarray(g.pos, dtype=np.float64),
+                yaw=float(getattr(g, "yaw", 0.0)),
+                size=np.asarray(getattr(g, "size", (1.6, 1.6, 1.6)), dtype=np.float64),
+                quat=(np.asarray(g.quat, dtype=np.float64) if getattr(g, "quat", None) is not None else None),
+            )
+            for g in self._gates
+        ]
+        self._gate_index_v3 = 0
+        self._last_pass_step = 0
         self._prev_raw_action = np.zeros(self.norm.action_dim, dtype=np.float32)
         self._prev_pos = self._obs.pos.copy()
         self._step_count = 0
@@ -514,20 +595,37 @@ def build_flightmare_env_config(**kwargs) -> FlightmareRacingEnvConfig:
         course_kwargs["num_gates"] = kwargs.pop("num_gates")
     if "z_min" in kwargs:
         course_kwargs["z_min"] = kwargs.pop("z_min")
+    if "gate_approach_m" in kwargs:
+        course_kwargs["gate_approach_m"] = kwargs.pop("gate_approach_m")
     course = CourseConfig(**course_kwargs)
     return FlightmareRacingEnvConfig(course=course, **kwargs)
 
 
-def _subproc_worker(remote, env_kwargs_list: list[dict], seeds: list[int]) -> None:
+def _subproc_worker(remote, env_kwargs_list: list[dict], seeds: list[int], worker_id: int = 0) -> None:
     """Subprocess worker: holds a slice of envs, services step/reset commands.
 
     Lives at module level so it pickles under the 'spawn' start method.
+    Sets ``FLIGHTMARE_PUB_PORT``/``FLIGHTMARE_SUB_PORT`` per worker so each
+    flightgym instance binds its own ZMQ port pair (otherwise every worker
+    would race for the default 10253/10254 and crash with ``Address already
+    in use``). Requires the patched ``unity_bridge.cpp`` that reads these
+    env vars.
     """
-    import os
+    import os, sys
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
+    # Self-contained port allocation (no import dependency). Matches
+    # parallel_unity.allocate_ports: base 10253/10254, stride 4 per slot.
+    _BASE_PUB, _BASE_SUB, _STRIDE = 10253, 10254, 4
+    _ENV_SLOTS_PER_WORKER = 64  # upper bound; gives disjoint port ranges across workers
     envs: list[FlightmareRacingEnv] = []
-    for kw, seed in zip(env_kwargs_list, seeds):
+    for local_i, (kw, seed) in enumerate(zip(env_kwargs_list, seeds)):
+        slot = int(worker_id) * _ENV_SLOTS_PER_WORKER + local_i
+        pub = _BASE_PUB + slot * _STRIDE
+        sub = _BASE_SUB + slot * _STRIDE
+        os.environ["FLIGHTMARE_PUB_PORT"] = str(pub)
+        os.environ["FLIGHTMARE_SUB_PORT"] = str(sub)
+        print(f"[subproc_worker w={worker_id} local={local_i}] FLIGHTMARE_PUB_PORT={pub} SUB_PORT={sub}", flush=True)
         cfg = build_flightmare_env_config(**{**kw, "seed": int(seed)})
         envs.append(FlightmareRacingEnv(cfg))
     try:
@@ -574,7 +672,14 @@ class SubprocFlightmareVecEnv:
     def __init__(self, env_kwargs_list: list[dict], seeds: list[int], n_workers: int):
         import multiprocessing as mp
         n = len(env_kwargs_list)
-        n_workers = max(1, min(int(n_workers), n))
+        # Flightmare/UnityBridge binds a ZMQ port per env construction. The
+        # patched bridge reads FLIGHTMARE_PUB_PORT/SUB_PORT once-effective at
+        # bridge construction, but in practice multiple envs inside the same
+        # subprocess still race / collide on ports. The only configuration
+        # that has proven reliable (matches parallel_collect.py) is one env
+        # per worker process, so we force that here regardless of the
+        # configured n_workers.
+        n_workers = n
         bins = np.array_split(np.arange(n, dtype=np.int64), n_workers)
         self._chunks: list[list[int]] = [list(map(int, b)) for b in bins]
         self._owner: list[tuple[int, int]] = [(-1, -1)] * n
@@ -590,7 +695,7 @@ class SubprocFlightmareVecEnv:
             parent_conn, child_conn = ctx.Pipe(duplex=True)
             p = ctx.Process(
                 target=_subproc_worker,
-                args=(child_conn, sub_kwargs, sub_seeds),
+                args=(child_conn, sub_kwargs, sub_seeds, w),
                 daemon=True,
             )
             p.start()

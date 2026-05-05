@@ -1,3 +1,4 @@
+# DEPRECATED NOW USING FLIGHTMARE BACKEND IN /paper
 # PPO fine-tuning for state-only Flightmare waypoint+LQR racing policy.
 # v2 keeps the best policy from any rollout, not only periodic checkpoints.
 

@@ -343,6 +343,7 @@ class FlightmarePPOTrainer:
             "n_workers": int(ppo.get("n_workers", 0)),
             "data_dir": self.data_cfg.get("data_dir", "data/flightmare/bc_v1"),
             "action_type": self.data_cfg.get("action_type", ppo.get("action_type", "ctbr")),
+            "obs_schema": self.data_cfg.get("obs_schema", ppo.get("obs_schema", "v2")),
             "include_mission": self.data_cfg.get("include_mission", True),
             "normalize_state": self.data_cfg.get("normalize_state", True),
             "normalize_mission": self.data_cfg.get("normalize_mission", True),

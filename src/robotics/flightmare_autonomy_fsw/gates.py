@@ -17,31 +17,73 @@ class GateCrossingEvent:
     clearance_margin_m: float = 0.0
 
 
-def _gate_pos_yaw_size(gate) -> tuple[np.ndarray, float, np.ndarray]:
+def _gate_pos_yaw_size_quat(gate):
     if hasattr(gate, "pos"):
         pos = np.asarray(gate.pos, dtype=np.float64)
         yaw = float(gate.yaw)
         size = getattr(gate, "size", None)
+        quat = getattr(gate, "quat", None)
     else:
         pos = np.asarray(gate["pos"], dtype=np.float64)
         yaw = float(gate["yaw"])
         size = gate.get("size")
+        quat = gate.get("quat")
     if size is None:
         size_arr = np.ones(3, dtype=np.float64)
     else:
         size_arr = np.asarray(size, dtype=np.float64).reshape(-1)
         if size_arr.size == 1:
             size_arr = np.repeat(size_arr, 3)
-    return pos, yaw, size_arr
+    if quat is not None:
+        quat = np.asarray(quat, dtype=np.float64).reshape(4)
+    return pos, yaw, size_arr, quat
+
+
+def _gate_pos_yaw_size(gate):
+    pos, yaw, size, _ = _gate_pos_yaw_size_quat(gate)
+    return pos, yaw, size
+
+
+def _quat_yaw(yaw: float) -> np.ndarray:
+    return np.array([np.cos(0.5 * yaw), 0.0, 0.0, np.sin(0.5 * yaw)], dtype=np.float64)
+
+
+def _quat_to_R(quat: np.ndarray) -> np.ndarray:
+    w, x, y, z = quat
+    n = w * w + x * x + y * y + z * z
+    if n < 1e-12:
+        return np.eye(3)
+    s = 2.0 / n
+    return np.array([
+        [1 - s * (y * y + z * z), s * (x * y - z * w),     s * (x * z + y * w)],
+        [s * (x * y + z * w),     1 - s * (x * x + z * z), s * (y * z - x * w)],
+        [s * (x * z - y * w),     s * (y * z + x * w),     1 - s * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
+def gate_quat(gate) -> np.ndarray:
+    """World-from-gate quaternion (w, x, y, z). Falls back to yaw-only when
+    the gate has no full 3D orientation set."""
+    _, yaw, _, quat = _gate_pos_yaw_size_quat(gate)
+    return quat if quat is not None else _quat_yaw(yaw)
 
 
 def gate_frame(gate) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return gate center and world-frame forward/lateral/up axes."""
-    pos, yaw, _ = _gate_pos_yaw_size(gate)
-    forward = np.array([np.cos(yaw), np.sin(yaw), 0.0], dtype=np.float64)
-    lateral = np.array([-np.sin(yaw), np.cos(yaw), 0.0], dtype=np.float64)
-    up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    return pos, forward, lateral, up
+    """Return gate center and world-frame forward/lateral/up axes.
+
+    The gate's body +x is forward (the approach normal), +y is lateral, +z
+    is up (top of the gate). For an upright yaw-only gate this collapses to
+    ``[cos(yaw), sin(yaw), 0]`` etc. For a Split-S inverted gate the up axis
+    points world-down — which lets the planner / aperture check / mission
+    obs all behave correctly without special-casing inverted gates."""
+    pos, yaw, _, quat = _gate_pos_yaw_size_quat(gate)
+    if quat is None:
+        forward = np.array([np.cos(yaw), np.sin(yaw), 0.0], dtype=np.float64)
+        lateral = np.array([-np.sin(yaw), np.cos(yaw), 0.0], dtype=np.float64)
+        up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        return pos, forward, lateral, up
+    R = _quat_to_R(quat)
+    return pos, R[:, 0].copy(), R[:, 1].copy(), R[:, 2].copy()
 
 
 def gate_half_extents(gate, vehicle_radius: float = 0.0) -> tuple[float, float]:

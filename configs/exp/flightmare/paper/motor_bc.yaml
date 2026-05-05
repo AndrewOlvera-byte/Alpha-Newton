@@ -1,33 +1,43 @@
-# DEPRECATED NOW USING FLIGHTMARE BACKEND IN /paper
-# State-only BC warmup for v3 Swift-scale per-motor racing.
-# Uses the same recollected dataset as waypoint v3, but trains on action/motor.
+# Paper ablation — BC pretraining on REAL Flightmare dynamics.
+# Action space: MOTOR (4 per-rotor normalized thrusts).
+# Architecture: unified flightmare_actor (mode=bc, action_type=motor).
+# Data:         data/flightmare/bc_v4 (collected via collect_v4.sh, flightgym).
+#
+# Same hyperparameters as waypoint_bc.yaml so the ablation isolates the
+# action-space effect.
 
 run:
-  name: flightmare_motor_bc_state_v3
+  name: paper_motor_bc_v4
   mode: bc
   seed: 0
 
 data:
-  type: flightmare_bc_state
-  data_dir: data/flightmare/bc_v3_swift_like
+  type: flightmare_bc_state_v3
+  data_dir: data/flightmare/bc_v4
   action_type: motor
-  include_mission: true
-  normalize_state: true
+  normalize_obs: true
   normalize_action: true
   action_normalization: bounds
-  normalize_mission: true
 
 robotics:
   architecture:
-    type: flightmare_motor_bc_state
-    state_dim: 27
+    type: flightmare_actor
+    mode: bc
+    action_type: motor
+
+    fusion: swift
+    proprio_core_dim: 9
+    gate_dim: 24
+    aux_dim: 3
     action_dim: 4
     use_vision: false
     include_prev_action: true
 
-    state_hidden_dim: 256
-    state_embed_dim: 256
-    trunk_hidden_dim: 512
+    proprio_hidden_dim: 128
+    proprio_embed_dim: 128
+    gate_hidden_dim: 128
+    gate_embed_dim: 128
+    trunk_hidden_dim: 768
     trunk_depth: 3
     dropout: 0.1
 
@@ -69,11 +79,4 @@ wandb:
   project: flightmare-bc
   entity: andrewolvera
   run_name: ${run.name}
-  tags:
-    - flightmare
-    - bc
-    - state-only
-    - motor
-    - v3
-    - swift-like
-    - bounds-norm
+  tags: [flightmare, bc, state-only, motor, v4, paper, flightgym-backend]

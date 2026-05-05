@@ -46,10 +46,23 @@ class StepResult:
 
 @dataclass
 class GateSpec:
+    """3D gate spec.
+
+    ``yaw`` is preserved for upright gates and Unity rendering. ``quat``
+    (w, x, y, z) is the full 3D orientation of the gate frame in world coords:
+    its body +x axis is the **forward** direction (the side approached from),
+    +z is the **up** direction (top of the gate). For an upright gate this
+    quat encodes a pure Z-rotation of magnitude ``yaw``; for a Split-S
+    inverted gate the quat additionally rolls 180° about its +x axis so
+    the up vector points world-down (-Z). When ``quat`` is None, callers
+    derive an upright quaternion from ``yaw``.
+    """
+
     gate_id: str
     pos: np.ndarray
     yaw: float
     size: np.ndarray
+    quat: np.ndarray | None = None  # (w, x, y, z), world-from-gate; None -> derived from yaw
 
 
 class FlightmareExpertEnv:
@@ -96,12 +109,19 @@ class FlightmareExpertEnv:
                     "If you are intentionally running a smoke test outside the Docker image "
                     "where flightgym is unavailable, set ALPHA_NEWTON_ALLOW_NUMPY_FALLBACK=1."
                 )
+            # Both 'flightgym' (headless) and 'visual' (with Unity rendering)
+            # route to the same VisualRacingEnv_v0 binding (see
+            # patch_flightmare_pybind.py). It exposes setState/stepCtbr/stepMotor
+            # which we need; the bare QuadrotorEnv_v1 wrapper does not. The only
+            # difference between the two backends is whether connectUnity() is
+            # called and whether RGB frames are read out — both controlled by
+            # the ``render`` flag passed below.
             if self.backend == "flightgym":
-                impl_cls = _FlightgymImpl
+                impl_cls = _VisualFlightmareImpl
             elif self.backend == "visual":
                 impl_cls = _VisualFlightmareImpl
             elif self.backend == "auto":
-                impl_cls = _VisualFlightmareImpl if (self._render or self.visual_backend) else _FlightgymImpl
+                impl_cls = _VisualFlightmareImpl
             else:
                 raise ValueError(f"Unknown FlightmareExpertEnv backend={self.backend!r}")
             return impl_cls(
@@ -239,8 +259,31 @@ env:
         self._render = render
 
     def reset(self, init_pos, yaw):
+        # Flightgym's QuadrotorEnv_v1 reset() ignores init_pos/yaw and may spawn
+        # the quad with a non-level attitude. Run a brief Python-side stabilize
+        # loop (level-attitude PD on quat + body-rate damping) so the policy
+        # always sees a settled hover state. Caller is expected to translate
+        # the course origin to the resulting pos (flightgym never moves to the
+        # requested init_pos — the installed binding doesn't expose setState).
         self.env.reset(self.obs)
-        self._last_omega = np.zeros(3, dtype=np.float64)
+        self._last_omega = self.obs[0, 9:12].astype(np.float64)
+        hover_thrust = float(self.params.mass * 9.81)
+        for _ in range(60):
+            row = self.obs[0].astype(np.float64)
+            quat = _quat_from_euler_zyx(row[3:6])
+            omega = row[9:12]
+            R = quat_to_R(quat)
+            b3 = R[:, 2]
+            # Drive thrust axis toward world +z. Cross product gives the body-rate
+            # axis that rotates b3 onto [0,0,1]; magnitude is sin(angle).
+            e_axis = np.cross(b3, np.array([0.0, 0.0, 1.0]))
+            kp_att = 6.0
+            kd_omega = 0.5
+            omega_des = kp_att * e_axis - kd_omega * omega
+            motor = self._ctbr_to_motor(hover_thrust, omega_des)
+            self.act[0] = np.clip(2.0 * motor - 0.5, -0.5, 1.5).astype(np.float32)
+            self.env.step(self.act, self.obs, self.reward, self.done, self.extra)
+            self._last_omega = self.obs[0, 9:12].astype(np.float64)
         return self._observe(done=False)
 
     def step_ctbr(self, thrust_newton, omega_des):

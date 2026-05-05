@@ -1,3 +1,4 @@
+# DEPRECATED NOW USING FLIGHTMARE BACKEND IN /paper
 # State-only BC warmup for v3 Swift-scale waypoint+speed racing.
 # First collect data:
 #   docker compose exec alpha-newton bash scripts/flightmare_bc/collect_v3_swift_like.sh

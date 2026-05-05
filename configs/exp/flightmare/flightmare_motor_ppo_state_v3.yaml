@@ -1,3 +1,4 @@
+# DEPRECATED NOW USING FLIGHTMARE BACKEND IN /paper
 # PPO fine-tuning for v3 Swift-scale per-motor racing.
 # This is the 4-motor actuator ablation; CTBR is intentionally not used.
 

@@ -49,6 +49,16 @@ from scripts.flightmare_bc.mission import (
     encode_mission,
     gates_to_views,
 )
+from scripts.flightmare_bc.obs_v3 import (
+    AUX_DIM,
+    GATE_DIM,
+    LOOKAHEAD_GATES_V3,
+    PROPRIO_CORE_DIM,
+    GateSpec,
+    build_proprio_core,
+    encode_aux,
+    encode_gate_corners,
+)
 
 
 @dataclass
@@ -129,17 +139,31 @@ class MissionWrapper:
         lookahead: int = LOOKAHEAD_GATES,
         include_mission: bool = True,
         concat_mission_to_state: bool = False,
+        obs_schema: str = "v2",
     ):
+        if obs_schema not in {"v2", "v3"}:
+            raise ValueError(f"obs_schema must be 'v2' or 'v3', got {obs_schema!r}")
         self.policy = policy
         self.action_type = action_type
         self.device = torch.device(device)
-        self.lookahead = int(lookahead)
+        self.lookahead = int(lookahead) if obs_schema == "v2" else LOOKAHEAD_GATES_V3
         self.include_mission = bool(include_mission)
         self.concat_mission_to_state = bool(concat_mission_to_state)
+        self.obs_schema = obs_schema
         self.tracker = MissionTracker(gates, lookahead=self.lookahead)
+        self._gate_specs: list[GateSpec] = self._gates_to_specs(gates)
+        # v3 time_since_pass tracker (in seconds; advanced by act/update at
+        # caller cadence — eval driver tells us via update_world_model).
+        self._step_count = 0
+        self._last_pass_step = 0
+        self._gate_index_v3 = 0
+        self._dt = 0.01  # default 100 Hz; eval driver may set via set_dt().
 
         self._state_mean = self._state_std = None
         self._mission_mean = self._mission_std = None
+        self._proprio_mean = self._proprio_std = None
+        self._gate_mean = self._gate_std = None
+        self._aux_mean = self._aux_std = None
         self._action_mean = self._action_std = None
         self._action_low = self._action_high = None
         self._action_norm_mode = "standard"
@@ -150,6 +174,19 @@ class MissionWrapper:
             if "mission_mean" in stats.files:
                 self._mission_mean = torch.from_numpy(stats["mission_mean"]).float().to(self.device)
                 self._mission_std = torch.from_numpy(stats["mission_std"]).float().to(self.device)
+            if obs_schema == "v3":
+                for k in ("proprio_core_mean", "gate_mean", "aux_mean"):
+                    if k not in stats.files:
+                        raise RuntimeError(
+                            f"{norm_stats} missing v3 stats {k!r} — run "
+                            f"`python -m scripts.flightmare_bc.transform_to_v3` first."
+                        )
+                self._proprio_mean = torch.from_numpy(stats["proprio_core_mean"]).float().to(self.device)
+                self._proprio_std = torch.from_numpy(stats["proprio_core_std"]).float().to(self.device)
+                self._gate_mean = torch.from_numpy(stats["gate_mean"]).float().to(self.device)
+                self._gate_std = torch.from_numpy(stats["gate_std"]).float().to(self.device)
+                self._aux_mean = torch.from_numpy(stats["aux_mean"]).float().to(self.device)
+                self._aux_std = torch.from_numpy(stats["aux_std"]).float().to(self.device)
             mkey = f"{action_type}_mean"
             if mkey in stats.files:
                 self._action_mean = torch.from_numpy(stats[mkey]).float().to(self.device)
@@ -162,6 +199,28 @@ class MissionWrapper:
         self._prev_action = None  # populated on first act()
         self._last_observation: MissionObservation | None = None
 
+    @staticmethod
+    def _gates_to_specs(gates) -> list[GateSpec]:
+        specs: list[GateSpec] = []
+        for g in gates:
+            if hasattr(g, "pos"):
+                pos = np.asarray(g.pos, dtype=np.float64)
+                yaw = float(getattr(g, "yaw", 0.0))
+                size = np.asarray(getattr(g, "size", (1.6, 1.6, 1.6)), dtype=np.float64)
+                quat = getattr(g, "quat", None)
+            else:
+                pos = np.asarray(g["pos"], dtype=np.float64)
+                yaw = float(g.get("yaw", 0.0))
+                size = np.asarray(g.get("size", (1.6, 1.6, 1.6)), dtype=np.float64)
+                quat = g.get("quat")
+            if quat is not None:
+                quat = np.asarray(quat, dtype=np.float64).reshape(4)
+            specs.append(GateSpec(pos=pos, yaw=yaw, size=size, quat=quat))
+        return specs
+
+    def set_dt(self, dt: float) -> None:
+        self._dt = float(dt)
+
     @property
     def current_gate_index(self) -> int:
         return self.tracker.current_index
@@ -173,12 +232,16 @@ class MissionWrapper:
     def set_gates(self, gates) -> None:
         """Replace the active track map and clear per-episode state."""
         self.tracker = MissionTracker(gates, lookahead=self.lookahead)
+        self._gate_specs = self._gates_to_specs(gates)
         self.reset()
 
     def reset(self) -> None:
         self.tracker.current_index = 0
         self._prev_action = None
         self._last_observation = None
+        self._step_count = 0
+        self._last_pass_step = 0
+        self._gate_index_v3 = 0
 
     def update_world_model(
         self,
@@ -194,6 +257,7 @@ class MissionWrapper:
         omega = np.asarray(omega, dtype=np.float32)
 
         self.tracker.update(pos)
+        self._step_count += 1
         mission_np = encode_mission(
             pos,
             quat,
@@ -260,25 +324,51 @@ class MissionWrapper:
             raise RuntimeError("update_world_model() must be called before make_policy_batch().")
 
         obs = self._last_observation
-        state = torch.from_numpy(obs.drone_state).float().to(self.device).unsqueeze(0)
-        mission = torch.from_numpy(obs.mission).float().to(self.device).unsqueeze(0)
 
-        if self._state_mean is not None:
-            state = (state - self._state_mean) / self._state_std
-        if self._mission_mean is not None:
-            mission = (mission - self._mission_mean) / self._mission_std
+        if self.obs_schema == "v3":
+            current = int(self.tracker.current_index)
+            if current != self._gate_index_v3:
+                self._last_pass_step = self._step_count
+                self._gate_index_v3 = current
+            time_since_pass = float(self._step_count - self._last_pass_step) * self._dt
+            proprio_np = build_proprio_core(obs.vel, obs.quat, obs.omega)
+            gate_np = encode_gate_corners(
+                obs.pos, obs.quat, self._gate_specs, current, LOOKAHEAD_GATES_V3
+            )
+            aux_np = encode_aux(obs.pos, self._gate_specs, current, time_since_pass)
+            proprio = torch.from_numpy(proprio_np).float().to(self.device).unsqueeze(0)
+            gate = torch.from_numpy(gate_np).float().to(self.device).unsqueeze(0)
+            aux = torch.from_numpy(aux_np).float().to(self.device).unsqueeze(0)
+            if self._proprio_mean is not None:
+                proprio = (proprio - self._proprio_mean) / self._proprio_std
+                gate = (gate - self._gate_mean) / self._gate_std
+                aux = (aux - self._aux_mean) / self._aux_std
+            state = torch.cat([proprio, gate, aux], dim=-1)
+            batch = {
+                "images": {},
+                "state": state,
+                "prev_actions": self._prepare_prev_action(prev_action, prev_action_normalized),
+            }
+        else:
+            state = torch.from_numpy(obs.drone_state).float().to(self.device).unsqueeze(0)
+            mission = torch.from_numpy(obs.mission).float().to(self.device).unsqueeze(0)
 
-        batch = {
-            "images": {},
-            "state": state,
-            "prev_actions": self._prepare_prev_action(prev_action, prev_action_normalized),
-        }
+            if self._state_mean is not None:
+                state = (state - self._state_mean) / self._state_std
+            if self._mission_mean is not None:
+                mission = (mission - self._mission_mean) / self._mission_std
 
-        if self.include_mission:
-            if self.concat_mission_to_state:
-                batch["state"] = torch.cat([state, mission], dim=-1)
-            else:
-                batch["mission"] = mission
+            batch = {
+                "images": {},
+                "state": state,
+                "prev_actions": self._prepare_prev_action(prev_action, prev_action_normalized),
+            }
+
+            if self.include_mission:
+                if self.concat_mission_to_state:
+                    batch["state"] = torch.cat([state, mission], dim=-1)
+                else:
+                    batch["mission"] = mission
 
         if image is not None:
             if isinstance(image, np.ndarray):

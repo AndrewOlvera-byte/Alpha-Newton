@@ -307,6 +307,13 @@ class FlightmarePPOTrainer:
         }
         self.best_score = float("-inf")
         self.best_iteration = 0
+        # When set, the trainer restores actor+critic weights, the AdamW
+        # optimizer state, and the rolling best-score from this directory at
+        # the start of train(). Falls back gracefully when optimizer.pt or
+        # training_state.json are missing — e.g. when the source checkpoint
+        # was saved before save_optimizer_state was enabled, in which case
+        # only the model weights are restored and the optimizer starts fresh.
+        self.resume_from = ppo.get("resume_from") or training_cfg.get("resume_from")
         self.save_total_limit = training_cfg.get("save_total_limit")
         self.save_total_limit = int(self.save_total_limit) if self.save_total_limit else None
         self.save_final = bool(training_cfg.get("save_final", True))
@@ -557,6 +564,9 @@ class FlightmarePPOTrainer:
             {"params": critic_params, "lr": self.critic_lr, "weight_decay": 1e-4},
         ])
 
+        if self.resume_from:
+            self._restore_from_checkpoint(self.resume_from, model, optimizer)
+
         base_env_kwargs = self._env_kwargs()
         env_seed = int(self.ppo_cfg.get("seed", 0))
         if self.curriculum is not None:
@@ -777,6 +787,73 @@ class FlightmarePPOTrainer:
             )
         if getattr(self, "_wandb", None) is not None and self._wandb.run:
             self._wandb.finish()
+
+    def _restore_from_checkpoint(self, path: str, model: nn.Module, optimizer) -> None:
+        """Restore actor+critic weights, optimizer state, and best-score
+        bookkeeping from a previous PPO checkpoint directory.
+
+        The BC entrypoint's ``from_bc_checkpoint`` already preloaded matching
+        weights when the same path was passed as ``bc_checkpoint``; this is a
+        belt-and-suspenders re-load so configs that only set ``resume_from``
+        (no ``bc_checkpoint``) still pick up actor+critic. ``strict=False`` so
+        a critic added after the source checkpoint was written stays at its
+        freshly-initialized values.
+        """
+        ckpt_dir = path
+        if not os.path.isdir(ckpt_dir):
+            raise FileNotFoundError(f"resume_from directory not found: {ckpt_dir}")
+
+        model_path = os.path.join(ckpt_dir, "model.pt")
+        if not os.path.exists(model_path):
+            model_path = os.path.join(ckpt_dir, "actor_critic.pt")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Neither model.pt nor actor_critic.pt found under {ckpt_dir}."
+            )
+        state = torch.load(model_path, map_location=self.device, weights_only=True)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"[Flightmare PPO] Resumed model weights from {model_path}")
+        if missing:
+            print(f"  missing keys ({len(missing)}): {missing[:5]}{' ...' if len(missing) > 5 else ''}")
+        if unexpected:
+            print(f"  unexpected keys ({len(unexpected)}): {unexpected[:5]}{' ...' if len(unexpected) > 5 else ''}")
+
+        opt_path = os.path.join(ckpt_dir, "optimizer.pt")
+        if os.path.exists(opt_path):
+            try:
+                opt_state = torch.load(opt_path, map_location=self.device, weights_only=True)
+                optimizer.load_state_dict(opt_state.get("optimizer", opt_state))
+                print(f"[Flightmare PPO] Resumed optimizer state from {opt_path}")
+            except Exception as exc:  # noqa: BLE001 — broad on purpose; downgrade to warn
+                print(
+                    f"[Flightmare PPO] WARNING: failed to load optimizer state from {opt_path}: "
+                    f"{type(exc).__name__}: {exc}. Continuing with fresh optimizer."
+                )
+        else:
+            print(
+                "[Flightmare PPO] No optimizer.pt found alongside the resumed model "
+                "(was save_optimizer_state disabled when this checkpoint was written?). "
+                "Optimizer starts fresh — fine for low-LR PPO; momentum/variance estimates rebuild quickly."
+            )
+
+        ts_path = os.path.join(ckpt_dir, "training_state.json")
+        if os.path.exists(ts_path):
+            try:
+                with open(ts_path) as f:
+                    ts = json.load(f)
+                bs = ts.get("best_score")
+                if bs is not None and np.isfinite(bs):
+                    self.best_score = float(bs)
+                self.best_iteration = int(ts.get("best_iteration") or 0)
+                print(
+                    f"[Flightmare PPO] Restored best-score bookkeeping: "
+                    f"best_score={self.best_score:.4f} best_iteration={self.best_iteration}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[Flightmare PPO] WARNING: failed to parse {ts_path}: "
+                    f"{type(exc).__name__}: {exc}. best-score starts at -inf."
+                )
 
     def _save_checkpoint(
         self,

@@ -301,8 +301,15 @@ def main() -> None:
 
     model = _build_model(cfg, checkpoint, device)
     arch_cfg = (cfg.robotics or {}).get("architecture", {})
-    include_mission = bool((cfg.data or {}).get("include_mission", True))
-    concat_mission_to_state = include_mission and int(arch_cfg.get("state_dim", 13)) == 13 + MISSION_DIM
+    data_cfg = cfg.data or {}
+    obs_schema = str(data_cfg.get("obs_schema") or arch_cfg.get("obs_schema") or
+                     ("v3" if str(arch_cfg.get("fusion", "")).lower() == "swift" else "v2"))
+    include_mission = bool(data_cfg.get("include_mission", True))
+    if obs_schema == "v3":
+        concat_mission_to_state = False
+        include_mission = False  # Swift fusion does not consume the legacy mission vec.
+    else:
+        concat_mission_to_state = include_mission and int(arch_cfg.get("state_dim", 13)) == 13 + MISSION_DIM
 
     mission_wrapper = MissionWrapper(
         policy=model,
@@ -312,7 +319,10 @@ def main() -> None:
         device=device,
         include_mission=include_mission,
         concat_mission_to_state=concat_mission_to_state,
+        obs_schema=obs_schema,
     )
+    mission_wrapper.set_dt(1.0 / float(control_hz))
+    print(f"[Obs]    schema={obs_schema}")
 
     params = QuadParams()
     params.max_collective_thrust = max_collective_thrust_g * params.mass * params.g

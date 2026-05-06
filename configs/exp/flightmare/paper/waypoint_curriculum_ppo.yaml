@@ -103,27 +103,44 @@ robotics:
     max_collective_thrust_g: 5.5
     action_clip: 1.0
 
+    # Resume actor+critic (and optimizer state, if save_optimizer_state was on
+    # when the source ckpt was written) from a previous PPO run's `best/`. The
+    # earlier run peaked at iter 148 (stage 1, 52% SR, 74% gate completion)
+    # then drifted off-manifold under the original asymmetric reward; this
+    # config keeps that policy and re-launches with the rebalanced reward and
+    # gate-miss handling.
+    resume_from: outputs/paper_waypoint_curriculum_ppo_v4/best
+
     reward_fn: flightmare_racing_v1
     reward_kwargs:
       progress_scale: 6.0
       segment_progress_scale: 1.5
-      gate_pass_bonus: 20.0
+      # Symmetrize pass/miss so the policy stops being incentivized to
+      # avoid aperture entries entirely. Old: +20 / -90 (4.5x asymmetric);
+      # new: +40 / -40.
+      gate_pass_bonus: 40.0
       completion_bonus: 220.0
-      gate_miss_penalty: 90.0
+      gate_miss_penalty: 40.0
       crash_penalty: 100.0
       time_penalty: 0.05
       body_rate_penalty: 0.0
       action_smoothness_penalty: 0.01
       alignment_scale: 0.05
-      gate_centering_penalty: 0.05
+      # Strengthen dense aperture-centering shaping (was 0.05 — drowned by the
+      # sparse miss event), and tighten its influence radius from 8m to 4m so
+      # the gradient targets the final approach window.
+      gate_centering_penalty: 0.30
       gate_violation_penalty: 0.20
-      gate_centering_near_m: 8.0
+      gate_centering_near_m: 4.0
       max_progress_reward: 5.0
 
     curriculum:
       enabled: true
       advance_metric: success_rate
-      advance_threshold: 0.5
+      # Was 0.5 — that fired at iter 148 mid stage 1 and pushed the policy to
+      # stage 2 before consolidation. 0.85 keeps the policy on a stage until
+      # it actually owns it.
+      advance_threshold: 0.85
       stages:
         - name: warmup_2gates
           until_iter: 800
@@ -133,6 +150,10 @@ robotics:
           fixed_gate_yaw_noise: 0.0
           horizon: 1200
           ent_coeff_override: 0.002
+          # Stage 1 keeps strict gate-miss termination — at 2 gates the
+          # episodes are short and the cleanliness signal helps the policy
+          # learn the basic flight-through shape.
+          terminate_on_gate_miss: true
         - name: ramp_4gates
           until_iter: 2500
           num_gates: 4
@@ -141,6 +162,12 @@ robotics:
           fixed_gate_yaw_noise: 0.03
           horizon: 1800
           ent_coeff_override: 0.001
+          # Stages 2+: drop strict termination so a single missed aperture
+          # doesn't end the episode. The policy keeps flying, accumulates
+          # progress reward through later gates, and learns "loose-but-passing
+          # > miss-and-die." This is the highest-leverage knob unstucking the
+          # aperture-precision plateau seen in the first run.
+          terminate_on_gate_miss: false
         - name: full_7gates
           until_iter: 8000
           num_gates: 7
@@ -148,6 +175,7 @@ robotics:
           fixed_gate_pos_noise: 0.20
           fixed_gate_yaw_noise: 0.05
           horizon: 2500
+          terminate_on_gate_miss: false
 
 training:
   trainer_type: ppo_flightmare
@@ -156,7 +184,10 @@ training:
   save_steps: 50
   save_total_limit: 12
   save_final: true
-  save_optimizer_state: false
+  # Persist AdamW state next to each saved checkpoint so future resume_from
+  # picks up momentum/variance estimates instead of restarting them. Cheap
+  # (~10 MB per ckpt for this 2M-param model).
+  save_optimizer_state: true
   best_steps: 1
   selection_metric: rollout_score
   rollout_score_weights:

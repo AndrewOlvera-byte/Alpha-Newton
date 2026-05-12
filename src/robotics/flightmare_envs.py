@@ -216,6 +216,14 @@ class FlightmareRacingEnvConfig:
     max_waypoint_speed: float = 15.0
     max_collective_thrust_g: float = 4.0
     action_clip: float = 5.0
+    reset_mode: str = "course_start"  # course_start|gate_pre_entry|reference_state|segment_window
+    start_gate_index: int | None = None
+    start_gate_choices: list[int] | None = None
+    start_offset_m: float = 3.0
+    start_offset_range: tuple[float, float] | None = None
+    reference_speed_mps: float = 4.0
+    goal_mode: str = "finish_remaining_course"  # pass_gate_i|gate_i_to_i+1|gate_i_to_i+2|finish_remaining_course
+    goal_gate_span: int | None = None
 
 
 class FlightmareRacingEnv(gymnasium.Env):
@@ -278,6 +286,8 @@ class FlightmareRacingEnv(gymnasium.Env):
         self._strict_tracker: StrictGateTracker | None = None
         self._prev_raw_action = np.zeros(self.norm.action_dim, dtype=np.float32)
         self._prev_pos = None
+        self._start_gate_index = 0
+        self._goal_terminal_gate_index = 0
 
     @property
     def using_fallback(self) -> bool:
@@ -392,13 +402,67 @@ class FlightmareRacingEnv(gymnasium.Env):
         body_forward = quat_to_R(quat)[:, 0]
         return float(np.clip(np.dot(body_forward, to_gate / n), 0.0, 1.0))
 
+    @staticmethod
+    def _quat_from_yaw(yaw: float) -> np.ndarray:
+        return np.array([np.cos(0.5 * yaw), 0.0, 0.0, np.sin(0.5 * yaw)], dtype=np.float64)
+
+    def _select_start_gate_index(self) -> int:
+        n = len(self._gates)
+        if n <= 0:
+            return 0
+        choices = self.cfg.start_gate_choices
+        if choices:
+            valid = [int(i) for i in choices if 0 <= int(i) < n]
+            if valid:
+                return int(valid[int(self.rng.integers(0, len(valid)))])
+        if self.cfg.start_gate_index is not None:
+            return int(np.clip(int(self.cfg.start_gate_index), 0, n - 1))
+        if self.cfg.reset_mode in {"gate_pre_entry", "reference_state", "segment_window"}:
+            return int(self.rng.integers(0, n))
+        return 0
+
+    def _start_offset(self) -> float:
+        rng = self.cfg.start_offset_range
+        if rng is not None:
+            lo, hi = float(rng[0]), float(rng[1])
+            if hi < lo:
+                lo, hi = hi, lo
+            return float(self.rng.uniform(lo, hi))
+        return float(self.cfg.start_offset_m)
+
+    def _goal_terminal_index(self, start_gate: int) -> int:
+        n = len(self._gates)
+        if n <= 0:
+            return 0
+        if self.cfg.goal_gate_span is not None:
+            return int(np.clip(start_gate + int(self.cfg.goal_gate_span), start_gate + 1, n))
+        mode = str(self.cfg.goal_mode)
+        if mode == "pass_gate_i":
+            return min(n, start_gate + 1)
+        if mode == "gate_i_to_i+1":
+            return min(n, start_gate + 2)
+        if mode == "gate_i_to_i+2":
+            return min(n, start_gate + 3)
+        if mode == "finish_remaining_course":
+            return n
+        raise ValueError(f"Unsupported goal_mode={self.cfg.goal_mode!r}")
+
+    def _reference_start_state(self, start_gate: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        gate = self._gates[start_gate]
+        center, forward, _, _ = gate_frame(gate)
+        offset = self._start_offset()
+        pos = center - offset * forward
+        yaw = float(getattr(gate, "yaw", np.arctan2(forward[1], forward[0])))
+        quat = self._quat_from_yaw(yaw)
+        vel = float(self.cfg.reference_speed_mps) * forward
+        omega = np.zeros(3, dtype=np.float64)
+        return pos.astype(np.float64), vel.astype(np.float64), quat.astype(np.float64), omega
+
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         self._gates, waypoints = self._sample_course()
         self.env.add_gates(self._gates)
-        yaw = float(self._gates[0].yaw) if self._gates else 0.0
-        self._obs = self.env.reset(init_pos=waypoints[0], yaw=yaw)
         self._gate_views = gates_to_views(self._gates)
         self._strict_tracker = StrictGateTracker(self._gates, vehicle_radius=self.cfg.gate_vehicle_radius)
         self._gate_specs = [
@@ -410,7 +474,23 @@ class FlightmareRacingEnv(gymnasium.Env):
             )
             for g in self._gates
         ]
-        self._gate_index_v3 = 0
+        self._start_gate_index = self._select_start_gate_index()
+        self._goal_terminal_gate_index = self._goal_terminal_index(self._start_gate_index)
+        reset_mode = str(self.cfg.reset_mode)
+        if reset_mode == "course_start" or not self._gates:
+            yaw = float(self._gates[0].yaw) if self._gates else 0.0
+            self._obs = self.env.reset(init_pos=waypoints[0], yaw=yaw)
+            self._start_gate_index = 0
+            self._goal_terminal_gate_index = self._goal_terminal_index(0)
+        elif reset_mode in {"gate_pre_entry", "reference_state", "segment_window"}:
+            pos, vel, quat, omega = self._reference_start_state(self._start_gate_index)
+            yaw = float(np.arctan2(2.0 * (quat[0] * quat[3] + quat[1] * quat[2]), 1.0 - 2.0 * (quat[2] ** 2 + quat[3] ** 2)))
+            self._obs = self.env.reset(init_pos=pos, yaw=yaw)
+            self._obs = self.env.set_state(pos=pos, quat=quat, vel=vel, omega=omega)
+            self._strict_tracker.current_index = int(self._start_gate_index)
+        else:
+            raise ValueError(f"Unsupported reset_mode={self.cfg.reset_mode!r}")
+        self._gate_index_v3 = int(self._start_gate_index)
         self._last_pass_step = 0
         self._prev_raw_action = np.zeros(self.norm.action_dim, dtype=np.float32)
         self._prev_pos = self._obs.pos.copy()
@@ -422,6 +502,10 @@ class FlightmareRacingEnv(gymnasium.Env):
         return self._make_obs(), {
             "using_fallback": self.using_fallback,
             "num_gates": len(self._gates),
+            "reset_mode": reset_mode,
+            "start_gate_index": int(self._start_gate_index),
+            "goal_terminal_gate_index": int(self._goal_terminal_gate_index),
+            "goal_mode": str(self.cfg.goal_mode),
             "initial_prev_action_norm": initial_prev_action,
         }
 
@@ -441,8 +525,17 @@ class FlightmareRacingEnv(gymnasium.Env):
         segment_progress = self._strict_tracker.segment_progress(prev_pos, prev_pos)
         alignment = self._alignment_to_gate(prev_pos, self._obs.quat, target_center)
         gate_signed_distance = 0.0
+        gate_normal_progress = 0.0
+        gate_normal_velocity = 0.0
         gate_lateral_norm = 0.0
         gate_vertical_norm = 0.0
+        gate_lateral_norm_next = 0.0
+        gate_vertical_norm_next = 0.0
+        gate_center_error_norm = 0.0
+        gate_center_error_norm_next = 0.0
+        gate_center_error_progress = 0.0
+        gate_signed_distance_next = 0.0
+        target_gate = None
         if self._gates and not self._strict_tracker.completed:
             idx = self._strict_tracker.current_index
             target_gate = self._gates[idx]
@@ -451,6 +544,7 @@ class FlightmareRacingEnv(gymnasium.Env):
             half_w, half_h = gate_half_extents(target_gate, vehicle_radius=self.cfg.gate_vehicle_radius)
             gate_lateral_norm = float(lateral_m / max(half_w, 1e-6))
             gate_vertical_norm = float(vertical_m / max(half_h, 1e-6))
+            gate_center_error_norm = float(np.hypot(gate_lateral_norm, gate_vertical_norm))
 
         self._obs, command = self._apply_action(raw_action)
         self._step_count += 1
@@ -458,6 +552,18 @@ class FlightmareRacingEnv(gymnasium.Env):
         curr_pos = self._obs.pos.copy()
         curr_dist_to_same_gate = float(np.linalg.norm(curr_pos - target_center))
         distance_progress = prev_dist - curr_dist_to_same_gate
+        if target_gate is not None:
+            curr_signed = signed_gate_distance(curr_pos, target_gate)
+            gate_normal_progress = float(curr_signed - gate_signed_distance)
+            gate_signed_distance_next = float(curr_signed)
+            _, gate_forward, _, _ = gate_frame(target_gate)
+            gate_normal_velocity = float(np.dot(self._obs.vel, gate_forward))
+            lateral_m, vertical_m = gate_offsets(curr_pos, target_gate)
+            half_w, half_h = gate_half_extents(target_gate, vehicle_radius=self.cfg.gate_vehicle_radius)
+            gate_lateral_norm_next = float(lateral_m / max(half_w, 1e-6))
+            gate_vertical_norm_next = float(vertical_m / max(half_h, 1e-6))
+            gate_center_error_norm_next = float(np.hypot(gate_lateral_norm_next, gate_vertical_norm_next))
+            gate_center_error_progress = float(gate_center_error_norm - gate_center_error_norm_next)
         # Recompute segment progress over the actual movement and pre-step target.
         if self._gates and not self._strict_tracker.completed:
             idx = self._strict_tracker.current_index
@@ -471,7 +577,7 @@ class FlightmareRacingEnv(gymnasium.Env):
         crash_reason = self._crash_reason()
         gate_missed = bool(event is not None and event.missed)
         gate_passed = bool(event is not None and event.passed)
-        success = bool(self._strict_tracker.completed)
+        success = bool(self._strict_tracker.current_index >= self._goal_terminal_gate_index)
         crash = crash_reason is not None
         body_z_world = quat_to_R(self._obs.quat)[:, 2]
 
@@ -490,12 +596,28 @@ class FlightmareRacingEnv(gymnasium.Env):
             "gates_completed": int(self._strict_tracker.current_index),
             "num_gates": len(self._gates),
             "gate_completion": float(self._strict_tracker.current_index / max(1, len(self._gates))),
+            "goal_completion": float(
+                (self._strict_tracker.current_index - self._start_gate_index)
+                / max(1, self._goal_terminal_gate_index - self._start_gate_index)
+            ),
+            "start_gate_index": int(self._start_gate_index),
+            "goal_terminal_gate_index": int(self._goal_terminal_gate_index),
+            "goal_mode": str(self.cfg.goal_mode),
+            "reset_mode": str(self.cfg.reset_mode),
             "distance_progress_m": float(distance_progress),
             "segment_progress_m": float(segment_progress),
             "gate_alignment": float(alignment),
             "gate_signed_distance_m": float(gate_signed_distance),
+            "gate_signed_distance_next_m": float(gate_signed_distance_next),
+            "gate_normal_progress_m": float(gate_normal_progress),
+            "gate_normal_velocity_mps": float(gate_normal_velocity),
             "gate_lateral_norm": float(gate_lateral_norm),
             "gate_vertical_norm": float(gate_vertical_norm),
+            "gate_lateral_norm_next": float(gate_lateral_norm_next),
+            "gate_vertical_norm_next": float(gate_vertical_norm_next),
+            "gate_center_error_norm": float(gate_center_error_norm),
+            "gate_center_error_norm_next": float(gate_center_error_norm_next),
+            "gate_center_error_progress": float(gate_center_error_progress),
             "crash": crash,
             "crash_reason": crash_reason,
             "raw_action": raw_action.astype(np.float32),

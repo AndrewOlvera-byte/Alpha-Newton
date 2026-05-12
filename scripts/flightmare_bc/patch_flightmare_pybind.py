@@ -99,6 +99,16 @@ class VisualRacingEnv {
     bridge_->addStaticObject(gate);
   }
 
+  void addGateQuat(const std::string& object_id, const Vector<3>& pos,
+                   const Vector<4>& quat_wxyz, const Vector<3>& size) {
+    auto gate = std::make_shared<StaticGate>(object_id, "rpg_gate");
+    gate->setPosition(pos);
+    gate->setQuaternion(Quaternion(quat_wxyz[0], quat_wxyz[1],
+                                   quat_wxyz[2], quat_wxyz[3]));
+    gate->setSize(size);
+    bridge_->addStaticObject(gate);
+  }
+
   bool render() {
     if (!unity_ready_) return false;
     bridge_->getRender(frame_id_++);
@@ -151,6 +161,9 @@ VISUAL_RACING_PYBIND = r'''
     .def("addGate", &VisualRacingEnv::addGate,
          py::arg("object_id"), py::arg("pos"), py::arg("yaw"),
          py::arg("size"))
+    .def("addGateQuat", &VisualRacingEnv::addGateQuat,
+         py::arg("object_id"), py::arg("pos"), py::arg("quat_wxyz"),
+         py::arg("size"))
     .def("render", &VisualRacingEnv::render)
     .def("getRGB", &VisualRacingEnv::getRGB);
 '''
@@ -182,6 +195,41 @@ def main() -> None:
   }""",
         )
         if patched != text:
+            wrapper.write_text(patched)
+        if "addGateQuat" not in patched:
+            patched = patched.replace(
+                """  bool render() {
+    if (!unity_ready_) return false;
+    bridge_->getRender(frame_id_++);
+    return bridge_->handleOutput();
+  }""",
+                """  void addGateQuat(const std::string& object_id, const Vector<3>& pos,
+                   const Vector<4>& quat_wxyz, const Vector<3>& size) {
+    auto gate = std::make_shared<StaticGate>(object_id, "rpg_gate");
+    gate->setPosition(pos);
+    gate->setQuaternion(Quaternion(quat_wxyz[0], quat_wxyz[1],
+                                   quat_wxyz[2], quat_wxyz[3]));
+    gate->setSize(size);
+    bridge_->addStaticObject(gate);
+  }
+
+  bool render() {
+    if (!unity_ready_) return false;
+    bridge_->getRender(frame_id_++);
+    return bridge_->handleOutput();
+  }""",
+            )
+            patched = patched.replace(
+                """.def("addGate", &VisualRacingEnv::addGate,
+         py::arg("object_id"), py::arg("pos"), py::arg("yaw"),
+         py::arg("size"))""",
+                """.def("addGate", &VisualRacingEnv::addGate,
+         py::arg("object_id"), py::arg("pos"), py::arg("yaw"),
+         py::arg("size"))
+    .def("addGateQuat", &VisualRacingEnv::addGateQuat,
+         py::arg("object_id"), py::arg("pos"), py::arg("quat_wxyz"),
+         py::arg("size"))""",
+            )
             wrapper.write_text(patched)
         return
 

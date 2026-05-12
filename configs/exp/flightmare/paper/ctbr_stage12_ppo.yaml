@@ -1,0 +1,193 @@
+# CTBR PPO focused on Split-S curriculum stages 1 and 2 only.
+#
+# Purpose:
+#   - Re-learn reliable reference-state single-gate starts.
+#   - Then diagnose/solve adjacent two-gate closed-loop transitions before
+#     moving to three-gate windows or full-course training.
+#   - Use flightmare_racing_v3, which adds dense gate-frame centerline-error
+#     progress and stall/no-progress penalties.
+#
+# Run:
+#   docker compose exec alpha-newton python -m src.entrypoints.train_ppo \
+#     --exp flightmare/paper/ctbr_stage12_ppo
+
+run:
+  name: paper_ctbr_stage12_ppo_v4
+  mode: ppo
+  seed: 0
+
+data:
+  type: flightmare_ppo_state
+  data_dir: data/flightmare/bc_v4
+  action_type: ctbr
+  obs_schema: v3
+  normalize_state: true
+  normalize_action: true
+  action_normalization: bounds
+
+robotics:
+  architecture:
+    type: flightmare_actor
+    mode: ppo
+    action_type: ctbr
+    bc_checkpoint: outputs/paper_ctbr_bc_v4/best/model.pt
+
+    fusion: swift
+    proprio_core_dim: 9
+    gate_dim: 24
+    aux_dim: 3
+    action_dim: 4
+    use_vision: false
+    include_prev_action: true
+
+    proprio_hidden_dim: 128
+    proprio_embed_dim: 128
+    gate_hidden_dim: 128
+    gate_embed_dim: 128
+    trunk_hidden_dim: 768
+    trunk_depth: 3
+    dropout: 0.05
+
+    head_hidden_dim: 256
+    head_depth: 2
+    state_dependent_std: false
+    init_log_std: -2.0
+    log_std_min: -4.0
+    log_std_max: -1.2
+    with_critic: true
+    critic_hidden_dim: 256
+    critic_depth: 2
+    bc_loss_type: gnll
+    action_clip: 1.0
+
+  ppo:
+    bc_checkpoint: outputs/paper_ctbr_bc_v4/best/model.pt
+    action_type: ctbr
+
+    obs_schema: v3
+    backend: flightgym
+    render: false
+    scene: industrial
+
+    n_envs: 8
+    n_workers: 8
+    n_steps: 1024
+    ppo_epochs: 4
+    minibatch_size: 2048
+    clip_eps: 0.04
+    vf_coeff: 0.5
+    ent_coeff: 0.0015
+    gamma: 0.995
+    gae_lambda: 0.95
+    max_iterations: 3500
+    actor_lr: 3.0e-6
+    critic_lr: 1.0e-4
+    target_kl: 0.012
+
+    control_hz: 100.0
+    horizon: 900
+
+    course_mode: swift_v4
+    num_gates: 7
+    gate_size: 1.6
+    gate_approach_m: 3.0
+    z_min: 1.0
+    fixed_gate_pos_noise: 0.00
+    fixed_gate_yaw_noise: 0.00
+    random_start_gate: false
+    reset_mode: reference_state
+    start_offset_m: 3.0
+    start_offset_range: [2.0, 4.0]
+    reference_speed_mps: 4.0
+    goal_mode: pass_gate_i
+
+    gate_vehicle_radius: 0.20
+    max_world_radius: 350.0
+    min_z: -0.25
+    terminate_on_gate_miss: true
+    terminate_on_crash: true
+    max_body_rate: 8.0
+    max_collective_thrust_g: 5.5
+    action_clip: 1.0
+
+    reward_fn: flightmare_racing_v3
+    reward_kwargs:
+      gate_normal_progress_scale: 6.0
+      segment_progress_scale: 1.5
+      centerline_progress_scale: 3.0
+      centerline_error_penalty: 0.04
+      aperture_near_penalty: 0.75
+      aperture_near_m: 4.0
+      velocity_alignment_scale: 0.06
+      body_alignment_scale: 0.04
+      gate_pass_bonus: 28.0
+      segment_completion_bonus: 8.0
+      completion_bonus: 180.0
+      gate_miss_penalty: 80.0
+      crash_penalty: 90.0
+      no_progress_penalty: 0.08
+      backward_progress_penalty: 2.0
+      min_forward_velocity_mps: 0.75
+      stall_grace_steps: 25
+      time_penalty: 0.015
+      body_rate_penalty: 0.0007
+      action_smoothness_penalty: 0.006
+      vertical_speed_penalty: 0.001
+      max_progress_reward: 3.0
+      max_centerline_progress: 2.0
+      max_centerline_error: 6.0
+
+    curriculum:
+      enabled: true
+      advance_metric: null
+      advance_threshold: 1.0
+      stages:
+        - name: stage1_single_gate
+          until_iter: 1200
+          num_gates: 7
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5, 6]
+          start_offset_range: [2.0, 4.0]
+          goal_mode: pass_gate_i
+          horizon: 650
+          ent_coeff_override: 0.002
+        - name: stage2_two_gate_transitions
+          until_iter: 3500
+          num_gates: 7
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5]
+          start_offset_range: [2.0, 4.0]
+          goal_mode: gate_i_to_i+1
+          horizon: 1000
+          ent_coeff_override: 0.0015
+
+training:
+  trainer_type: ppo_flightmare
+  max_grad_norm: 0.5
+  logging_steps: 1
+  save_steps: 50
+  save_total_limit: 12
+  save_final: true
+  save_optimizer_state: false
+  best_steps: 1
+  selection_metric: rollout_score
+  rollout_score_weights:
+    success_rate: 1.0
+    mean_gate_completion: 0.20
+    mean_speed_mps: 0.01
+    mean_reward: 0.0
+
+  bf16: true
+  output_dir: outputs/${run.name}
+
+wandb:
+  project: flightmare-ppo
+  entity: andrewolvera
+  run_name: ${run.name}
+  tags: [flightmare, ppo, state-only, ctbr, v4, stage12, transition-reward]

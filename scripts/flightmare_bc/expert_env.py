@@ -156,6 +156,26 @@ class FlightmareExpertEnv:
     def reset(self, init_pos: np.ndarray, yaw: float = 0.0) -> StepResult:
         return self._impl.reset(np.asarray(init_pos, dtype=np.float64), float(yaw))
 
+    def set_state(
+        self,
+        pos: np.ndarray,
+        quat: np.ndarray,
+        vel: np.ndarray | None = None,
+        omega: np.ndarray | None = None,
+    ) -> StepResult:
+        quat = np.asarray(quat, dtype=np.float64)
+        if not hasattr(self._impl, "set_state"):
+            yaw = float(np.arctan2(2.0 * (quat[0] * quat[3] + quat[1] * quat[2]), 1.0 - 2.0 * (quat[2] ** 2 + quat[3] ** 2)))
+            return self.reset(np.asarray(pos, dtype=np.float64), yaw=yaw)
+        vel_arr = np.zeros(3, dtype=np.float64) if vel is None else np.asarray(vel, dtype=np.float64)
+        omega_arr = np.zeros(3, dtype=np.float64) if omega is None else np.asarray(omega, dtype=np.float64)
+        return self._impl.set_state(
+            np.asarray(pos, dtype=np.float64),
+            quat,
+            vel_arr,
+            omega_arr,
+        )
+
     def step_ctbr(self, thrust_newton: float, omega_des: np.ndarray) -> StepResult:
         return self._impl.step_ctbr(float(thrust_newton), np.asarray(omega_des, dtype=np.float64))
 
@@ -373,12 +393,21 @@ class _VisualFlightmareImpl:
 
     def add_gates(self, gates: list[GateSpec]) -> None:
         for gate in gates:
-            self.env.addGate(
-                gate.gate_id,
-                np.asarray(gate.pos, dtype=np.float32),
-                float(gate.yaw),
-                np.asarray(gate.size, dtype=np.float32),
-            )
+            quat = getattr(gate, "quat", None)
+            if quat is not None and hasattr(self.env, "addGateQuat"):
+                self.env.addGateQuat(
+                    gate.gate_id,
+                    np.asarray(gate.pos, dtype=np.float32),
+                    np.asarray(quat, dtype=np.float32),
+                    np.asarray(gate.size, dtype=np.float32),
+                )
+            else:
+                self.env.addGate(
+                    gate.gate_id,
+                    np.asarray(gate.pos, dtype=np.float32),
+                    float(gate.yaw),
+                    np.asarray(gate.size, dtype=np.float32),
+                )
 
     def reset(self, init_pos, yaw):
         if self.render and not self.connected:
@@ -390,6 +419,17 @@ class _VisualFlightmareImpl:
                 )
         quat = np.array([np.cos(0.5 * yaw), 0.0, 0.0, np.sin(0.5 * yaw)], dtype=np.float32)
         self.env.reset(np.asarray(init_pos, dtype=np.float32), quat)
+        if self.render:
+            self.env.render()
+        return self._observe(done=False)
+
+    def set_state(self, pos, quat, vel, omega):
+        self.env.setState(
+            np.asarray(pos, dtype=np.float32),
+            np.asarray(quat, dtype=np.float32),
+            np.asarray(vel, dtype=np.float32),
+            np.asarray(omega, dtype=np.float32),
+        )
         if self.render:
             self.env.render()
         return self._observe(done=False)
@@ -452,6 +492,14 @@ class _NumpyFallbackImpl:
         cy, sy = np.cos(yaw / 2), np.sin(yaw / 2)
         self.quat = np.array([cy, 0.0, 0.0, sy])
         self.omega = np.zeros(3)
+        return self._observe()
+
+    def set_state(self, pos, quat, vel, omega):
+        self.pos = np.asarray(pos, dtype=np.float64).copy()
+        self.quat = np.asarray(quat, dtype=np.float64).copy()
+        self.quat /= np.linalg.norm(self.quat) + 1e-9
+        self.vel = np.asarray(vel, dtype=np.float64).copy()
+        self.omega = np.asarray(omega, dtype=np.float64).copy()
         return self._observe()
 
     def step_ctbr(self, thrust_newton, omega_des):

@@ -24,9 +24,10 @@ set -euo pipefail
 
 EPISODES=${EPISODES:-2000}
 SEED=${SEED:-0}
+OUT=${OUT:-data/flightmare/bc_v4}
 
 python -m scripts.flightmare_bc.collect \
-  --out data/flightmare/bc_v4 \
+  --out "$OUT" \
   --episodes "$EPISODES" \
   --backend flightgym \
   --course-mode swift_v4 \
@@ -48,3 +49,16 @@ python -m scripts.flightmare_bc.collect \
   --val-frac 0.1 \
   --min-gate-completion 0.99 \
   --seed "$SEED"
+
+python -m scripts.flightmare_bc.transform_to_v3 \
+  --data-dir "$OUT" \
+  --force
+
+python -m scripts.flightmare_bc.recompute_v3_norm_stats \
+  --data-dir "$OUT" \
+  --split train
+
+python -m scripts.flightmare_bc.diag_bc_v3_geometry \
+  --data-dir "$OUT" \
+  --episodes 20 \
+  --fail-on-missing-quat

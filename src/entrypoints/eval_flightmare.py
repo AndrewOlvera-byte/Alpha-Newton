@@ -206,7 +206,7 @@ def main() -> None:
     parser.add_argument("--no-plot", action="store_true")
 
     parser.add_argument("--num-gates", type=int, default=None)
-    parser.add_argument("--course-mode", choices=["gates", "swift_like", "fixed_gates"], default=None)
+    parser.add_argument("--course-mode", choices=["gates", "swift_like", "swift_v4", "fixed_gates"], default=None)
     parser.add_argument("--gate-layout", type=str, default=None)
     parser.add_argument("--random-start-gate", action="store_true", default=None)
     parser.add_argument("--fixed-gate-pos-noise", type=float, default=None)

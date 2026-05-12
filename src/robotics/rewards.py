@@ -305,6 +305,238 @@ def flightmare_racing_v1(
     return float(r)
 
 
+def flightmare_racing_v2(
+    *,
+    info: dict,
+    action: np.ndarray | None = None,
+    prev_action: np.ndarray | None = None,
+    dt: float = 0.01,
+    gate_normal_progress_scale: float = 7.0,
+    segment_progress_scale: float = 2.0,
+    max_progress_reward: float = 5.0,
+    aperture_centering_scale: float = 0.20,
+    aperture_violation_penalty: float = 2.0,
+    aperture_near_m: float = 5.0,
+    velocity_alignment_scale: float = 0.03,
+    body_alignment_scale: float = 0.05,
+    split_s_vertical_speed_scale: float = 0.0,
+    gate_pass_bonus: float = 25.0,
+    segment_completion_bonus: float = 0.0,
+    completion_bonus: float = 250.0,
+    gate_miss_penalty: float = 120.0,
+    crash_penalty: float = 120.0,
+    time_penalty: float = 0.03,
+    body_rate_penalty: float = 0.001,
+    action_smoothness_penalty: float = 0.01,
+    vertical_speed_penalty: float = 0.002,
+    thrust_saturation_penalty: float = 0.0,
+    **_,
+) -> float:
+    """Gate-local racing reward with explicit term logging.
+
+    The main shaped terms reward positive motion through the active gate plane
+    and along the local segment, while aperture and stability terms make
+    reward hacking visible through ``info["reward_terms"]``.
+    """
+    terms: dict[str, float] = {}
+
+    normal_progress = float(np.clip(
+        info.get("gate_normal_progress_m", 0.0),
+        -max_progress_reward,
+        max_progress_reward,
+    ))
+    segment_progress = float(np.clip(
+        info.get("segment_progress_m", 0.0),
+        -max_progress_reward,
+        max_progress_reward,
+    ))
+    terms["progress_gate_normal"] = float(gate_normal_progress_scale) * normal_progress
+    terms["progress_segment"] = float(segment_progress_scale) * segment_progress
+    terms["time"] = -float(time_penalty)
+
+    lat_norm = float(info.get("gate_lateral_norm", 0.0))
+    vert_norm = float(info.get("gate_vertical_norm", 0.0))
+    signed_dist = abs(float(info.get("gate_signed_distance_m", 0.0)))
+    near = max(0.0, 1.0 - signed_dist / max(float(aperture_near_m), 1e-6))
+    center_err = min(lat_norm * lat_norm + vert_norm * vert_norm, 9.0)
+    violation = min(max(abs(lat_norm) - 1.0, 0.0) + max(abs(vert_norm) - 1.0, 0.0), 9.0)
+    terms["aperture_centering"] = -float(aperture_centering_scale) * near * center_err
+    terms["aperture_violation"] = -float(aperture_violation_penalty) * near * violation
+
+    forward_speed = max(0.0, float(info.get("gate_normal_velocity_mps", 0.0)))
+    terms["velocity_alignment"] = float(velocity_alignment_scale) * forward_speed
+    terms["body_alignment"] = float(body_alignment_scale) * float(info.get("gate_alignment", 0.0))
+
+    vz = float(info.get("vertical_speed_mps", 0.0))
+    terms["vertical_speed"] = -float(vertical_speed_penalty) * vz * vz
+    if split_s_vertical_speed_scale != 0.0:
+        # Negative vertical speed is useful only near Split-S descent/recovery,
+        # so keep this term opt-in from config.
+        terms["split_s_descent"] = float(split_s_vertical_speed_scale) * max(0.0, -vz)
+
+    omega = info.get("omega")
+    if omega is not None:
+        omega_sq = float(np.sum(np.asarray(omega, dtype=np.float32) ** 2))
+    else:
+        omega_sq = float(info.get("angular_rate_norm", 0.0)) ** 2
+    terms["body_rate"] = -float(body_rate_penalty) * omega_sq
+
+    if action is not None:
+        a = np.asarray(action, dtype=np.float32)
+        if prev_action is not None:
+            pa = np.asarray(prev_action, dtype=np.float32)
+            terms["action_smoothness"] = -float(action_smoothness_penalty) * float(np.sum((a - pa) ** 2))
+        if thrust_saturation_penalty > 0.0 and a.size:
+            high = max(float(a[0]) - 0.95, 0.0)
+            low = max(0.05 - float(a[0]), 0.0)
+            terms["thrust_saturation"] = -float(thrust_saturation_penalty) * (low * low + high * high)
+
+    if info.get("gate_passed", False):
+        margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
+        terms["gate_pass"] = float(gate_pass_bonus) + 2.0 * margin
+        terms["segment_complete"] = float(segment_completion_bonus)
+    if info.get("success", False):
+        terms["completion"] = float(completion_bonus)
+    if info.get("gate_missed", False):
+        terms["gate_miss"] = -float(gate_miss_penalty)
+    if info.get("crash", False):
+        terms["crash"] = -float(crash_penalty)
+
+    total = float(sum(terms.values()))
+    terms["total"] = total
+    info["reward_terms"] = terms
+    for key, value in terms.items():
+        info[f"reward/{key}"] = float(value)
+    return total
+
+
+def flightmare_racing_v3(
+    *,
+    info: dict,
+    action: np.ndarray | None = None,
+    prev_action: np.ndarray | None = None,
+    dt: float = 0.01,
+    gate_normal_progress_scale: float = 6.0,
+    segment_progress_scale: float = 1.5,
+    centerline_progress_scale: float = 3.0,
+    centerline_error_penalty: float = 0.04,
+    aperture_near_penalty: float = 0.75,
+    aperture_near_m: float = 4.0,
+    velocity_alignment_scale: float = 0.06,
+    body_alignment_scale: float = 0.04,
+    gate_pass_bonus: float = 28.0,
+    segment_completion_bonus: float = 8.0,
+    completion_bonus: float = 180.0,
+    gate_miss_penalty: float = 80.0,
+    crash_penalty: float = 90.0,
+    no_progress_penalty: float = 0.08,
+    backward_progress_penalty: float = 2.0,
+    min_forward_velocity_mps: float = 0.75,
+    stall_grace_steps: int = 25,
+    time_penalty: float = 0.015,
+    body_rate_penalty: float = 0.0007,
+    action_smoothness_penalty: float = 0.006,
+    vertical_speed_penalty: float = 0.001,
+    thrust_saturation_penalty: float = 0.0,
+    max_progress_reward: float = 3.0,
+    max_centerline_progress: float = 2.0,
+    max_centerline_error: float = 6.0,
+    **_,
+) -> float:
+    """Transition-focused racing reward for stage 1/2 curriculum.
+
+    Compared with v2, this reward provides a dense signal for reducing
+    lateral/vertical gate-frame error before the gate plane is crossed. This
+    matters for two-gate closed-loop learning: after passing gate i the policy
+    must curve toward gate i+1, and a near-plane-only aperture penalty arrives
+    too late to teach that transition.
+    """
+    terms: dict[str, float] = {}
+
+    normal_progress = float(np.clip(
+        info.get("gate_normal_progress_m", 0.0),
+        -max_progress_reward,
+        max_progress_reward,
+    ))
+    segment_progress = float(np.clip(
+        info.get("segment_progress_m", 0.0),
+        -max_progress_reward,
+        max_progress_reward,
+    ))
+    center_progress = float(np.clip(
+        info.get("gate_center_error_progress", 0.0),
+        -max_centerline_progress,
+        max_centerline_progress,
+    ))
+    forward_speed = float(info.get("gate_normal_velocity_mps", 0.0))
+
+    terms["progress_gate_normal"] = float(gate_normal_progress_scale) * normal_progress
+    terms["progress_segment"] = float(segment_progress_scale) * segment_progress
+    terms["centerline_progress"] = float(centerline_progress_scale) * center_progress
+    if normal_progress < 0.0:
+        terms["backward_progress"] = float(backward_progress_penalty) * normal_progress
+
+    center_err = float(np.clip(
+        info.get("gate_center_error_norm_next", info.get("gate_center_error_norm", 0.0)),
+        0.0,
+        max_centerline_error,
+    ))
+    terms["centerline_error"] = -float(centerline_error_penalty) * center_err
+
+    signed_dist = abs(float(info.get("gate_signed_distance_next_m", info.get("gate_signed_distance_m", 0.0))))
+    near = max(0.0, 1.0 - signed_dist / max(float(aperture_near_m), 1e-6))
+    lat = abs(float(info.get("gate_lateral_norm_next", info.get("gate_lateral_norm", 0.0))))
+    vert = abs(float(info.get("gate_vertical_norm_next", info.get("gate_vertical_norm", 0.0))))
+    violation = min(max(lat - 1.0, 0.0) + max(vert - 1.0, 0.0), max_centerline_error)
+    terms["aperture_violation_near"] = -float(aperture_near_penalty) * near * violation
+
+    terms["velocity_alignment"] = float(velocity_alignment_scale) * max(0.0, forward_speed)
+    terms["body_alignment"] = float(body_alignment_scale) * float(info.get("gate_alignment", 0.0))
+    terms["time"] = -float(time_penalty)
+
+    step = int(info.get("step", 0))
+    if step >= int(stall_grace_steps) and forward_speed < float(min_forward_velocity_mps):
+        terms["no_progress"] = -float(no_progress_penalty) * (float(min_forward_velocity_mps) - forward_speed)
+
+    vz = float(info.get("vertical_speed_mps", 0.0))
+    terms["vertical_speed"] = -float(vertical_speed_penalty) * vz * vz
+
+    omega = info.get("omega")
+    if omega is not None:
+        omega_sq = float(np.sum(np.asarray(omega, dtype=np.float32) ** 2))
+    else:
+        omega_sq = float(info.get("angular_rate_norm", 0.0)) ** 2
+    terms["body_rate"] = -float(body_rate_penalty) * omega_sq
+
+    if action is not None:
+        a = np.asarray(action, dtype=np.float32)
+        if prev_action is not None:
+            pa = np.asarray(prev_action, dtype=np.float32)
+            terms["action_smoothness"] = -float(action_smoothness_penalty) * float(np.sum((a - pa) ** 2))
+        if thrust_saturation_penalty > 0.0 and a.size:
+            high = max(float(a[0]) - 0.95, 0.0)
+            low = max(0.05 - float(a[0]), 0.0)
+            terms["thrust_saturation"] = -float(thrust_saturation_penalty) * (low * low + high * high)
+
+    if info.get("gate_passed", False):
+        margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
+        terms["gate_pass"] = float(gate_pass_bonus) + 2.0 * margin
+        terms["segment_complete"] = float(segment_completion_bonus)
+    if info.get("success", False):
+        terms["completion"] = float(completion_bonus)
+    if info.get("gate_missed", False):
+        terms["gate_miss"] = -float(gate_miss_penalty)
+    if info.get("crash", False):
+        terms["crash"] = -float(crash_penalty)
+
+    total = float(sum(terms.values()))
+    terms["total"] = total
+    info["reward_terms"] = terms
+    for key, value in terms.items():
+        info[f"reward/{key}"] = float(value)
+    return total
+
+
 # ===========================================================================
 # Registry + lookup
 # ===========================================================================
@@ -314,6 +546,8 @@ REWARD_FUNCTIONS: Dict[str, Callable] = {
     "sparse_success": sparse_success,
     "dense_multitask_v1": dense_multitask_v1,
     "flightmare_racing_v1": flightmare_racing_v1,
+    "flightmare_racing_v2": flightmare_racing_v2,
+    "flightmare_racing_v3": flightmare_racing_v3,
 }
 
 

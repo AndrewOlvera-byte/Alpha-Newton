@@ -127,6 +127,7 @@ def _gates_from_centers(
     prefix: str,
     yaws: list[float] | None = None,
     sizes: list[np.ndarray] | None = None,
+    quats: list[np.ndarray | None] | None = None,
 ) -> list[GateSpec]:
     centers = np.asarray(centers, dtype=np.float64).copy()
     if bool(_cfg(cfg, "random_start_gate", False)) and len(centers) > 1:
@@ -136,6 +137,8 @@ def _gates_from_centers(
             yaws = list(np.roll(np.asarray(yaws, dtype=np.float64), -offset))
         if sizes is not None:
             sizes = list(np.roll(np.asarray(sizes, dtype=np.float64), -offset, axis=0))
+        if quats is not None:
+            quats = list(quats[offset:]) + list(quats[:offset])
 
     pos_noise_xyz = _cfg(cfg, "fixed_gate_pos_noise_xyz", None)
     if pos_noise_xyz is not None:
@@ -161,12 +164,16 @@ def _gates_from_centers(
         if yaw_noise > 0.0:
             yaw += float(rng.uniform(-yaw_noise, yaw_noise))
         size = sizes[i] if sizes is not None else _gate_size_array(cfg)
+        quat = None if quats is None else quats[i]
+        if quat is None:
+            quat = _quat_from_yaw_pitch_roll(yaw, 0.0, 0.0)
         gates.append(
             GateSpec(
                 gate_id=f"{prefix}_{i:03d}",
                 pos=center.copy(),
                 yaw=yaw,
                 size=np.asarray(size, dtype=np.float64).copy(),
+                quat=np.asarray(quat, dtype=np.float64).copy(),
             )
         )
     return gates
@@ -206,6 +213,7 @@ def _layout_gate_course(rng: np.random.Generator, cfg: argparse.Namespace) -> li
     centers = []
     yaws: list[float | None] = []
     sizes: list[np.ndarray] = []
+    quats: list[np.ndarray | None] = []
     for i, g in enumerate(raw_gates):
         if not isinstance(g, dict):
             raise ValueError(f"Gate layout entry {i} must be an object with pos/yaw/size fields.")
@@ -215,10 +223,19 @@ def _layout_gate_course(rng: np.random.Generator, cfg: argparse.Namespace) -> li
         centers.append(np.asarray(pos, dtype=np.float64))
         yaws.append(None if "yaw" not in g else float(g["yaw"]))
         sizes.append(_gate_size_array(cfg, g))
+        quats.append(None if g.get("quat") is None else np.asarray(g["quat"], dtype=np.float64))
     centers_arr = np.stack(centers, axis=0)
     computed_yaws = _compute_path_yaws(centers_arr)
     resolved_yaws = [computed_yaws[i] if yaw is None else float(yaw) for i, yaw in enumerate(yaws)]
-    return _gates_from_centers(centers_arr, rng, cfg, prefix="fixed_gate", yaws=resolved_yaws, sizes=sizes)
+    return _gates_from_centers(
+        centers_arr,
+        rng,
+        cfg,
+        prefix="fixed_gate",
+        yaws=resolved_yaws,
+        sizes=sizes,
+        quats=quats,
+    )
 
 
 def _quat_from_yaw_pitch_roll(yaw: float, pitch: float, roll: float) -> np.ndarray:
@@ -334,12 +351,14 @@ def sample_gate_course(rng: np.random.Generator, cfg: argparse.Namespace) -> lis
         jitter = float(_cfg(cfg, "gate_lateral_jitter", 2.0))
         pos = pos + rng.uniform(-jitter, jitter) * lateral
         pos[2] = float(rng.uniform(gate_z_range[0], gate_z_range[1]))
+        yaw = heading + float(rng.uniform(-float(_cfg(cfg, "gate_yaw_noise", 0.25)), float(_cfg(cfg, "gate_yaw_noise", 0.25))))
         gates.append(
             GateSpec(
                 gate_id=f"gate_{i:03d}",
                 pos=pos.copy(),
-                yaw=heading + float(rng.uniform(-float(_cfg(cfg, "gate_yaw_noise", 0.25)), float(_cfg(cfg, "gate_yaw_noise", 0.25)))),
+                yaw=yaw,
                 size=_gate_size_array(cfg),
+                quat=_quat_from_yaw_pitch_roll(yaw, 0.0, 0.0),
             )
         )
     return gates
@@ -494,15 +513,21 @@ def collect_one_episode(
         "mean_track_err": float(np.mean(pos_errors)) if pos_errors else 0.0,
         "max_track_err": float(np.max(pos_errors)) if pos_errors else 0.0,
         "n_waypoints": int(len(waypoints)),
-        "gates": [
-            {
-                "id": g.gate_id,
-                "pos": g.pos.astype(float).tolist(),
-                "yaw": float(g.yaw),
-                "size": g.size.astype(float).tolist(),
-            }
-            for g in gates
-        ],
+        "gates": [_gate_record(g) for g in gates],
+    }
+
+
+def _gate_record(g: GateSpec) -> dict:
+    return {
+        "id": g.gate_id,
+        "pos": g.pos.astype(float).tolist(),
+        "yaw": float(g.yaw),
+        "size": g.size.astype(float).tolist(),
+        "quat": (
+            None
+            if getattr(g, "quat", None) is None
+            else np.asarray(g.quat, dtype=np.float64).astype(float).tolist()
+        ),
     }
 
 

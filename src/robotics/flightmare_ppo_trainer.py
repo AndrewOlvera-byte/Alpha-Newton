@@ -146,6 +146,8 @@ def collect_flightmare_rollouts(
     reward_sq_sum = 0.0
     reward_min = float("inf")
     reward_max = float("-inf")
+    reward_term_sums: dict[str, float] = {}
+    reward_term_count = 0
 
     t0 = time.time()
     amp = torch.amp.autocast(
@@ -193,6 +195,11 @@ def collect_flightmare_rollouts(
                 gate_misses += 1
             if info.get("crash", False):
                 crash_count += 1
+            terms = info.get("reward_terms")
+            if isinstance(terms, dict):
+                reward_term_count += 1
+                for key, value in terms.items():
+                    reward_term_sums[key] = reward_term_sums.get(key, 0.0) + float(value)
 
             if dones[i]:
                 ep_rewards.append(float(current_rewards[i]))
@@ -252,6 +259,9 @@ def collect_flightmare_rollouts(
         "mean_speed_mps": float(speed_sum / max(1, speed_count)),
         "max_speed_mps": float(max_speed),
     }
+    if reward_term_sums:
+        denom = max(1, reward_term_count)
+        stats["reward_terms"] = {k: float(v / denom) for k, v in sorted(reward_term_sums.items())}
     return obs_list, prev_actions, stats
 
 
@@ -384,6 +394,14 @@ class FlightmarePPOTrainer:
             "max_body_rate": ppo.get("max_body_rate", 8.0),
             "max_waypoint_speed": ppo.get("max_waypoint_speed", 15.0),
             "max_collective_thrust_g": ppo.get("max_collective_thrust_g", 4.0),
+            "reset_mode": ppo.get("reset_mode", "course_start"),
+            "start_gate_index": ppo.get("start_gate_index"),
+            "start_gate_choices": ppo.get("start_gate_choices"),
+            "start_offset_m": ppo.get("start_offset_m", 3.0),
+            "start_offset_range": ppo.get("start_offset_range"),
+            "reference_speed_mps": ppo.get("reference_speed_mps", 4.0),
+            "goal_mode": ppo.get("goal_mode", "finish_remaining_course"),
+            "goal_gate_span": ppo.get("goal_gate_span"),
             "action_clip": ppo.get(
                 "action_clip",
                 (self.robotics_cfg.get("architecture", {}) or {}).get("action_clip", 5.0),
@@ -737,6 +755,10 @@ class FlightmarePPOTrainer:
                             if self.curriculum is not None
                             else {}
                         ),
+                        **{
+                            f"reward_terms/{key}": float(value)
+                            for key, value in stats.get("reward_terms", {}).items()
+                        },
                     }
                     print(
                         f"[{iteration}/{self.max_iterations}] "

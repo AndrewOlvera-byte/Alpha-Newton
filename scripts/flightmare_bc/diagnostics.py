@@ -59,7 +59,7 @@ def main():
             T = h["obs/state"].shape[0]
             keys = list(h.keys())
             action_keys = list(h["action"].keys())
-            n_actions_ok = n_actions_ok and (set(action_keys) == {"waypoint", "ctbr"})
+            n_actions_ok = n_actions_ok and (set(action_keys) == {"waypoint", "ctbr", "motor"})
 
             if "mission" in keys:
                 gi = h["mission/gate_index"][...]
@@ -104,7 +104,7 @@ def main():
         print("  norm_stats.npz NOT FOUND")
 
     print()
-    print(f"PASS  actions=={{waypoint,ctbr}}: {n_actions_ok}")
+    print(f"PASS  actions=={{waypoint,ctbr,motor}}: {n_actions_ok}")
     print(f"PASS  gate_index monotonic    : {all_progress_ok}")
 
 

@@ -3,9 +3,17 @@
 #
 # CTBR sits between waypoint (high-level, easy credit assignment) and motor
 # (full actuator authority, hard credit assignment). It is the action space
-# used by Swift / Champion-level racing policies. Same curriculum (2g -> 4g
-# -> 7g) as waypoint_curriculum_ppo.yaml so the ablation isolates the
-# action-space effect.
+# used by Swift / champion-level racing policies.
+#
+# Curriculum shape:
+#   1. reference-state single-gate starts across all gates
+#   2. adjacent two-gate transitions
+#   3. three-gate segment windows
+#   4. partial remaining-course starts
+#   5. full swift_v4 course with bounded fixed-layout perturbations
+#
+# This run is meant to learn the Split-S swift_v4 course robustly first. It is
+# not yet the full procedural generalization stage from the broader plan.
 #
 # Run after BC training:
 #   docker compose exec alpha-newton python -m src.entrypoints.train_ppo \
@@ -92,9 +100,14 @@ robotics:
     gate_size: 1.6
     gate_approach_m: 3.0
     z_min: 1.0
-    fixed_gate_pos_noise: 0.20
-    fixed_gate_yaw_noise: 0.05
-    random_start_gate: true
+    fixed_gate_pos_noise: 0.00
+    fixed_gate_yaw_noise: 0.00
+    random_start_gate: false
+    reset_mode: reference_state
+    start_offset_m: 3.0
+    start_offset_range: [2.0, 5.0]
+    reference_speed_mps: 4.0
+    goal_mode: pass_gate_i
 
     gate_vehicle_radius: 0.20
     max_world_radius: 350.0
@@ -105,50 +118,83 @@ robotics:
     max_collective_thrust_g: 5.5
     action_clip: 1.0
 
-    reward_fn: flightmare_racing_v1
+    reward_fn: flightmare_racing_v2
     reward_kwargs:
-      progress_scale: 6.0
-      segment_progress_scale: 1.5
-      gate_pass_bonus: 20.0
+      gate_normal_progress_scale: 7.0
+      segment_progress_scale: 2.0
+      aperture_centering_scale: 0.20
+      aperture_violation_penalty: 2.0
+      aperture_near_m: 6.0
+      velocity_alignment_scale: 0.03
+      body_alignment_scale: 0.05
+      gate_pass_bonus: 25.0
+      segment_completion_bonus: 5.0
       completion_bonus: 220.0
-      gate_miss_penalty: 90.0
-      crash_penalty: 100.0
-      time_penalty: 0.05
-      body_rate_penalty: 0.0
+      gate_miss_penalty: 120.0
+      crash_penalty: 120.0
+      time_penalty: 0.03
+      body_rate_penalty: 0.001
       action_smoothness_penalty: 0.01
-      alignment_scale: 0.05
-      gate_centering_penalty: 0.05
-      gate_violation_penalty: 0.20
-      gate_centering_near_m: 8.0
+      vertical_speed_penalty: 0.002
       max_progress_reward: 5.0
 
     curriculum:
       enabled: true
       advance_metric: success_rate
-      advance_threshold: 0.5
+      advance_threshold: 0.75
       stages:
-        - name: warmup_2gates
+        - name: stage1_single_gate
           until_iter: 800
-          num_gates: 2
+          num_gates: 7
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5, 6]
+          start_offset_range: [2.0, 5.0]
+          goal_mode: pass_gate_i
+          horizon: 600
+          ent_coeff_override: 0.002
+        - name: stage2_two_gate_transitions
+          until_iter: 2500
+          num_gates: 7
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5]
+          start_offset_range: [1.5, 5.0]
+          goal_mode: gate_i_to_i+1
+          horizon: 1000
+          ent_coeff_override: 0.001
+        - name: stage3_three_gate_windows
+          until_iter: 4500
+          num_gates: 7
           random_start_gate: false
           fixed_gate_pos_noise: 0.05
-          fixed_gate_yaw_noise: 0.0
-          horizon: 1200
-          ent_coeff_override: 0.002
-        - name: ramp_4gates
-          until_iter: 2500
-          num_gates: 4
-          random_start_gate: true
+          fixed_gate_yaw_noise: 0.01
+          reset_mode: segment_window
+          start_gate_choices: [0, 1, 2, 3, 4]
+          goal_mode: gate_i_to_i+2
+          horizon: 1400
+        - name: stage4_partial_courses
+          until_iter: 6500
+          num_gates: 7
+          random_start_gate: false
           fixed_gate_pos_noise: 0.10
           fixed_gate_yaw_noise: 0.03
-          horizon: 1800
-          ent_coeff_override: 0.001
-        - name: full_7gates
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4]
+          goal_mode: finish_remaining_course
+          horizon: 2200
+        - name: stage5_full_course
           until_iter: 8000
           num_gates: 7
-          random_start_gate: true
+          random_start_gate: false
           fixed_gate_pos_noise: 0.20
           fixed_gate_yaw_noise: 0.05
+          reset_mode: course_start
+          goal_mode: finish_remaining_course
           horizon: 2500
 
 training:

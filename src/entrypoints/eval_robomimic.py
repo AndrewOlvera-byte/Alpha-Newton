@@ -19,12 +19,12 @@ import torch
 
 from src.core.config import Config
 from src.core.registry import build
-from src.robotics.models.HistoryBuffer import HistoryBuffer
+from src.robotics.models.robosuite.HistoryBuffer import HistoryBuffer
 
 import src.robotics.data
-import src.robotics.models.VLA_like
-import src.robotics.models.VLA_MLP
-import src.robotics.models.VLA_Gaussian
+import src.robotics.models.robosuite.VLA_like
+import src.robotics.models.robosuite.VLA_MLP
+import src.robotics.models.robosuite.VLA_Gaussian
 from src.robotics.normalization import NormStats
 
 

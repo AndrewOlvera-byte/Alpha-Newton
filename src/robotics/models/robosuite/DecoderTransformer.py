@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from src.robotics.models.RMSNorm import RMSNorm
+from src.robotics.models.robosuite.RMSNorm import RMSNorm
 
 
 class MHSA(nn.Module):

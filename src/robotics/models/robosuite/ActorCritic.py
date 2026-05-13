@@ -9,7 +9,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 
 from src.core.registry import register, build
-from src.robotics.models.VLA_MLP import VLAMLPPolicy
+from src.robotics.models.robosuite.VLA_MLP import VLAMLPPolicy
 
 
 class ValueHead(nn.Module):

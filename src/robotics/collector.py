@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from src.robotics.models.HistoryBuffer import HistoryBuffer
+from src.robotics.models.robosuite.HistoryBuffer import HistoryBuffer
 from src.robotics.loss import compute_gae
 
 

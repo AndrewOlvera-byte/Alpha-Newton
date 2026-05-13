@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 
 from src.core.registry import register
-from src.robotics.models.GaussianController import GaussianController
-from src.robotics.models.IntentBCBase import VisionIntentBCBackbone
+from src.robotics.models.robosuite.GaussianController import GaussianController
+from src.robotics.models.robosuite.IntentBCBase import VisionIntentBCBackbone
 
 
 class VLAGaussianPolicy(nn.Module):

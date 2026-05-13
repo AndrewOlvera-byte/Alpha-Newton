@@ -9,8 +9,8 @@ import torch.nn.functional as F
 
 from src.core.registry import register
 from src.robotics.loss import gaussian_nll_loss
-from src.robotics.models.IntentBCBase import VisionIntentBCBackbone
-from src.robotics.models.MLPController import MLPController
+from src.robotics.models.robosuite.IntentBCBase import VisionIntentBCBackbone
+from src.robotics.models.robosuite.MLPController import MLPController
 
 
 class VLAMLPPolicy(nn.Module):

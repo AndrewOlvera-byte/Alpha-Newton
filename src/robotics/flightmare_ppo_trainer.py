@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -324,6 +325,7 @@ class FlightmarePPOTrainer:
         # was saved before save_optimizer_state was enabled, in which case
         # only the model weights are restored and the optimizer starts fresh.
         self.resume_from = ppo.get("resume_from") or training_cfg.get("resume_from")
+        self.start_iteration = 1
         self.save_total_limit = training_cfg.get("save_total_limit")
         self.save_total_limit = int(self.save_total_limit) if self.save_total_limit else None
         self.save_final = bool(training_cfg.get("save_final", True))
@@ -588,10 +590,14 @@ class FlightmarePPOTrainer:
         base_env_kwargs = self._env_kwargs()
         env_seed = int(self.ppo_cfg.get("seed", 0))
         if self.curriculum is not None:
+            # Align the active curriculum stage before constructing the first
+            # resumed environment.
+            self.curriculum.update(self.start_iteration, None)
+        if self.curriculum is not None:
             print(f"[Flightmare PPO] Curriculum enabled: {self.curriculum.describe()}")
         env_kwargs = self._apply_curriculum_overrides(base_env_kwargs)
-        vec_env = make_flightmare_vec_env(n_envs=self.n_envs, seed=env_seed, **env_kwargs)
-        obs_list, infos = vec_env.reset(seed=env_seed)
+        vec_env = make_flightmare_vec_env(n_envs=self.n_envs, seed=env_seed + self.start_iteration - 1, **env_kwargs)
+        obs_list, infos = vec_env.reset(seed=env_seed + self.start_iteration - 1)
         if infos and infos[0].get("using_fallback"):
             print("[Flightmare PPO] WARNING: using numpy fallback; metrics are not authoritative.")
 
@@ -609,7 +615,7 @@ class FlightmarePPOTrainer:
             "  Best selection: "
             f"{self.selection_metric} every {self.best_steps or 'disabled'} iteration(s)"
         )
-        print(f"  Max iterations: {self.max_iterations} | Device: {self.device}\n")
+        print(f"  Iterations: {self.start_iteration} -> {self.max_iterations} | Device: {self.device}\n")
 
         amp = torch.amp.autocast(
             device_type=self.device.type,
@@ -619,7 +625,7 @@ class FlightmarePPOTrainer:
 
         last_rollout_stats: dict | None = None
         try:
-            for iteration in range(1, self.max_iterations + 1):
+            for iteration in range(self.start_iteration, self.max_iterations + 1):
                 # Curriculum: advance stage if the iteration window expired or
                 # the early-advance metric crossed its threshold last rollout.
                 if self.curriculum is not None and self.curriculum.update(
@@ -707,7 +713,8 @@ class FlightmarePPOTrainer:
 
                 if iteration % self.logging_steps == 0:
                     elapsed = time.time() - t_start
-                    fps = iteration * self.n_steps * self.n_envs / max(elapsed, 1e-6)
+                    completed_iterations = iteration - self.start_iteration + 1
+                    fps = completed_iterations * self.n_steps * self.n_envs / max(elapsed, 1e-6)
                     values_flat = buffer.values.flatten()
                     returns_flat = buffer.returns.flatten()
                     var_returns = returns_flat.var()
@@ -863,18 +870,30 @@ class FlightmarePPOTrainer:
             try:
                 with open(ts_path) as f:
                     ts = json.load(f)
+                resume_iteration = int(ts.get("iteration") or 0)
+                if resume_iteration > 0:
+                    self.start_iteration = resume_iteration + 1
                 bs = ts.get("best_score")
                 if bs is not None and np.isfinite(bs):
                     self.best_score = float(bs)
                 self.best_iteration = int(ts.get("best_iteration") or 0)
                 print(
-                    f"[Flightmare PPO] Restored best-score bookkeeping: "
+                    f"[Flightmare PPO] Restored training state: "
+                    f"next_iteration={self.start_iteration} "
                     f"best_score={self.best_score:.4f} best_iteration={self.best_iteration}"
                 )
             except Exception as exc:  # noqa: BLE001
                 print(
                     f"[Flightmare PPO] WARNING: failed to parse {ts_path}: "
                     f"{type(exc).__name__}: {exc}. best-score starts at -inf."
+                )
+        else:
+            match = re.search(r"checkpoint-(\d+)$", os.path.basename(os.path.normpath(ckpt_dir)))
+            if match:
+                self.start_iteration = int(match.group(1)) + 1
+                print(
+                    f"[Flightmare PPO] Inferred next_iteration={self.start_iteration} "
+                    f"from checkpoint directory name."
                 )
 
     def _save_checkpoint(

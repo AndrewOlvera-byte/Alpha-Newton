@@ -12,13 +12,13 @@ import torch
 
 from src.core.config import Config
 from src.core.registry import build
-from src.robotics.models.ActorCritic import VLAMLPActorCritic
+from src.robotics.models.robosuite.ActorCritic import VLAMLPActorCritic
 from src.robotics.normalization import NormStats
 
 # Register builders
-import src.robotics.models.VLA_MLP
-import src.robotics.models.VLA_Gaussian
-import src.robotics.models.ActorCritic
+import src.robotics.models.robosuite.VLA_MLP
+import src.robotics.models.robosuite.VLA_Gaussian
+import src.robotics.models.robosuite.ActorCritic
 import src.robotics.models.flightmare
 import src.robotics.flightmare_envs
 import src.robotics.flightmare_ppo_trainer
@@ -136,7 +136,7 @@ def test_flightmare(cfg: Config, bc_checkpoint: str):
 def test(cfg: Config, bc_checkpoint: str):
     """Dry-run: build env, model, collect 1 step, verify shapes."""
     from src.robotics.envs import RobosuiteGymEnv
-    from src.robotics.models.HistoryBuffer import HistoryBuffer
+    from src.robotics.models.robosuite.HistoryBuffer import HistoryBuffer
 
     arch_cfg = cfg.robotics.get("architecture", {})
     raw_tasks = cfg.data.get("tasks", ["lift"])

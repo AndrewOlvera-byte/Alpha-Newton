@@ -22,7 +22,7 @@ from src.robotics.envs import (
     make_robosuite_multitask_vec_env,
 )
 from src.robotics.loss import ppo_clip_loss, value_loss
-from src.robotics.models.HistoryBuffer import HistoryBuffer
+from src.robotics.models.robosuite.HistoryBuffer import HistoryBuffer
 from src.robotics.normalization import NormStats
 
 

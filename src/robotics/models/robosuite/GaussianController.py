@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 
-from src.robotics.models.MLPController import IntentCrossAttention
+from src.robotics.models.robosuite.MLPController import IntentCrossAttention
 
 
 class GaussianController(nn.Module):

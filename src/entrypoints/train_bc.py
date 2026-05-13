@@ -14,9 +14,9 @@ from src.core.registry import build
 # Register builders
 import src.robotics.data
 import src.robotics.bc_trainer
-import src.robotics.models.VLA_like
-import src.robotics.models.VLA_MLP
-import src.robotics.models.VLA_Gaussian
+import src.robotics.models.robosuite.VLA_like
+import src.robotics.models.robosuite.VLA_MLP
+import src.robotics.models.robosuite.VLA_Gaussian
 import src.robotics.models.flightmare
 import scripts.flightmare_bc.dataset
 

@@ -11,12 +11,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.core.registry import register
-from src.robotics.models.ViT import DINOv2Encoder
-from src.robotics.models.StateEncoder import StateEncoder
-from src.robotics.models.ActionEncoder import ActionEncoder
-from src.robotics.models.DecoderTransformer import CausalTransformerDecoder
-from src.robotics.models.DiT import DiTActionHead
-from src.robotics.models.AttentionPool import AttentionPool
+from src.robotics.models.robosuite.ViT import DINOv2Encoder
+from src.robotics.models.robosuite.StateEncoder import StateEncoder
+from src.robotics.models.robosuite.ActionEncoder import ActionEncoder
+from src.robotics.models.robosuite.DecoderTransformer import CausalTransformerDecoder
+from src.robotics.models.robosuite.DiT import DiTActionHead
+from src.robotics.models.robosuite.AttentionPool import AttentionPool
 
 
 def sinusoidal_positional_encoding(seq_len: int, d_model: int, device: torch.device) -> torch.Tensor:

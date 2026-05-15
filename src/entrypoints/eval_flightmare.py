@@ -12,6 +12,9 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -204,6 +207,14 @@ def main() -> None:
     parser.add_argument("--render", action="store_true", help="Connect/render Unity. Default is headless state-only evaluation.")
     parser.add_argument("--fail-on-fallback", action="store_true", help="Fail if Flightmare bindings are unavailable and numpy fallback is used.")
     parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument("--save-video", action="store_true", help="Record Unity RGB frames for one evaluated episode.")
+    parser.add_argument("--video-episode", type=int, default=0, help="Episode index to record when --save-video is set.")
+    parser.add_argument("--video-camera", type=str, default="forward", help="Camera name/key for saved video frames.")
+    parser.add_argument("--video-fps", type=int, default=30)
+    parser.add_argument("--video-stride", type=int, default=2, help="Save every Nth rendered frame.")
+    parser.add_argument("--image-size", type=int, default=720, help="Unity RGB frame size when --save-video is set.")
+    parser.add_argument("--launch-unity", action="store_true", help="Launch FLIGHTMARE_UNITY_EXECUTABLE for render/video eval.")
+    parser.add_argument("--unity-startup-s", type=float, default=3.0)
 
     parser.add_argument("--num-gates", type=int, default=None)
     parser.add_argument("--course-mode", choices=["gates", "swift_like", "swift_v4", "fixed_gates"], default=None)
@@ -247,6 +258,7 @@ def main() -> None:
     run_name = cfg.run.get("name", Path(config_label).stem)
     output_dir = args.output_dir or (Path(cfg.training["output_dir"]) / "eval")
     output_dir.mkdir(parents=True, exist_ok=True)
+    unity_proc = None
 
     print(f"[Config] {config_label}")
     print(f"[Run]    {run_name}")
@@ -259,7 +271,7 @@ def main() -> None:
     control_hz = float(_arg_or_ppo(args, "control_hz", ppo_cfg, "control_hz", dataset_manifest.get("control_hz", 100.0)))
     scene = str(_arg_or_ppo(args, "scene", ppo_cfg, "scene", "industrial"))
     backend = str(_arg_or_ppo(args, "backend", ppo_cfg, "backend", dataset_manifest.get("backend", "auto")))
-    render = bool(args.render or ppo_cfg.get("render", False))
+    render = bool(args.render or args.save_video or ppo_cfg.get("render", False))
     course_mode = str(_arg_or_ppo(args, "course_mode", ppo_cfg, "course_mode", dataset_manifest.get("course_mode", "gates")))
     gate_layout = _arg_or_ppo(args, "gate_layout", ppo_cfg, "gate_layout", None)
     random_start_gate = (
@@ -342,6 +354,13 @@ def main() -> None:
         fixed_gate_yaw_noise=fixed_gate_yaw_noise,
         gate_approach_m=gate_approach_m,
     )
+    if args.launch_unity:
+        exe = Path(os.environ.get("FLIGHTMARE_UNITY_EXECUTABLE", "/opt/flightmare/flightrender/RPG_Flightmare.x86_64"))
+        if not exe.exists():
+            raise FileNotFoundError(f"Flightmare Unity executable not found: {exe}")
+        unity_args = os.environ.get("FLIGHTMARE_UNITY_ARGS", "").split()
+        unity_proc = subprocess.Popen([str(exe), *unity_args], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        time.sleep(max(0.0, float(args.unity_startup_s)))
     state_node = FlightmareStateNode(
         control_hz=control_hz,
         course_config=course_config,
@@ -349,6 +368,8 @@ def main() -> None:
         scene=scene,
         render=render,
         seed=args.seed,
+        image_size=args.image_size,
+        cameras=(args.video_camera,) if args.save_video else (),
         backend=backend,
     )
     if state_node.using_fallback:
@@ -387,17 +408,44 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
     results = []
+    video_frames: list[np.ndarray] = []
+
+    def _capture_frame(images: dict[str, np.ndarray], step: int) -> None:
+        if not args.save_video or step % max(1, int(args.video_stride)) != 0:
+            return
+        frame = images.get(args.video_camera)
+        if frame is None:
+            return
+        frame = np.asarray(frame, dtype=np.uint8)
+        if frame.ndim == 1:
+            side = int(round((frame.size / 3) ** 0.5))
+            if side * side * 3 == frame.size:
+                frame = frame.reshape(side, side, 3)
+        if frame.ndim == 3 and frame.shape[-1] == 3:
+            video_frames.append(frame.copy())
+
     try:
         for ep in range(args.episodes):
-            result = graph.run_episode(ep, rng)
+            result = graph.run_episode(
+                ep,
+                rng,
+                frame_callback=_capture_frame if args.save_video and ep == int(args.video_episode) else None,
+            )
             results.append(result)
             _print_episode(result)
     finally:
         graph.close()
+        if unity_proc is not None and unity_proc.poll() is None:
+            unity_proc.terminate()
+            try:
+                unity_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                unity_proc.kill()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     stats_path = output_dir / f"{timestamp}_stats.json"
     plot_path = output_dir / f"{timestamp}_trajectories.png"
+    video_path = output_dir / f"{timestamp}_episode{int(args.video_episode):03d}_{args.video_camera}.mp4"
     extra = {
         "config": config_label,
         "run_name": run_name,
@@ -431,6 +479,14 @@ def main() -> None:
     write_stats_json(results, stats_path, extra=extra)
     if not args.no_plot:
         save_trajectory_plot(results, plot_path, title=f"{run_name} ({action_type})")
+    if args.save_video:
+        if not video_frames:
+            print("[Video] WARNING: no RGB frames captured; check Unity/render connection and camera binding.")
+        else:
+            import imageio.v2 as imageio
+
+            imageio.mimwrite(video_path, video_frames, fps=int(args.video_fps), quality=8)
+            print(f"[Video] wrote {len(video_frames)} frames -> {video_path}")
 
     summary = summarize_results(results)
     print("\n[Summary]")
@@ -444,6 +500,8 @@ def main() -> None:
     print(f"  stats: {stats_path}")
     if not args.no_plot:
         print(f"  plot:  {plot_path}")
+    if args.save_video and video_frames:
+        print(f"  video: {video_path}")
 
 
 if __name__ == "__main__":

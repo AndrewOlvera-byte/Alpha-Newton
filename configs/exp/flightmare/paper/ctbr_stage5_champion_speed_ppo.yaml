@@ -1,0 +1,271 @@
+# CTBR PPO speed fine-tune from the best full-course reliability checkpoint.
+#
+# Seed:
+#   outputs/paper_ctbr_stage4_full_speed_ppo_v5/checkpoint-21800/model.pt
+#
+# Goal:
+#   Probe whether a speed-gated reward can push the ~75 m Swift-scale Split-S
+#   course from ~9.4 s / ~8 m/s toward champion-level lap speed without losing
+#   full-course reliability. All curriculum stages are full-course evaluations,
+#   so best-checkpoint selection is not biased by easier segment tasks.
+#
+# Run:
+#   docker compose exec alpha-newton python -m src.entrypoints.train_ppo \
+#     --exp flightmare/paper/ctbr_stage5_champion_speed_ppo
+
+run:
+  name: paper_ctbr_stage5_champion_speed_ppo_v1
+  mode: ppo
+  seed: 0
+
+data:
+  type: flightmare_ppo_state
+  data_dir: data/flightmare/bc_v4
+  action_type: ctbr
+  obs_schema: v3
+  normalize_state: true
+  normalize_action: true
+  action_normalization: bounds
+
+robotics:
+  architecture:
+    type: flightmare_actor
+    mode: ppo
+    action_type: ctbr
+    bc_checkpoint: outputs/paper_ctbr_stage4_full_speed_ppo_v5/checkpoint-21800/model.pt
+
+    fusion: swift
+    proprio_core_dim: 9
+    gate_dim: 24
+    aux_dim: 3
+    action_dim: 4
+    use_vision: false
+    include_prev_action: true
+
+    proprio_hidden_dim: 128
+    proprio_embed_dim: 128
+    gate_hidden_dim: 128
+    gate_embed_dim: 128
+    trunk_hidden_dim: 768
+    trunk_depth: 3
+    dropout: 0.05
+
+    head_hidden_dim: 256
+    head_depth: 2
+    state_dependent_std: false
+    init_log_std: -2.0
+    log_std_min: -4.0
+    log_std_max: -1.1
+    with_critic: true
+    critic_hidden_dim: 256
+    critic_depth: 2
+    bc_loss_type: gnll
+    action_clip: 1.0
+
+  ppo:
+    bc_checkpoint: outputs/paper_ctbr_stage4_full_speed_ppo_v5/checkpoint-21800/model.pt
+    action_type: ctbr
+
+    obs_schema: v3
+    backend: flightgym
+    render: false
+    scene: industrial
+
+    n_envs: 16
+    n_workers: 16
+    n_steps: 512
+    ppo_epochs: 4
+    minibatch_size: 2048
+    clip_eps: 0.05
+    vf_coeff: 0.5
+    ent_coeff: 0.00035
+    gamma: 0.997
+    gae_lambda: 0.95
+    max_iterations: 10000
+    actor_lr: 3.5e-6
+    critic_lr: 1.5e-4
+    target_kl: 0.015
+
+    control_hz: 100.0
+    horizon: 1700
+
+    course_mode: swift_v4
+    num_gates: 7
+    gate_size: 1.6
+    gate_approach_m: 3.0
+    z_min: 1.0
+    fixed_gate_pos_noise: 0.00
+    fixed_gate_yaw_noise: 0.00
+    random_start_gate: false
+    reset_mode: course_start
+    start_offset_m: 3.0
+    start_offset_range: null
+    reference_speed_mps: 4.0
+    goal_mode: finish_remaining_course
+
+    gate_vehicle_radius: 0.20
+    max_world_radius: 350.0
+    min_z: -0.25
+    terminate_on_gate_miss: true
+    terminate_on_crash: true
+    max_body_rate: 8.0
+    max_collective_thrust_g: 5.5
+    action_clip: 1.0
+
+    reward_fn: flightmare_racing_v4_speed
+    reward_kwargs:
+      gate_normal_progress_scale: 4.0
+      segment_progress_scale: 1.0
+      centerline_progress_scale: 2.25
+      centerline_error_penalty: 0.045
+      aperture_near_penalty: 1.25
+      aperture_near_m: 5.0
+      velocity_alignment_scale: 0.05
+      body_alignment_scale: 0.03
+      speed_reward_scale: 0.09
+      speed_target_mps: 13.0
+      speed_centerline_window: 2.0
+      speed_gate_near_m: 7.0
+      gate_pass_bonus: 26.0
+      gate_pass_speed_bonus_scale: 1.2
+      gate_pass_speed_cap_mps: 16.0
+      segment_completion_bonus: 6.0
+      completion_bonus: 240.0
+      completion_time_target_s: 6.5
+      completion_time_bonus_scale: 24.0
+      gate_miss_penalty: 180.0
+      crash_penalty: 180.0
+      no_progress_penalty: 0.16
+      backward_progress_penalty: 2.5
+      min_forward_velocity_mps: 2.0
+      stall_grace_steps: 20
+      time_penalty: 0.08
+      body_rate_penalty: 0.00035
+      action_smoothness_penalty: 0.002
+      vertical_speed_penalty: 0.0005
+      thrust_saturation_penalty: 0.0005
+      max_progress_reward: 3.0
+      max_centerline_progress: 2.0
+      max_centerline_error: 6.0
+
+    curriculum:
+      enabled: true
+      advance_metric: null
+      advance_threshold: 1.0
+      stages:
+        - name: full_course_reliability_anchor
+          until_iter: 1500
+          num_gates: 7
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: course_start
+          goal_mode: finish_remaining_course
+          horizon: 1800
+          ent_coeff_override: 0.00035
+          reward_kwargs:
+            speed_reward_scale: 0.06
+            speed_target_mps: 10.5
+            speed_centerline_window: 1.6
+            gate_pass_speed_bonus_scale: 0.8
+            completion_time_target_s: 8.5
+            completion_time_bonus_scale: 12.0
+            time_penalty: 0.04
+            gate_miss_penalty: 220.0
+            crash_penalty: 220.0
+            min_forward_velocity_mps: 1.5
+
+        - name: full_course_speedup_12mps
+          until_iter: 4000
+          num_gates: 7
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: course_start
+          goal_mode: finish_remaining_course
+          horizon: 1500
+          ent_coeff_override: 0.0003
+          reward_kwargs:
+            speed_reward_scale: 0.11
+            speed_target_mps: 12.0
+            speed_centerline_window: 2.0
+            gate_pass_speed_bonus_scale: 1.4
+            completion_time_target_s: 7.4
+            completion_time_bonus_scale: 22.0
+            time_penalty: 0.09
+            gate_miss_penalty: 200.0
+            crash_penalty: 200.0
+            min_forward_velocity_mps: 2.5
+
+        - name: champion_speed_push
+          until_iter: 7500
+          num_gates: 7
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: course_start
+          goal_mode: finish_remaining_course
+          horizon: 1200
+          ent_coeff_override: 0.00025
+          reward_kwargs:
+            gate_normal_progress_scale: 3.5
+            segment_progress_scale: 0.8
+            centerline_progress_scale: 1.8
+            centerline_error_penalty: 0.04
+            aperture_near_penalty: 1.5
+            speed_reward_scale: 0.16
+            speed_target_mps: 14.5
+            speed_centerline_window: 2.35
+            speed_gate_near_m: 8.0
+            gate_pass_speed_bonus_scale: 1.8
+            completion_time_target_s: 6.0
+            completion_time_bonus_scale: 36.0
+            time_penalty: 0.14
+            gate_miss_penalty: 220.0
+            crash_penalty: 220.0
+            min_forward_velocity_mps: 3.5
+            body_rate_penalty: 0.00025
+            action_smoothness_penalty: 0.0015
+
+        - name: fast_reliability_lock
+          until_iter: 10000
+          num_gates: 7
+          fixed_gate_pos_noise: 0.02
+          fixed_gate_yaw_noise: 0.005
+          reset_mode: course_start
+          goal_mode: finish_remaining_course
+          horizon: 1400
+          ent_coeff_override: 0.0002
+          reward_kwargs:
+            speed_reward_scale: 0.12
+            speed_target_mps: 13.5
+            speed_centerline_window: 2.0
+            gate_pass_speed_bonus_scale: 1.5
+            completion_time_target_s: 6.8
+            completion_time_bonus_scale: 28.0
+            time_penalty: 0.10
+            gate_miss_penalty: 260.0
+            crash_penalty: 260.0
+            min_forward_velocity_mps: 3.0
+
+training:
+  trainer_type: ppo_flightmare
+  max_grad_norm: 0.5
+  logging_steps: 1
+  save_steps: 50
+  save_total_limit: 80
+  save_final: true
+  save_optimizer_state: true
+  best_steps: 1
+  selection_metric: rollout_score
+  rollout_score_weights:
+    success_rate: 2.0
+    mean_gate_completion: 1.0
+    mean_speed_mps: 0.06
+    mean_reward: 0.0
+
+  bf16: true
+  output_dir: outputs/${run.name}
+
+wandb:
+  project: flightmare-ppo
+  entity: andrewolvera
+  run_name: ${run.name}
+  tags: [flightmare, ppo, state-only, ctbr, v1, stage5, champion-speed, speed-gated-reward]

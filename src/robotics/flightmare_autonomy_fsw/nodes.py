@@ -53,6 +53,7 @@ class FlightmareStateNode:
         render: bool = False,
         seed: int = 0,
         image_size: int = 224,
+        cameras: Sequence[str] = (),
         backend: str = "auto",
     ):
         self.control_hz = float(control_hz)
@@ -63,10 +64,11 @@ class FlightmareStateNode:
         self.render = bool(render)
         self.seed = int(seed)
         self.image_size = int(image_size)
+        self.cameras = tuple(cameras)
         self.backend = str(backend)
         self.env = FlightmareExpertEnv(
             image_size=self.image_size,
-            cameras=(),
+            cameras=self.cameras,
             control_hz=self.control_hz,
             params=self.params,
             scene=self.scene,
@@ -78,6 +80,7 @@ class FlightmareStateNode:
         self._step = 0
         self._t = 0.0
         self._course: GateCourse | None = None
+        self.last_images: dict[str, np.ndarray] = {}
 
     @property
     def using_fallback(self) -> bool:
@@ -101,6 +104,7 @@ class FlightmareStateNode:
         )
         yaw = float(gates[0].yaw) if gates else 0.0
         obs = self.env.reset(init_pos=waypoints[0], yaw=yaw)
+        self.last_images = obs.images
 
         self._step = 0
         self._t = 0.0
@@ -112,6 +116,7 @@ class FlightmareStateNode:
             obs = self.env.step_motor(command.motor)
         else:
             obs = self.env.step_ctbr(command.thrust_newton, command.body_rates)
+        self.last_images = obs.images
         self._step += 1
         self._t = self._step * self.dt
         return VehicleState.from_step_result(obs, t=self._t, step=self._step)

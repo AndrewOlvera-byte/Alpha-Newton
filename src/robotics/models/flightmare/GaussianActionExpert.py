@@ -99,7 +99,12 @@ class GaussianActionExpert(nn.Module):
 
     def _mu_log_std(self, feature: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.head_trunk(feature)
-        mu = self.mean(h)
+        raw_mu = self.mean(h)
+        if self.action_clip > 0:
+            bounded_mu = raw_mu.clamp(-float(self.action_clip), float(self.action_clip))
+            mu = raw_mu + (bounded_mu - raw_mu).detach()
+        else:
+            mu = raw_mu
         if self.state_dependent_std:
             log_std = self.log_std_head(h)
         else:

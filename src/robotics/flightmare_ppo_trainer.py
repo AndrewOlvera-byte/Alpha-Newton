@@ -129,6 +129,7 @@ def collect_flightmare_rollouts(
     n_steps: int,
     device: torch.device,
     use_bf16: bool = False,
+    action_clip: float | None = None,
 ) -> tuple[list[dict], np.ndarray, dict]:
     n_envs = len(obs_list)
     current_rewards = np.zeros(n_envs, dtype=np.float32)
@@ -143,6 +144,8 @@ def collect_flightmare_rollouts(
     max_speed = 0.0
     speed_sum = 0.0
     speed_count = 0
+    action_clip_sum = 0.0
+    action_clip_count = 0
     reward_sum = 0.0
     reward_sq_sum = 0.0
     reward_min = float("inf")
@@ -160,7 +163,20 @@ def collect_flightmare_rollouts(
     for step in range(n_steps):
         batch = _stack_obs(obs_list, prev_actions, device)
         with torch.no_grad(), amp:
-            actions, log_probs, values = model.act(batch)
+            sampled_actions, _, values = model.act(batch)
+            if action_clip is not None:
+                clip = float(action_clip)
+                actions = sampled_actions.clamp(-clip, clip)
+                log_probs, _, eval_values = model.evaluate_actions(batch, actions)
+                if eval_values is not None:
+                    values = eval_values
+                action_clip_sum += float((sampled_actions.abs() > clip).float().mean().item())
+                action_clip_count += 1
+            else:
+                actions = sampled_actions
+                log_probs, _, eval_values = model.evaluate_actions(batch, actions)
+                if eval_values is not None:
+                    values = eval_values
         actions_np = actions.float().cpu().numpy()
 
         next_obs, rewards, terms, truncs, infos = vec_env.step(actions_np)
@@ -259,6 +275,7 @@ def collect_flightmare_rollouts(
         "crashes": int(crash_count),
         "mean_speed_mps": float(speed_sum / max(1, speed_count)),
         "max_speed_mps": float(max_speed),
+        "action_clip_fraction": float(action_clip_sum / max(1, action_clip_count)),
     }
     if reward_term_sums:
         denom = max(1, reward_term_count)
@@ -310,6 +327,7 @@ class FlightmarePPOTrainer:
             "mean_gate_completion": 0.1,
             "mean_reward": 0.0,
             "mean_speed_mps": 0.0,
+            "mean_length": 0.0,
         }
         configured_weights = training_cfg.get("rollout_score_weights", {}) or {}
         self.rollout_score_weights = {
@@ -318,6 +336,14 @@ class FlightmarePPOTrainer:
         }
         self.best_score = float("-inf")
         self.best_iteration = 0
+        guard_cfg = ppo.get("collapse_guard", {}) or {}
+        self.collapse_guard_enabled = bool(guard_cfg.get("enabled", False))
+        self.collapse_guard_after_iter = int(guard_cfg.get("after_iter", 25))
+        self.collapse_guard_patience = int(guard_cfg.get("patience", 3))
+        self.collapse_guard_min_success = float(guard_cfg.get("min_success_rate", 0.05))
+        self.collapse_guard_max_gate_completion = float(guard_cfg.get("max_gate_completion", 0.25))
+        self.collapse_guard_skip_update = bool(guard_cfg.get("skip_update", True))
+        self._collapse_guard_count = 0
         # When set, the trainer restores actor+critic weights, the AdamW
         # optimizer state, and the rolling best-score from this directory at
         # the start of train(). Falls back gracefully when optimizer.pt or
@@ -377,6 +403,7 @@ class FlightmarePPOTrainer:
             "gate_layout": ppo.get("gate_layout"),
             "random_start_gate": ppo.get("random_start_gate", False),
             "fixed_gate_pos_noise": ppo.get("fixed_gate_pos_noise", 0.0),
+            "fixed_gate_pos_noise_xyz": ppo.get("fixed_gate_pos_noise_xyz"),
             "fixed_gate_yaw_noise": ppo.get("fixed_gate_yaw_noise", 0.0),
             "num_gates": ppo.get("num_gates", 8),
             "gate_spacing_range": ppo.get("gate_spacing_range", [4.0, 9.0]),
@@ -385,6 +412,7 @@ class FlightmarePPOTrainer:
             "gate_yaw_step": ppo.get("gate_yaw_step", 0.7),
             "gate_yaw_noise": ppo.get("gate_yaw_noise", 0.25),
             "gate_size": ppo.get("gate_size", 1.0),
+            "gate_approach_m": ppo.get("gate_approach_m", 1.2),
             "z_min": ppo.get("z_min", 1.0),
             "gate_vehicle_radius": ppo.get("gate_vehicle_radius", 0.15),
             "max_world_radius": ppo.get("max_world_radius", 120.0),
@@ -414,9 +442,15 @@ class FlightmarePPOTrainer:
         """Layer the active curriculum stage onto a base env_kwargs dict."""
         if self.curriculum is None:
             return env_kwargs
-        env_overrides = self.curriculum.env_overrides()
+        env_overrides = dict(self.curriculum.env_overrides())
         merged = dict(env_kwargs)
+        reward_overrides = env_overrides.pop("reward_kwargs", None)
         merged.update(env_overrides)
+        if reward_overrides is not None:
+            merged["reward_kwargs"] = {
+                **(env_kwargs.get("reward_kwargs", {}) or {}),
+                **(reward_overrides or {}),
+            }
         # Trainer-side overrides (entropy coefficient).
         trainer_overrides = self.curriculum.trainer_overrides()
         if "ent_coeff_override" in trainer_overrides:
@@ -514,6 +548,7 @@ class FlightmarePPOTrainer:
             + self.rollout_score_weights["mean_gate_completion"] * stats["mean_gate_completion"]
             + self.rollout_score_weights["mean_reward"] * stats["mean_reward"]
             + self.rollout_score_weights["mean_speed_mps"] * stats["mean_speed_mps"]
+            + self.rollout_score_weights["mean_length"] * stats["mean_length"]
         )
 
     def _checkpoint_metrics(self, stats: dict, score: float) -> dict[str, float | int]:
@@ -530,7 +565,26 @@ class FlightmarePPOTrainer:
             "crashes": int(stats["crashes"]),
             "mean_speed_mps": float(stats["mean_speed_mps"]),
             "max_speed_mps": float(stats["max_speed_mps"]),
+            "action_clip_fraction": float(stats["action_clip_fraction"]),
         }
+
+    def _collapse_guard_bad_rollout(self, iteration: int, stats: dict) -> bool:
+        if not self.collapse_guard_enabled:
+            return False
+        if iteration < self.collapse_guard_after_iter:
+            return False
+        return (
+            float(stats["success_rate"]) <= self.collapse_guard_min_success
+            and float(stats["mean_gate_completion"]) <= self.collapse_guard_max_gate_completion
+        )
+
+    def _restore_best_checkpoint(self, model: nn.Module, optimizer) -> bool:
+        best_dir = os.path.join(self.output_dir, "best")
+        if not os.path.isdir(best_dir):
+            return False
+        self._restore_from_checkpoint(best_dir, model, optimizer)
+        model.to(self.device)
+        return True
 
     def smoke_test(self) -> None:
         disabled_dropout = self._disable_dropout()
@@ -551,7 +605,15 @@ class FlightmarePPOTrainer:
                 device=self.device,
             )
             obs_list, prev_actions, stats = collect_flightmare_rollouts(
-                vec_env, model, obs_list, prev_actions, buffer, 8, self.device, self.use_bf16
+                vec_env,
+                model,
+                obs_list,
+                prev_actions,
+                buffer,
+                8,
+                self.device,
+                self.use_bf16,
+                action_clip=float(self._env_kwargs().get("action_clip", 1.0)),
             )
             buffer.compute_advantages(stats["last_values"], self.gamma, self.gae_lambda)
             buffer.normalize_advantages()
@@ -632,6 +694,7 @@ class FlightmarePPOTrainer:
                     iteration, last_rollout_stats
                 ):
                     new_kwargs = self._apply_curriculum_overrides(base_env_kwargs)
+                    env_kwargs = new_kwargs
                     print(
                         f"[Flightmare PPO] Curriculum transition at iter {iteration}: "
                         f"{self.curriculum.describe()} (ent_coeff={self.ent_coeff})"
@@ -654,6 +717,7 @@ class FlightmarePPOTrainer:
                     self.n_steps,
                     self.device,
                     self.use_bf16,
+                    action_clip=float(env_kwargs.get("action_clip", 1.0)),
                 )
                 last_rollout_stats = stats
                 buffer.compute_advantages(stats["last_values"], self.gamma, self.gae_lambda)
@@ -675,40 +739,54 @@ class FlightmarePPOTrainer:
                             best_score=self.best_score,
                         )
 
+                guard_bad_rollout = self._collapse_guard_bad_rollout(iteration, stats)
+                guard_restored = False
+                skip_update = False
+                if guard_bad_rollout:
+                    self._collapse_guard_count += 1
+                    skip_update = self.collapse_guard_skip_update
+                    if self._collapse_guard_count >= self.collapse_guard_patience:
+                        guard_restored = self._restore_best_checkpoint(model, optimizer)
+                        if guard_restored:
+                            self._collapse_guard_count = 0
+                else:
+                    self._collapse_guard_count = 0
+
                 model.train()
                 pol_loss_sum = val_loss_sum = ent_sum = kl_sum = clip_sum = grad_sum = 0.0
                 n_updates = 0
                 early_stop = False
                 update_t0 = time.time()
-                for mb in buffer.get_minibatches(self.minibatch_size, self.ppo_epochs):
-                    adv = mb["advantages"]
-                    with amp:
-                        log_prob, entropy, value = model.evaluate_actions(mb["batch"], mb["actions"])
-                        p_loss = ppo_clip_loss(log_prob, mb["old_log_probs"], adv, self.clip_eps)
-                        v_loss = value_loss(value, mb["returns"], mb["old_values"], self.clip_eps)
-                        ent = entropy.mean()
-                        loss = p_loss + self.vf_coeff * v_loss - self.ent_coeff * ent
+                if not skip_update:
+                    for mb in buffer.get_minibatches(self.minibatch_size, self.ppo_epochs):
+                        adv = mb["advantages"]
+                        with amp:
+                            log_prob, entropy, value = model.evaluate_actions(mb["batch"], mb["actions"])
+                            p_loss = ppo_clip_loss(log_prob, mb["old_log_probs"], adv, self.clip_eps)
+                            v_loss = value_loss(value, mb["returns"], mb["old_values"], self.clip_eps)
+                            ent = entropy.mean()
+                            loss = p_loss + self.vf_coeff * v_loss - self.ent_coeff * ent
 
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    grad_norm = nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
-                    optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        loss.backward()
+                        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
+                        optimizer.step()
 
-                    with torch.no_grad():
-                        log_ratio = log_prob - mb["old_log_probs"]
-                        ratio = log_ratio.exp()
-                        approx_kl = ((ratio - 1.0) - log_ratio).mean()
-                        clip_frac = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
-                    pol_loss_sum += float(p_loss.item())
-                    val_loss_sum += float(v_loss.item())
-                    ent_sum += float(ent.item())
-                    kl_sum += float(approx_kl.item())
-                    clip_sum += float(clip_frac.item())
-                    grad_sum += float(grad_norm)
-                    n_updates += 1
-                    if self.target_kl is not None and float(approx_kl.item()) > 1.5 * self.target_kl:
-                        early_stop = True
-                        break
+                        with torch.no_grad():
+                            log_ratio = log_prob - mb["old_log_probs"]
+                            ratio = log_ratio.exp()
+                            approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                            clip_frac = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
+                        pol_loss_sum += float(p_loss.item())
+                        val_loss_sum += float(v_loss.item())
+                        ent_sum += float(ent.item())
+                        kl_sum += float(approx_kl.item())
+                        clip_sum += float(clip_frac.item())
+                        grad_sum += float(grad_norm)
+                        n_updates += 1
+                        if self.target_kl is not None and float(approx_kl.item()) > 1.5 * self.target_kl:
+                            early_stop = True
+                            break
                 update_time = time.time() - update_t0
 
                 if iteration % self.logging_steps == 0:
@@ -741,6 +819,7 @@ class FlightmarePPOTrainer:
                         "rollout/crashes": stats["crashes"],
                         "rollout/mean_speed_mps": stats["mean_speed_mps"],
                         "rollout/max_speed_mps": stats["max_speed_mps"],
+                        "rollout/action_clip_fraction": stats["action_clip_fraction"],
                         "rollout/reward_step_mean": stats["step_reward_mean"],
                         "rollout/reward_step_std": stats["step_reward_std"],
                         "rollout/reward_step_min": stats["step_reward_min"],
@@ -753,6 +832,10 @@ class FlightmarePPOTrainer:
                         "checkpoint/best_score": self.best_score if np.isfinite(self.best_score) else -1.0,
                         "checkpoint/best_iteration": self.best_iteration,
                         "checkpoint/is_new_best": float(is_new_best),
+                        "collapse_guard/bad_rollout": float(guard_bad_rollout),
+                        "collapse_guard/count": float(self._collapse_guard_count),
+                        "collapse_guard/skipped_update": float(skip_update),
+                        "collapse_guard/restored_best": float(guard_restored),
                         **(
                             {
                                 "curriculum/stage_idx": float(self.curriculum.active_index),
@@ -776,11 +859,13 @@ class FlightmarePPOTrainer:
                         f"gc={stats['mean_gate_completion']:.1%} "
                         f"pass={stats['gate_passes']} miss={stats['gate_misses']} crash={stats['crashes']} "
                         f"v={stats['mean_speed_mps']:.1f}/{stats['max_speed_mps']:.1f} "
+                        f"aclip={stats['action_clip_fraction']:.2f} "
                         f"pl={pol_loss_sum/max(1,n_updates):.4f} "
                         f"vl={val_loss_sum/max(1,n_updates):.4f} "
                         f"ent={ent_sum/max(1,n_updates):.3f} "
                         f"kl={kl_sum/max(1,n_updates):.4f} "
                         f"stop={int(early_stop)} "
+                        f"guard={int(guard_bad_rollout)}/{self._collapse_guard_count} "
                         f"ev={explained_var:+.2f} "
                         f"fps={fps:.0f} rfps={stats['rollout_fps']:.0f} "
                         f"[roll={stats['rollout_time']:.1f}s upd={update_time:.1f}s]"

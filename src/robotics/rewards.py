@@ -537,6 +537,625 @@ def flightmare_racing_v3(
     return total
 
 
+def flightmare_racing_v4_speed(
+    *,
+    info: dict,
+    action: np.ndarray | None = None,
+    prev_action: np.ndarray | None = None,
+    dt: float = 0.01,
+    gate_normal_progress_scale: float = 4.0,
+    segment_progress_scale: float = 1.0,
+    centerline_progress_scale: float = 2.25,
+    centerline_error_penalty: float = 0.045,
+    aperture_near_penalty: float = 1.25,
+    aperture_near_m: float = 5.0,
+    velocity_alignment_scale: float = 0.05,
+    body_alignment_scale: float = 0.03,
+    speed_reward_scale: float = 0.09,
+    speed_target_mps: float = 13.0,
+    speed_centerline_window: float = 2.0,
+    speed_gate_near_m: float = 7.0,
+    gate_pass_bonus: float = 26.0,
+    gate_pass_speed_bonus_scale: float = 1.2,
+    gate_pass_speed_cap_mps: float = 16.0,
+    segment_completion_bonus: float = 6.0,
+    completion_bonus: float = 240.0,
+    completion_time_target_s: float = 6.5,
+    completion_time_bonus_scale: float = 24.0,
+    gate_miss_penalty: float = 180.0,
+    crash_penalty: float = 180.0,
+    no_progress_penalty: float = 0.16,
+    backward_progress_penalty: float = 2.5,
+    min_forward_velocity_mps: float = 2.0,
+    stall_grace_steps: int = 20,
+    time_penalty: float = 0.08,
+    body_rate_penalty: float = 0.00035,
+    action_smoothness_penalty: float = 0.002,
+    vertical_speed_penalty: float = 0.0005,
+    thrust_saturation_penalty: float = 0.0005,
+    max_progress_reward: float = 3.0,
+    max_centerline_progress: float = 2.0,
+    max_centerline_error: float = 6.0,
+    **_,
+) -> float:
+    """Speed-focused racing reward for full-course fine-tuning.
+
+    Unlike v3, raw velocity is not rewarded everywhere. Speed credit is gated by
+    local gate-frame error and distance to the gate plane so the policy is paid
+    for carrying speed on a viable racing line, not for charging into misses.
+    """
+    terms: dict[str, float] = {}
+
+    normal_progress = float(np.clip(
+        info.get("gate_normal_progress_m", 0.0),
+        -max_progress_reward,
+        max_progress_reward,
+    ))
+    segment_progress = float(np.clip(
+        info.get("segment_progress_m", 0.0),
+        -max_progress_reward,
+        max_progress_reward,
+    ))
+    center_progress = float(np.clip(
+        info.get("gate_center_error_progress", 0.0),
+        -max_centerline_progress,
+        max_centerline_progress,
+    ))
+    forward_speed = float(info.get("gate_normal_velocity_mps", 0.0))
+
+    terms["progress_gate_normal"] = float(gate_normal_progress_scale) * normal_progress
+    terms["progress_segment"] = float(segment_progress_scale) * segment_progress
+    terms["centerline_progress"] = float(centerline_progress_scale) * center_progress
+    if normal_progress < 0.0:
+        terms["backward_progress"] = float(backward_progress_penalty) * normal_progress
+
+    center_err = float(np.clip(
+        info.get("gate_center_error_norm_next", info.get("gate_center_error_norm", 0.0)),
+        0.0,
+        max_centerline_error,
+    ))
+    terms["centerline_error"] = -float(centerline_error_penalty) * center_err
+
+    signed_dist = abs(float(info.get("gate_signed_distance_next_m", info.get("gate_signed_distance_m", 0.0))))
+    aperture_near = max(0.0, 1.0 - signed_dist / max(float(aperture_near_m), 1e-6))
+    lat = abs(float(info.get("gate_lateral_norm_next", info.get("gate_lateral_norm", 0.0))))
+    vert = abs(float(info.get("gate_vertical_norm_next", info.get("gate_vertical_norm", 0.0))))
+    violation = min(max(lat - 1.0, 0.0) + max(vert - 1.0, 0.0), max_centerline_error)
+    terms["aperture_violation_near"] = -float(aperture_near_penalty) * aperture_near * violation
+
+    lane_quality = float(np.clip(1.0 - center_err / max(float(speed_centerline_window), 1e-6), 0.0, 1.0))
+    gate_near_quality = float(np.clip(1.0 - signed_dist / max(float(speed_gate_near_m), 1e-6), 0.0, 1.0))
+    speed_quality = lane_quality * max(0.25, gate_near_quality)
+    speed_deficit = max(0.0, float(speed_target_mps) - max(0.0, forward_speed))
+    terms["racing_speed"] = float(speed_reward_scale) * speed_quality * max(0.0, forward_speed)
+    terms["speed_deficit"] = -0.25 * float(speed_reward_scale) * lane_quality * speed_deficit
+
+    terms["velocity_alignment"] = float(velocity_alignment_scale) * max(0.0, forward_speed)
+    terms["body_alignment"] = float(body_alignment_scale) * float(info.get("gate_alignment", 0.0))
+    terms["time"] = -float(time_penalty)
+
+    step = int(info.get("step", 0))
+    if step >= int(stall_grace_steps) and forward_speed < float(min_forward_velocity_mps):
+        terms["no_progress"] = -float(no_progress_penalty) * (float(min_forward_velocity_mps) - forward_speed)
+
+    vz = float(info.get("vertical_speed_mps", 0.0))
+    terms["vertical_speed"] = -float(vertical_speed_penalty) * vz * vz
+
+    omega = info.get("omega")
+    if omega is not None:
+        omega_sq = float(np.sum(np.asarray(omega, dtype=np.float32) ** 2))
+    else:
+        omega_sq = float(info.get("angular_rate_norm", 0.0)) ** 2
+    terms["body_rate"] = -float(body_rate_penalty) * omega_sq
+
+    if action is not None:
+        a = np.asarray(action, dtype=np.float32)
+        if prev_action is not None:
+            pa = np.asarray(prev_action, dtype=np.float32)
+            terms["action_smoothness"] = -float(action_smoothness_penalty) * float(np.sum((a - pa) ** 2))
+        if thrust_saturation_penalty > 0.0 and a.size:
+            high = max(float(a[0]) - 0.97, 0.0)
+            low = max(0.03 - float(a[0]), 0.0)
+            terms["thrust_saturation"] = -float(thrust_saturation_penalty) * (low * low + high * high)
+
+    if info.get("gate_passed", False):
+        margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
+        pass_speed = min(max(0.0, forward_speed), float(gate_pass_speed_cap_mps))
+        terms["gate_pass"] = float(gate_pass_bonus) + 1.5 * margin
+        terms["gate_pass_speed"] = float(gate_pass_speed_bonus_scale) * pass_speed
+        terms["segment_complete"] = float(segment_completion_bonus)
+    if info.get("success", False):
+        elapsed_s = max(0.0, float(step) * float(dt))
+        fast_bonus = max(0.0, float(completion_time_target_s) - elapsed_s)
+        terms["completion"] = float(completion_bonus)
+        terms["fast_completion"] = float(completion_time_bonus_scale) * fast_bonus
+    if info.get("gate_missed", False):
+        terms["gate_miss"] = -float(gate_miss_penalty)
+    if info.get("crash", False):
+        terms["crash"] = -float(crash_penalty)
+
+    total = float(sum(terms.values()))
+    terms["total"] = total
+    info["reward_terms"] = terms
+    for key, value in terms.items():
+        info[f"reward/{key}"] = float(value)
+    return total
+
+
+def flightmare_racing_v5_min_time(
+    *,
+    info: dict,
+    action: np.ndarray | None = None,
+    prev_action: np.ndarray | None = None,
+    dt: float = 0.01,
+    gate_normal_progress_scale: float = 4.0,
+    segment_progress_scale: float = 8.0,
+    centerline_progress_scale: float = 2.0,
+    centerline_error_penalty: float = 0.055,
+    centerline_error_power: float = 1.5,
+    aperture_near_penalty: float = 1.7,
+    aperture_near_m: float = 5.0,
+    velocity_alignment_scale: float = 0.02,
+    body_alignment_scale: float = 0.02,
+    gate_pass_bonus: float = 30.0,
+    gate_margin_bonus_scale: float = 2.0,
+    segment_completion_bonus: float = 4.0,
+    completion_bonus: float = 260.0,
+    completion_time_penalty_scale: float = 10.0,
+    gate_miss_penalty: float = 260.0,
+    gate_miss_margin_penalty: float = 60.0,
+    crash_penalty: float = 260.0,
+    no_progress_penalty: float = 0.22,
+    backward_progress_penalty: float = 4.0,
+    min_forward_velocity_mps: float = 3.0,
+    stall_grace_steps: int = 20,
+    time_penalty: float = 0.14,
+    body_rate_penalty: float = 0.00018,
+    action_smoothness_penalty: float = 0.0012,
+    vertical_speed_penalty: float = 0.00025,
+    thrust_saturation_penalty: float = 0.0,
+    max_progress_reward: float = 3.0,
+    max_centerline_progress: float = 2.0,
+    max_centerline_error: float = 6.0,
+    **_,
+) -> float:
+    """Minimum-time full-course reward.
+
+    The primary objective is dense course progress minus a constant per-step
+    cost. This makes a fixed completed course more valuable when completed in
+    fewer steps, without paying the policy for speed in isolation.
+    """
+    terms: dict[str, float] = {}
+
+    normal_progress = float(np.clip(
+        info.get("gate_normal_progress_m", 0.0),
+        -max_progress_reward,
+        max_progress_reward,
+    ))
+    segment_progress = float(np.clip(
+        info.get("segment_progress_m", 0.0),
+        -max_progress_reward,
+        max_progress_reward,
+    ))
+    center_progress = float(np.clip(
+        info.get("gate_center_error_progress", 0.0),
+        -max_centerline_progress,
+        max_centerline_progress,
+    ))
+    forward_speed = float(info.get("gate_normal_velocity_mps", 0.0))
+
+    terms["progress_segment"] = float(segment_progress_scale) * segment_progress
+    terms["progress_gate_normal"] = float(gate_normal_progress_scale) * normal_progress
+    terms["centerline_progress"] = float(centerline_progress_scale) * center_progress
+    if normal_progress < 0.0 or segment_progress < 0.0:
+        terms["backward_progress"] = float(backward_progress_penalty) * min(normal_progress, segment_progress)
+
+    center_err = float(np.clip(
+        info.get("gate_center_error_norm_next", info.get("gate_center_error_norm", 0.0)),
+        0.0,
+        max_centerline_error,
+    ))
+    signed_dist = abs(float(info.get("gate_signed_distance_next_m", info.get("gate_signed_distance_m", 0.0))))
+    near = max(0.0, 1.0 - signed_dist / max(float(aperture_near_m), 1e-6))
+    center_shape = center_err ** max(float(centerline_error_power), 1.0)
+    terms["centerline_error"] = -float(centerline_error_penalty) * (0.25 + 0.75 * near) * center_shape
+
+    lat = abs(float(info.get("gate_lateral_norm_next", info.get("gate_lateral_norm", 0.0))))
+    vert = abs(float(info.get("gate_vertical_norm_next", info.get("gate_vertical_norm", 0.0))))
+    violation = min(max(lat - 1.0, 0.0) + max(vert - 1.0, 0.0), max_centerline_error)
+    terms["aperture_violation_near"] = -float(aperture_near_penalty) * near * violation * violation
+
+    terms["velocity_alignment"] = float(velocity_alignment_scale) * max(0.0, forward_speed)
+    terms["body_alignment"] = float(body_alignment_scale) * float(info.get("gate_alignment", 0.0))
+    terms["time"] = -float(time_penalty)
+
+    step = int(info.get("step", 0))
+    if step >= int(stall_grace_steps) and forward_speed < float(min_forward_velocity_mps):
+        terms["no_progress"] = -float(no_progress_penalty) * (float(min_forward_velocity_mps) - forward_speed)
+
+    vz = float(info.get("vertical_speed_mps", 0.0))
+    terms["vertical_speed"] = -float(vertical_speed_penalty) * vz * vz
+
+    omega = info.get("omega")
+    if omega is not None:
+        omega_sq = float(np.sum(np.asarray(omega, dtype=np.float32) ** 2))
+    else:
+        omega_sq = float(info.get("angular_rate_norm", 0.0)) ** 2
+    terms["body_rate"] = -float(body_rate_penalty) * omega_sq
+
+    if action is not None:
+        a = np.asarray(action, dtype=np.float32)
+        if prev_action is not None:
+            pa = np.asarray(prev_action, dtype=np.float32)
+            terms["action_smoothness"] = -float(action_smoothness_penalty) * float(np.sum((a - pa) ** 2))
+        if thrust_saturation_penalty > 0.0 and a.size:
+            high = max(float(a[0]) - 0.98, 0.0)
+            low = max(0.02 - float(a[0]), 0.0)
+            terms["thrust_saturation"] = -float(thrust_saturation_penalty) * (low * low + high * high)
+
+    if info.get("gate_passed", False):
+        margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
+        terms["gate_pass"] = float(gate_pass_bonus) + float(gate_margin_bonus_scale) * margin
+        terms["segment_complete"] = float(segment_completion_bonus)
+    if info.get("success", False):
+        elapsed_s = max(0.0, float(step) * float(dt))
+        terms["completion"] = float(completion_bonus)
+        terms["completion_time"] = -float(completion_time_penalty_scale) * elapsed_s
+    if info.get("gate_missed", False):
+        miss_margin = max(0.0, -float(info.get("gate_margin_m", 0.0)))
+        terms["gate_miss"] = -float(gate_miss_penalty) - float(gate_miss_margin_penalty) * miss_margin
+    if info.get("crash", False):
+        terms["crash"] = -float(crash_penalty)
+
+    total = float(sum(terms.values()))
+    terms["total"] = total
+    info["reward_terms"] = terms
+    for key, value in terms.items():
+        info[f"reward/{key}"] = float(value)
+    return total
+
+
+def flightmare_racing_v6_champion_lap(
+    *,
+    info: dict,
+    action: np.ndarray | None = None,
+    prev_action: np.ndarray | None = None,
+    dt: float = 0.01,
+    gate_normal_progress_scale: float = 5.0,
+    segment_progress_scale: float = 2.0,
+    centerline_progress_scale: float = 3.0,
+    centerline_error_penalty: float = 0.065,
+    centerline_error_power: float = 1.35,
+    aperture_near_penalty: float = 1.8,
+    aperture_near_m: float = 5.5,
+    speed_reward_scale: float = 0.085,
+    speed_cap_mps: float = 18.0,
+    speed_centerline_window: float = 1.75,
+    speed_gate_near_m: float = 8.0,
+    overspeed_error_penalty: float = 0.035,
+    overspeed_gate_near_m: float = 7.0,
+    velocity_alignment_scale: float = 0.05,
+    body_alignment_scale: float = 0.04,
+    gate_pass_bonus: float = 28.0,
+    gate_pass_speed_bonus_scale: float = 1.05,
+    gate_pass_speed_cap_mps: float = 18.0,
+    gate_margin_bonus_scale: float = 2.0,
+    segment_completion_bonus: float = 7.0,
+    completion_bonus: float = 240.0,
+    completion_time_target_s: float = 8.0,
+    completion_time_bonus_scale: float = 42.0,
+    completion_time_floor_s: float = 5.6,
+    gate_miss_penalty: float = 260.0,
+    gate_miss_margin_penalty: float = 90.0,
+    crash_penalty: float = 280.0,
+    no_progress_penalty: float = 0.14,
+    backward_progress_penalty: float = 2.5,
+    min_forward_velocity_mps: float = 1.5,
+    stall_grace_steps: int = 25,
+    time_penalty: float = 0.035,
+    body_rate_penalty: float = 0.00055,
+    action_smoothness_penalty: float = 0.0035,
+    vertical_speed_penalty: float = 0.0008,
+    thrust_saturation_penalty: float = 0.001,
+    max_progress_reward: float = 3.0,
+    max_centerline_progress: float = 2.0,
+    max_centerline_error: float = 6.0,
+    **_,
+) -> float:
+    """Fixed-course champion-lap reward.
+
+    Dense progress is the primary proxy for lap time. Speed is credited only
+    when the drone is on a viable racing line, and high speed outside the gate
+    corridor is penalized so partial-course sprinting into misses is not a
+    profitable local optimum.
+    """
+    terms: dict[str, float] = {}
+
+    normal_progress = float(np.clip(
+        info.get("gate_normal_progress_m", 0.0),
+        -max_progress_reward,
+        max_progress_reward,
+    ))
+    segment_progress = float(np.clip(
+        info.get("segment_progress_m", 0.0),
+        -max_progress_reward,
+        max_progress_reward,
+    ))
+    center_progress = float(np.clip(
+        info.get("gate_center_error_progress", 0.0),
+        -max_centerline_progress,
+        max_centerline_progress,
+    ))
+    forward_speed = float(info.get("gate_normal_velocity_mps", 0.0))
+
+    terms["progress_gate_normal"] = float(gate_normal_progress_scale) * normal_progress
+    terms["progress_segment"] = float(segment_progress_scale) * segment_progress
+    terms["centerline_progress"] = float(centerline_progress_scale) * center_progress
+    if normal_progress < 0.0 or segment_progress < 0.0:
+        terms["backward_progress"] = float(backward_progress_penalty) * min(normal_progress, segment_progress)
+
+    center_err = float(np.clip(
+        info.get("gate_center_error_norm_next", info.get("gate_center_error_norm", 0.0)),
+        0.0,
+        max_centerline_error,
+    ))
+    signed_dist = abs(float(info.get("gate_signed_distance_next_m", info.get("gate_signed_distance_m", 0.0))))
+    near = max(0.0, 1.0 - signed_dist / max(float(aperture_near_m), 1e-6))
+    center_shape = center_err ** max(float(centerline_error_power), 1.0)
+    terms["centerline_error"] = -float(centerline_error_penalty) * (0.35 + 0.65 * near) * center_shape
+
+    lat = abs(float(info.get("gate_lateral_norm_next", info.get("gate_lateral_norm", 0.0))))
+    vert = abs(float(info.get("gate_vertical_norm_next", info.get("gate_vertical_norm", 0.0))))
+    violation = min(max(lat - 1.0, 0.0) + max(vert - 1.0, 0.0), max_centerline_error)
+    terms["aperture_violation_near"] = -float(aperture_near_penalty) * near * violation * violation
+
+    lane_quality = float(np.clip(1.0 - center_err / max(float(speed_centerline_window), 1e-6), 0.0, 1.0))
+    gate_near_quality = float(np.clip(1.0 - signed_dist / max(float(speed_gate_near_m), 1e-6), 0.0, 1.0))
+    forward_quality = float(np.clip(max(normal_progress, 0.0) / max(float(max_progress_reward), 1e-6), 0.0, 1.0))
+    speed_quality = lane_quality * (0.35 + 0.65 * gate_near_quality) * (0.35 + 0.65 * forward_quality)
+    capped_speed = min(max(0.0, forward_speed), float(speed_cap_mps))
+    terms["racing_speed"] = float(speed_reward_scale) * speed_quality * capped_speed
+
+    overspeed_near = max(0.0, 1.0 - signed_dist / max(float(overspeed_gate_near_m), 1e-6))
+    excess_err = max(0.0, center_err - 1.0)
+    terms["overspeed_error"] = -float(overspeed_error_penalty) * overspeed_near * excess_err * max(0.0, forward_speed)
+
+    terms["velocity_alignment"] = float(velocity_alignment_scale) * max(0.0, forward_speed)
+    terms["body_alignment"] = float(body_alignment_scale) * float(info.get("gate_alignment", 0.0))
+    terms["time"] = -float(time_penalty)
+
+    step = int(info.get("step", 0))
+    if step >= int(stall_grace_steps) and forward_speed < float(min_forward_velocity_mps):
+        terms["no_progress"] = -float(no_progress_penalty) * (float(min_forward_velocity_mps) - forward_speed)
+
+    vz = float(info.get("vertical_speed_mps", 0.0))
+    terms["vertical_speed"] = -float(vertical_speed_penalty) * vz * vz
+
+    omega = info.get("omega")
+    if omega is not None:
+        omega_sq = float(np.sum(np.asarray(omega, dtype=np.float32) ** 2))
+    else:
+        omega_sq = float(info.get("angular_rate_norm", 0.0)) ** 2
+    terms["body_rate"] = -float(body_rate_penalty) * omega_sq
+
+    if action is not None:
+        a = np.asarray(action, dtype=np.float32)
+        if prev_action is not None:
+            pa = np.asarray(prev_action, dtype=np.float32)
+            terms["action_smoothness"] = -float(action_smoothness_penalty) * float(np.sum((a - pa) ** 2))
+        if thrust_saturation_penalty > 0.0 and a.size:
+            high = max(float(a[0]) - 0.96, 0.0)
+            low = max(0.04 - float(a[0]), 0.0)
+            terms["thrust_saturation"] = -float(thrust_saturation_penalty) * (low * low + high * high)
+
+    if info.get("gate_passed", False):
+        margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
+        pass_speed = min(max(0.0, forward_speed), float(gate_pass_speed_cap_mps))
+        margin_quality = float(np.clip(margin / 0.35, 0.0, 1.0))
+        terms["gate_pass"] = float(gate_pass_bonus) + float(gate_margin_bonus_scale) * margin
+        terms["gate_pass_speed"] = float(gate_pass_speed_bonus_scale) * pass_speed * (0.35 + 0.65 * margin_quality)
+        terms["segment_complete"] = float(segment_completion_bonus)
+    if info.get("success", False):
+        elapsed_s = max(0.0, float(step) * float(dt))
+        fast_bonus = max(0.0, float(completion_time_target_s) - max(elapsed_s, float(completion_time_floor_s)))
+        terms["completion"] = float(completion_bonus)
+        terms["fast_completion"] = float(completion_time_bonus_scale) * fast_bonus
+    if info.get("gate_missed", False):
+        miss_margin = max(0.0, -float(info.get("gate_margin_m", 0.0)))
+        terms["gate_miss"] = -float(gate_miss_penalty) - float(gate_miss_margin_penalty) * miss_margin
+    if info.get("crash", False):
+        terms["crash"] = -float(crash_penalty)
+
+    total = float(sum(terms.values()))
+    terms["total"] = total
+    info["reward_terms"] = terms
+    for key, value in terms.items():
+        info[f"reward/{key}"] = float(value)
+    return total
+
+
+def flightmare_racing_v7_guarded_time_trial(
+    *,
+    info: dict,
+    action: np.ndarray | None = None,
+    prev_action: np.ndarray | None = None,
+    dt: float = 0.01,
+    gate_normal_progress_scale: float = 5.4,
+    segment_progress_scale: float = 1.8,
+    centerline_progress_scale: float = 3.4,
+    centerline_error_penalty: float = 0.085,
+    centerline_error_power: float = 1.45,
+    aperture_near_penalty: float = 2.3,
+    aperture_near_m: float = 6.0,
+    progress_speed_gain: float = 0.42,
+    racing_speed_scale: float = 0.018,
+    speed_reference_mps: float = 8.0,
+    speed_cap_mps: float = 16.5,
+    speed_centerline_window: float = 1.55,
+    speed_gate_near_m: float = 8.5,
+    overspeed_error_penalty: float = 0.065,
+    overspeed_gate_near_m: float = 8.0,
+    velocity_alignment_scale: float = 0.0,
+    body_alignment_scale: float = 0.035,
+    gate_pass_bonus: float = 30.0,
+    gate_pass_speed_bonus_scale: float = 0.25,
+    gate_pass_speed_cap_mps: float = 16.5,
+    gate_margin_bonus_scale: float = 3.0,
+    segment_completion_bonus: float = 7.0,
+    completion_bonus: float = 260.0,
+    completion_time_target_s: float = 9.4,
+    completion_time_bonus_scale: float = 24.0,
+    completion_time_penalty_scale: float = 18.0,
+    completion_time_floor_s: float = 7.2,
+    gate_miss_penalty: float = 430.0,
+    gate_miss_margin_penalty: float = 150.0,
+    remaining_gate_miss_penalty: float = 18.0,
+    crash_penalty: float = 430.0,
+    no_progress_penalty: float = 0.18,
+    backward_progress_penalty: float = 3.0,
+    min_forward_velocity_mps: float = 1.8,
+    stall_grace_steps: int = 25,
+    time_penalty: float = 0.055,
+    body_rate_penalty: float = 0.00045,
+    action_smoothness_penalty: float = 0.0025,
+    vertical_speed_penalty: float = 0.0008,
+    thrust_saturation_penalty: float = 0.00035,
+    max_progress_reward: float = 3.0,
+    max_centerline_progress: float = 2.0,
+    max_centerline_error: float = 6.0,
+    **_,
+) -> float:
+    """Guarded fixed-course time-trial reward.
+
+    This variant keeps potential-like gate/centerline progress as the dense
+    lap-time proxy and only amplifies speed when that progress is clean. It is
+    meant for late-stage fixed-course fine-tuning where the failure to avoid is
+    partial-course sprinting into a repeated early gate miss.
+    """
+    terms: dict[str, float] = {}
+
+    normal_progress = float(np.clip(
+        info.get("gate_normal_progress_m", 0.0),
+        -max_progress_reward,
+        max_progress_reward,
+    ))
+    segment_progress = float(np.clip(
+        info.get("segment_progress_m", 0.0),
+        -max_progress_reward,
+        max_progress_reward,
+    ))
+    center_progress = float(np.clip(
+        info.get("gate_center_error_progress", 0.0),
+        -max_centerline_progress,
+        max_centerline_progress,
+    ))
+    forward_speed = float(info.get("gate_normal_velocity_mps", 0.0))
+
+    base_progress = (
+        float(gate_normal_progress_scale) * normal_progress
+        + float(segment_progress_scale) * segment_progress
+        + float(centerline_progress_scale) * center_progress
+    )
+    terms["progress_base"] = base_progress
+    if normal_progress < 0.0 or segment_progress < 0.0:
+        terms["backward_progress"] = float(backward_progress_penalty) * min(normal_progress, segment_progress)
+
+    center_err = float(np.clip(
+        info.get("gate_center_error_norm_next", info.get("gate_center_error_norm", 0.0)),
+        0.0,
+        max_centerline_error,
+    ))
+    signed_dist = abs(float(info.get("gate_signed_distance_next_m", info.get("gate_signed_distance_m", 0.0))))
+    near = max(0.0, 1.0 - signed_dist / max(float(aperture_near_m), 1e-6))
+    center_shape = center_err ** max(float(centerline_error_power), 1.0)
+    terms["centerline_error"] = -float(centerline_error_penalty) * (0.30 + 0.70 * near) * center_shape
+
+    lat = abs(float(info.get("gate_lateral_norm_next", info.get("gate_lateral_norm", 0.0))))
+    vert = abs(float(info.get("gate_vertical_norm_next", info.get("gate_vertical_norm", 0.0))))
+    violation = min(max(lat - 1.0, 0.0) + max(vert - 1.0, 0.0), max_centerline_error)
+    terms["aperture_violation_near"] = -float(aperture_near_penalty) * near * violation * violation
+
+    lane_quality = float(np.clip(1.0 - center_err / max(float(speed_centerline_window), 1e-6), 0.0, 1.0))
+    gate_near_quality = float(np.clip(1.0 - signed_dist / max(float(speed_gate_near_m), 1e-6), 0.0, 1.0))
+    forward_quality = float(np.clip(max(normal_progress, 0.0) / max(float(max_progress_reward), 1e-6), 0.0, 1.0))
+    speed_quality = lane_quality * (0.35 + 0.65 * gate_near_quality) * (0.35 + 0.65 * forward_quality)
+    capped_speed = min(max(0.0, forward_speed), float(speed_cap_mps))
+    speed_ratio = capped_speed / max(float(speed_reference_mps), 1e-6)
+
+    # This is the main speed term: no clean progress means no meaningful speed
+    # credit, so early misses cannot become attractive just by flying fast.
+    terms["progress_speed"] = (
+        float(progress_speed_gain)
+        * speed_quality
+        * min(speed_ratio, 2.0)
+        * max(0.0, base_progress)
+    )
+    terms["racing_speed"] = float(racing_speed_scale) * speed_quality * capped_speed
+
+    overspeed_near = max(0.0, 1.0 - signed_dist / max(float(overspeed_gate_near_m), 1e-6))
+    excess_err = max(0.0, center_err - 0.85)
+    terms["overspeed_error"] = -float(overspeed_error_penalty) * overspeed_near * excess_err * max(0.0, forward_speed)
+
+    if velocity_alignment_scale:
+        terms["velocity_alignment"] = float(velocity_alignment_scale) * max(0.0, forward_speed)
+    terms["body_alignment"] = float(body_alignment_scale) * float(info.get("gate_alignment", 0.0))
+    terms["time"] = -float(time_penalty)
+
+    step = int(info.get("step", 0))
+    if step >= int(stall_grace_steps) and forward_speed < float(min_forward_velocity_mps):
+        terms["no_progress"] = -float(no_progress_penalty) * (float(min_forward_velocity_mps) - forward_speed)
+
+    vz = float(info.get("vertical_speed_mps", 0.0))
+    terms["vertical_speed"] = -float(vertical_speed_penalty) * vz * vz
+
+    omega = info.get("omega")
+    if omega is not None:
+        omega_sq = float(np.sum(np.asarray(omega, dtype=np.float32) ** 2))
+    else:
+        omega_sq = float(info.get("angular_rate_norm", 0.0)) ** 2
+    terms["body_rate"] = -float(body_rate_penalty) * omega_sq
+
+    if action is not None:
+        a = np.asarray(action, dtype=np.float32)
+        if prev_action is not None:
+            pa = np.asarray(prev_action, dtype=np.float32)
+            terms["action_smoothness"] = -float(action_smoothness_penalty) * float(np.sum((a - pa) ** 2))
+        if thrust_saturation_penalty > 0.0 and a.size:
+            high = max(float(a[0]) - 0.985, 0.0)
+            low = max(0.025 - float(a[0]), 0.0)
+            terms["thrust_saturation"] = -float(thrust_saturation_penalty) * (low * low + high * high)
+
+    if info.get("gate_passed", False):
+        margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
+        pass_speed = min(max(0.0, forward_speed), float(gate_pass_speed_cap_mps))
+        margin_quality = float(np.clip(margin / 0.35, 0.0, 1.0))
+        terms["gate_pass"] = float(gate_pass_bonus) + float(gate_margin_bonus_scale) * margin
+        terms["gate_pass_speed"] = float(gate_pass_speed_bonus_scale) * pass_speed * margin_quality
+        terms["segment_complete"] = float(segment_completion_bonus)
+    if info.get("success", False):
+        elapsed_s = max(0.0, float(step) * float(dt))
+        fast_bonus = max(0.0, float(completion_time_target_s) - max(elapsed_s, float(completion_time_floor_s)))
+        terms["completion"] = float(completion_bonus)
+        terms["fast_completion"] = float(completion_time_bonus_scale) * fast_bonus
+        terms["success_time_cost"] = -float(completion_time_penalty_scale) * elapsed_s
+    if info.get("gate_missed", False):
+        miss_margin = max(0.0, -float(info.get("gate_margin_m", 0.0)))
+        completed = int(info.get("gates_completed", 0))
+        num_gates = max(1, int(info.get("num_gates", 1)))
+        remaining = max(0, num_gates - completed)
+        terms["gate_miss"] = -float(gate_miss_penalty) - float(gate_miss_margin_penalty) * miss_margin
+        terms["gate_miss_remaining"] = -float(remaining_gate_miss_penalty) * float(remaining)
+    if info.get("crash", False):
+        terms["crash"] = -float(crash_penalty)
+
+    total = float(sum(terms.values()))
+    terms["total"] = total
+    info["reward_terms"] = terms
+    for key, value in terms.items():
+        info[f"reward/{key}"] = float(value)
+    return total
+
+
 # ===========================================================================
 # Registry + lookup
 # ===========================================================================
@@ -548,6 +1167,10 @@ REWARD_FUNCTIONS: Dict[str, Callable] = {
     "flightmare_racing_v1": flightmare_racing_v1,
     "flightmare_racing_v2": flightmare_racing_v2,
     "flightmare_racing_v3": flightmare_racing_v3,
+    "flightmare_racing_v4_speed": flightmare_racing_v4_speed,
+    "flightmare_racing_v5_min_time": flightmare_racing_v5_min_time,
+    "flightmare_racing_v6_champion_lap": flightmare_racing_v6_champion_lap,
+    "flightmare_racing_v7_guarded_time_trial": flightmare_racing_v7_guarded_time_trial,
 }
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -104,8 +105,15 @@ class FlightmareAutonomyGraph:
             return "ground"
         return None
 
-    def run_episode(self, episode_id: int, rng: np.random.Generator) -> EpisodeResult:
+    def run_episode(
+        self,
+        episode_id: int,
+        rng: np.random.Generator,
+        frame_callback: Callable[[dict[str, np.ndarray], int], None] | None = None,
+    ) -> EpisodeResult:
         course, state = self.state_node.reset(episode_id=episode_id, rng=rng)
+        if frame_callback is not None:
+            frame_callback(self.state_node.last_images, int(state.step))
         self.mission_node.reset(course.gates)
         strict_tracker = StrictGateTracker(course.gates, vehicle_radius=self.gate_vehicle_radius)
 
@@ -163,6 +171,8 @@ class FlightmareAutonomyGraph:
             ctbr_commands.append(command.ctbr.copy())
             prev_state = state
             state = self.state_node.step(command)
+            if frame_callback is not None:
+                frame_callback(self.state_node.last_images, int(state.step))
 
         traj = np.stack(positions, axis=0) if positions else np.zeros((0, 3), dtype=np.float32)
         if len(traj) > 1:

@@ -297,8 +297,33 @@ def _swift_v4_gate_course(rng: np.random.Generator, cfg: argparse.Namespace) -> 
     yaws = _compute_path_yaws(centers)
 
     if pos_noise > 0.0:
-        centers = centers + rng.normal(0.0, pos_noise, size=centers.shape)
-        centers[:, 2] = np.maximum(centers[:, 2], float(_cfg(cfg, "z_min", 1.0)))
+        # Per-gate Gaussian xyz noise with rejection sampling so adjacent
+        # noisy gates never overlap. ``min_pair_dist`` is the floor distance
+        # between any two gate centers (gate_size + clearance margin); at high
+        # noise sigmas a naive draw can pull neighbors inside each other.
+        size_arr = np.asarray(_gate_size_array(cfg), dtype=np.float64)
+        clearance = float(_cfg(cfg, "gate_clearance_m", 0.6))
+        min_pair_dist = float(np.max(size_arr[:2])) + clearance
+        z_min = float(_cfg(cfg, "z_min", 1.0))
+        noisy = centers.copy()
+        max_tries = 50
+        for i in range(noisy.shape[0]):
+            base = centers[i]
+            for _ in range(max_tries):
+                cand = base + rng.normal(0.0, pos_noise, size=3)
+                cand[2] = max(cand[2], z_min)
+                # Reject if the candidate is closer than min_pair_dist to any
+                # already-placed gate (including original positions of later
+                # gates, so the rejection respects the canonical layout).
+                others = np.vstack([noisy[:i], centers[i + 1:]])
+                if others.size == 0 or np.all(np.linalg.norm(others - cand, axis=1) >= min_pair_dist):
+                    noisy[i] = cand
+                    break
+            else:
+                # Could not satisfy clearance after max_tries — fall back to
+                # the canonical center so the course is always solvable.
+                noisy[i] = base
+        centers = noisy
     if yaw_noise > 0.0:
         yaws = [y + float(rng.uniform(-yaw_noise, yaw_noise)) for y in yaws]
 

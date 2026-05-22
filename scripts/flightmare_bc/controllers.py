@@ -58,6 +58,24 @@ class QuadParams:
     k_torque: float = 2.6e-7
     max_collective_thrust: float = 4.0 * 9.81 * 0.73  # ~4 g of total thrust
     inertia: tuple[float, float, float] = (0.0025, 0.0021, 0.0043)
+    # ---- Flightmare C++ dynamics overrides (written into quadrotor_env.yaml) ----
+    # These let a Python caller configure the C++ Quadrotor at construction
+    # time. Defaults reproduce the historical built-in Flightmare values so
+    # callers that do not opt in see identical behaviour.
+    motor_omega_min: float = 150.0
+    motor_omega_max: float = 3000.0
+    motor_tau: float = 0.0001
+    # thrust_map = a*omega^2 + b*omega + c (newton per motor).
+    thrust_map: tuple[float, float, float] = (
+        1.3298253500372892e-06,
+        0.0038360810526746033,
+        -1.7689986848125325,
+    )
+    kappa: float = 0.016                 # torque/thrust ratio used by C++ mixer
+    # Body-rate ceiling enforced by the C++ integrator (rad/s, per axis).
+    # The stock Flightmare config caps this at [6, 6, 6] which is far below
+    # real racing-drone capability (15-25 rad/s).
+    omega_max_body: tuple[float, float, float] = (6.0, 6.0, 6.0)
 
 
 @dataclass

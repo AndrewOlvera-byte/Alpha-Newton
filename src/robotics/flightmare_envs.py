@@ -216,6 +216,16 @@ class FlightmareRacingEnvConfig:
     max_waypoint_speed: float = 15.0
     max_collective_thrust_g: float = 4.0
     action_clip: float = 5.0
+    # Plant overrides: forwarded to QuadParams + the Flightmare C++ dynamics
+    # YAML. Keys (all optional, default None = keep historical Flightmare
+    # values): mass, arm_length, inertia, k_thrust, k_torque, motor_omega_min,
+    # motor_omega_max, motor_tau, thrust_map, kappa, omega_max_body.
+    plant: dict[str, Any] | None = None
+    # Override the action bounds loaded from norm_stats. Useful when the BC
+    # data was collected at conservative dynamics but the PPO env runs an
+    # aggressive racing plant. Schema: {"ctbr": {"low": [...], "high": [...]},
+    # "motor": {...}, "waypoint": {...}}.
+    action_bounds_override: dict[str, Any] | None = None
     reset_mode: str = "course_start"  # course_start|gate_pre_entry|reference_state|segment_window
     start_gate_index: int | None = None
     start_gate_choices: list[int] | None = None
@@ -235,6 +245,20 @@ class FlightmareRacingEnv(gymnasium.Env):
         super().__init__()
         self.cfg = cfg
         self.params = QuadParams()
+        if cfg.plant:
+            _PLANT_KEYS = (
+                "mass", "arm_length", "k_thrust", "k_torque", "inertia",
+                "motor_omega_min", "motor_omega_max", "motor_tau",
+                "thrust_map", "kappa", "omega_max_body",
+            )
+            for key in _PLANT_KEYS:
+                if key in cfg.plant and cfg.plant[key] is not None:
+                    value = cfg.plant[key]
+                    if key in ("inertia", "thrust_map", "omega_max_body"):
+                        value = tuple(float(x) for x in value)
+                    else:
+                        value = float(value)
+                    setattr(self.params, key, value)
         self.params.max_collective_thrust = float(cfg.max_collective_thrust_g) * self.params.mass * self.params.g
         self.dt = 1.0 / float(cfg.control_hz)
         self.rng = np.random.default_rng(cfg.seed)
@@ -248,6 +272,18 @@ class FlightmareRacingEnv(gymnasium.Env):
             action_normalization=cfg.action_normalization,
             obs_schema=cfg.obs_schema,
         )
+        if cfg.action_bounds_override:
+            bounds = cfg.action_bounds_override.get(cfg.action_type)
+            if bounds:
+                low = np.asarray(bounds["low"], dtype=np.float32)
+                high = np.asarray(bounds["high"], dtype=np.float32)
+                if low.shape != self.norm.action_low.shape or high.shape != self.norm.action_high.shape:
+                    raise ValueError(
+                        f"action_bounds_override[{cfg.action_type}] shape mismatch: "
+                        f"got low={low.shape} high={high.shape}, expected {self.norm.action_low.shape}"
+                    )
+                self.norm.action_low = low
+                self.norm.action_high = high
         self._gate_specs: list[GateSpec] = []
         self._gate_index_v3 = 0
         self._last_pass_step = 0

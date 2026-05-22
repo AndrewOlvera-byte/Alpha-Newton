@@ -328,6 +328,11 @@ class FlightmarePPOTrainer:
             "mean_reward": 0.0,
             "mean_speed_mps": 0.0,
             "mean_length": 0.0,
+            # Stage-aware best: each curriculum stage adds a flat bonus so
+            # progress (e.g. solid success on a later stage) outranks an
+            # already-saturated win on an earlier one. Default chosen so one
+            # full stage advance dominates ~2x any within-stage success swing.
+            "stage_index": 2.0,
         }
         configured_weights = training_cfg.get("rollout_score_weights", {}) or {}
         self.rollout_score_weights = {
@@ -424,6 +429,8 @@ class FlightmarePPOTrainer:
             "max_body_rate": ppo.get("max_body_rate", 8.0),
             "max_waypoint_speed": ppo.get("max_waypoint_speed", 15.0),
             "max_collective_thrust_g": ppo.get("max_collective_thrust_g", 4.0),
+            "plant": ppo.get("plant"),
+            "action_bounds_override": ppo.get("action_bounds_override"),
             "reset_mode": ppo.get("reset_mode", "course_start"),
             "start_gate_index": ppo.get("start_gate_index"),
             "start_gate_choices": ppo.get("start_gate_choices"),
@@ -445,11 +452,23 @@ class FlightmarePPOTrainer:
         env_overrides = dict(self.curriculum.env_overrides())
         merged = dict(env_kwargs)
         reward_overrides = env_overrides.pop("reward_kwargs", None)
+        plant_overrides = env_overrides.pop("plant", None)
+        bounds_overrides = env_overrides.pop("action_bounds_override", None)
         merged.update(env_overrides)
         if reward_overrides is not None:
             merged["reward_kwargs"] = {
                 **(env_kwargs.get("reward_kwargs", {}) or {}),
                 **(reward_overrides or {}),
+            }
+        if plant_overrides is not None:
+            merged["plant"] = {
+                **(env_kwargs.get("plant") or {}),
+                **(plant_overrides or {}),
+            }
+        if bounds_overrides is not None:
+            merged["action_bounds_override"] = {
+                **(env_kwargs.get("action_bounds_override") or {}),
+                **(bounds_overrides or {}),
             }
         # Trainer-side overrides (entropy coefficient).
         trainer_overrides = self.curriculum.trainer_overrides()
@@ -543,17 +562,20 @@ class FlightmarePPOTrainer:
                 "training.selection_metric must be one of "
                 "'rollout_score', 'success_rate', 'mean_reward', or 'gate_completion'."
             )
+        stage_idx = int(self.curriculum.active_index) if self.curriculum is not None else 0
         return float(
             self.rollout_score_weights["success_rate"] * stats["success_rate"]
             + self.rollout_score_weights["mean_gate_completion"] * stats["mean_gate_completion"]
             + self.rollout_score_weights["mean_reward"] * stats["mean_reward"]
             + self.rollout_score_weights["mean_speed_mps"] * stats["mean_speed_mps"]
             + self.rollout_score_weights["mean_length"] * stats["mean_length"]
+            + self.rollout_score_weights["stage_index"] * stage_idx
         )
 
     def _checkpoint_metrics(self, stats: dict, score: float) -> dict[str, float | int]:
         return {
             "selection_score": float(score),
+            "stage_index": int(self.curriculum.active_index) if self.curriculum is not None else 0,
             "success_rate": float(stats["success_rate"]),
             "mean_gate_completion": float(stats["mean_gate_completion"]),
             "mean_reward": float(stats["mean_reward"]),

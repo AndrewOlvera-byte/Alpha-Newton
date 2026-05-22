@@ -382,6 +382,39 @@ class _VisualFlightmareImpl:
         self.params = params
         self.cameras = cameras
         self.image_size = image_size
+
+        # VisualRacingEnv's C++ constructor reads quadrotor_env.yaml from
+        # $FLIGHTMARE_PATH/flightlib/configs/ (see patch_flightmare_pybind.py).
+        # Write a temp config from QuadParams so plant capability (TWR via
+        # thrust_map + motor_omega_max, body-rate ceiling via omega_max,
+        # inertia, motor lag, etc.) is driven by Python rather than baked into
+        # the installed Flightmare wheel.
+        self._runtime_root = Path(tempfile.mkdtemp(prefix="flightmare_cfg_"))
+        cfg_dir = self._runtime_root / "flightlib" / "configs"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        omega_cap = tuple(float(x) for x in getattr(params, "omega_max_body", (6.0, 6.0, 6.0)))
+        tmap = tuple(float(x) for x in getattr(params, "thrust_map",
+                     (1.3298253500372892e-06, 0.0038360810526746033, -1.7689986848125325)))
+        (cfg_dir / "quadrotor_env.yaml").write_text(
+            "quadrotor_env:\n"
+            "   camera: no\n"
+            f"   sim_dt: {float(dt)}\n"
+            "   max_t: 5.0\n"
+            "   add_camera: no\n"
+            "\n"
+            "quadrotor_dynamics:\n"
+            f"  mass: {float(params.mass)}\n"
+            f"  arm_l: {float(params.arm_length)}\n"
+            f"  motor_omega_min: {float(getattr(params, 'motor_omega_min', 150.0))}\n"
+            f"  motor_omega_max: {float(getattr(params, 'motor_omega_max', 3000.0))}\n"
+            f"  motor_tau: {float(getattr(params, 'motor_tau', 0.0001))}\n"
+            f"  thrust_map: [{tmap[0]}, {tmap[1]}, {tmap[2]}]\n"
+            f"  kappa: {float(getattr(params, 'kappa', 0.016))}\n"
+            f"  omega_max: [{omega_cap[0]}, {omega_cap[1]}, {omega_cap[2]}]\n"
+        )
+        self._old_flightmare_path = os.environ.get("FLIGHTMARE_PATH")
+        os.environ["FLIGHTMARE_PATH"] = str(self._runtime_root)
+
         self.env = flightgym.VisualRacingEnv_v0(
             int(_SCENE_IDS.get(str(scene).lower(), 1)),
             int(image_size),
@@ -467,6 +500,13 @@ class _VisualFlightmareImpl:
     def close(self):
         try:
             self.env.disconnectUnity()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_old_flightmare_path", None) is not None:
+                os.environ["FLIGHTMARE_PATH"] = self._old_flightmare_path
+            elif "FLIGHTMARE_PATH" in os.environ:
+                del os.environ["FLIGHTMARE_PATH"]
         except Exception:
             pass
 

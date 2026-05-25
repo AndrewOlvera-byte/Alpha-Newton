@@ -1,0 +1,308 @@
+# Teacher CTBR PPO — stages 1/2 on the racing plant, v5 BC checkpoint.
+#
+# Why this exists:
+#   ctbr_stage12_bridge_ppo (run 6l8f21c1) failed because the BC v4 checkpoint
+#   was trained on a tame plant (omega_max_body=[6,6,6]) and then PPO-finetuned
+#   on a racing plant (omega_max_body=[18,18,18]). The BC policy's confident
+#   commands produced 3x the angular response they were trained on, the policy
+#   immediately saturated actions, and KL exploded by 8 orders of magnitude at
+#   the stage 2b authority lift (grad_norm 1.8e13 = bf16 overflow).
+#
+#   v5 fixes this at the root by training BC on the same racing plant. The
+#   trainer-side knobs below are still tightened relative to the original
+#   bridge config because racing-plant PPO at 4+ m/s does push body rates
+#   close to 8 rad/s in normal flight, so we want belt-and-suspenders even
+#   with on-plant BC.
+#
+# Prereqs:
+#   1. bash scripts/flightmare_bc/collect_v5.sh
+#   2. python -m src.entrypoints.train_bc --exp flightmare/paper/teacher/ctbr_bc
+#
+# Run:
+#   docker compose exec alpha-newton python -m src.entrypoints.train_ppo \
+#     --exp flightmare/paper/teacher/ctbr_stage12_v5_ppo
+
+run:
+  name: paper_teacher_ctbr_stage12_v5_ppo
+  mode: ppo
+  seed: 0
+
+data:
+  type: flightmare_ppo_state
+  data_dir: data/flightmare/bc_v5
+  action_type: ctbr
+  obs_schema: v3
+  normalize_state: true
+  normalize_action: true
+  action_normalization: bounds
+
+robotics:
+  architecture:
+    type: flightmare_actor
+    mode: ppo
+    action_type: ctbr
+    bc_checkpoint: outputs/paper_teacher_ctbr_bc_v5/best/model.pt
+
+    fusion: swift
+    proprio_core_dim: 9
+    gate_dim: 24
+    aux_dim: 3
+    action_dim: 4
+    use_vision: false
+    include_prev_action: true
+
+    proprio_hidden_dim: 128
+    proprio_embed_dim: 128
+    gate_hidden_dim: 128
+    gate_embed_dim: 128
+    trunk_hidden_dim: 768
+    trunk_depth: 3
+    dropout: 0.05
+
+    head_hidden_dim: 256
+    head_depth: 2
+    state_dependent_std: false
+    # Tighter initial Gaussian so the policy can't sample into the
+    # saturated tail of the action bounds during early exploration.
+    # init=-2.5 -> sigma~0.082; the prior config used -2.0 (sigma~0.135)
+    # which let exploration noise alone saturate ~5% of actions.
+    init_log_std: -2.5
+    log_std_min: -4.0
+    log_std_max: -1.8
+    with_critic: true
+    critic_hidden_dim: 256
+    critic_depth: 2
+    bc_loss_type: gnll
+    action_clip: 1.0
+
+  ppo:
+    bc_checkpoint: outputs/paper_teacher_ctbr_bc_v5/best/model.pt
+    action_type: ctbr
+
+    obs_schema: v3
+    backend: flightgym
+    render: false
+    scene: industrial
+
+    # Steady stage-specific PPO geometry. Larger n_steps gives the critic
+    # enough post-gate context for stable advantage estimation in stage 2.
+    n_envs: 8
+    n_workers: 8
+    n_steps: 2048
+    ppo_epochs: 2
+    minibatch_size: 2048
+    # Halved relative to bridge: smaller surrogate clip + smaller target KL.
+    # Racing-plant runs need this; the OK experiment runs already had KL p99
+    # ~0.003 so 0.005 is not actually restrictive, it just removes headroom
+    # for the bf16-overflow failure mode.
+    clip_eps: 0.02
+    vf_coeff: 0.5
+    ent_coeff: 0.0010
+    gamma: 0.995
+    gae_lambda: 0.95
+    max_iterations: 9000
+    # Lowered from 3e-6: on the racing plant, same data magnitude with 3x
+    # the realized response means effectively 3x the policy gradient.
+    actor_lr: 1.0e-6
+    critic_lr: 5.0e-5
+    target_kl: 0.005
+
+    control_hz: 100.0
+    horizon: 1200
+
+    course_mode: swift_v4
+    num_gates: 7
+    gate_size: 1.6
+    gate_approach_m: 3.0
+    z_min: 1.0
+    fixed_gate_pos_noise: 0.00
+    fixed_gate_yaw_noise: 0.00
+    random_start_gate: false
+    reset_mode: reference_state
+    start_offset_m: 3.0
+    start_offset_range: [2.0, 4.0]
+    reference_speed_mps: 3.0
+    goal_mode: pass_gate_i
+
+    gate_vehicle_radius: 0.20
+    max_world_radius: 350.0
+    min_z: -0.25
+    terminate_on_gate_miss: true
+    terminate_on_crash: true
+
+    # Base authority — racing plant ceilings. Stage 1 caps body_rate to 6
+    # to match the rate envelope the BC data is densest at.
+    max_body_rate: 8.0
+    max_collective_thrust_g: 5.5
+    action_clip: 1.0
+
+    plant:
+      mass: 0.73
+      arm_length: 0.17
+      inertia: [0.0025, 0.0021, 0.0043]
+      k_thrust: 1.91e-6
+      k_torque: 2.6e-7
+      motor_omega_min: 150.0
+      motor_omega_max: 3000.0
+      motor_tau: 0.0001
+      thrust_map: [1.3298253500372892e-06, 0.0038360810526746033, -1.7689986848125325]
+      kappa: 0.016
+      omega_max_body: [18.0, 18.0, 18.0]
+
+    reward_fn: flightmare_racing_v3
+    reward_kwargs:
+      gate_normal_progress_scale: 6.0
+      segment_progress_scale: 1.5
+      centerline_progress_scale: 3.0
+      centerline_error_penalty: 0.04
+      aperture_near_penalty: 0.75
+      aperture_near_m: 4.0
+      velocity_alignment_scale: 0.06
+      body_alignment_scale: 0.04
+      # Lower per-event reward magnitudes than bridge_ppo so single rare
+      # transitions don't dominate the advantage estimate.
+      gate_pass_bonus: 22.0
+      segment_completion_bonus: 6.0
+      completion_bonus: 150.0
+      gate_miss_penalty: 80.0
+      crash_penalty: 90.0
+      no_progress_penalty: 0.08
+      backward_progress_penalty: 2.0
+      min_forward_velocity_mps: 0.75
+      stall_grace_steps: 25
+      time_penalty: 0.010
+      body_rate_penalty: 0.0012
+      action_smoothness_penalty: 0.012
+      vertical_speed_penalty: 0.001
+      max_progress_reward: 3.0
+      max_centerline_progress: 2.0
+      max_centerline_error: 6.0
+
+    # Re-enabled with thresholds calibrated to the failure mode bridge
+    # teacher exhibited (gate_completion ~0.45 while success collapsed).
+    # The prior threshold (gate_completion<=0.25) would never have caught it.
+    collapse_guard:
+      enabled: true
+      after_iter: 50
+      patience: 2
+      min_success_rate: 0.20
+      max_gate_completion: 0.55
+      skip_update: true
+
+    curriculum:
+      enabled: true
+      # Metric-based advance so a degrading stage 1 never drags a broken
+      # policy into stage 2 (the iter-only advance was a contributing
+      # cause of the bridge failure: best stage-1 score at iter 404,
+      # already degraded by iter 800, still promoted at iter 1200).
+      advance_metric: success_rate
+      advance_threshold: 0.85
+      stages:
+        # ----- Stage 1a: single-gate, body-rate cap at the rate envelope
+        # the BC data is densest at. Same racing plant, just policy-side
+        # caps so the agent can't command into the under-explored region.
+        - name: stage1a_single_gate_tame_authority
+          until_iter: 1500
+          num_gates: 7
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5, 6]
+          start_offset_range: [2.0, 4.0]
+          reference_speed_mps: 3.0
+          goal_mode: pass_gate_i
+          horizon: 600
+          max_collective_thrust_g: 4.5
+          max_body_rate: 6.0
+          ent_coeff_override: 0.0015
+          reward_kwargs:
+            time_penalty: 0.006
+            body_rate_penalty: 0.0020
+            action_smoothness_penalty: 0.015
+            gate_pass_bonus: 18.0
+            completion_bonus: 120.0
+
+        # ----- Stage 1b: SAME task, lift body-rate cap to 8. Tests that
+        # the policy is robust to authority BEFORE adding the second-gate
+        # complexity. This is the change the bridge config skipped.
+        - name: stage1b_single_gate_full_authority
+          until_iter: 3000
+          num_gates: 7
+          start_gate_choices: [0, 1, 2, 3, 4, 5, 6]
+          start_offset_range: [2.0, 4.0]
+          reference_speed_mps: 3.5
+          goal_mode: pass_gate_i
+          horizon: 700
+          max_collective_thrust_g: 5.0
+          max_body_rate: 8.0
+          ent_coeff_override: 0.0010
+          reward_kwargs:
+            time_penalty: 0.008
+            body_rate_penalty: 0.0015
+            action_smoothness_penalty: 0.012
+
+        # ----- Stage 2a: gate-to-gate, slightly throttled authority.
+        - name: stage2a_two_gate_controlled
+          until_iter: 5500
+          num_gates: 7
+          start_gate_choices: [0, 1, 2, 3, 4, 5]
+          start_offset_range: [3.0, 5.0]
+          reference_speed_mps: 3.5
+          goal_mode: gate_i_to_i+1
+          horizon: 1200
+          max_collective_thrust_g: 5.0
+          max_body_rate: 7.0
+          ent_coeff_override: 0.0008
+          reward_kwargs:
+            time_penalty: 0.008
+            body_rate_penalty: 0.0012
+            action_smoothness_penalty: 0.012
+
+        # ----- Stage 2b: gate-to-gate, full racing authority.
+        - name: stage2b_two_gate_full_authority
+          until_iter: 9000
+          num_gates: 7
+          start_gate_choices: [0, 1, 2, 3, 4, 5]
+          start_offset_range: [2.0, 4.0]
+          reference_speed_mps: 4.0
+          goal_mode: gate_i_to_i+1
+          horizon: 1000
+          max_collective_thrust_g: 5.5
+          max_body_rate: 8.0
+          ent_coeff_override: 0.0008
+          reward_kwargs:
+            time_penalty: 0.010
+            body_rate_penalty: 0.0010
+            action_smoothness_penalty: 0.010
+
+training:
+  trainer_type: ppo_flightmare
+  max_grad_norm: 0.5
+  logging_steps: 1
+  save_steps: 50
+  save_total_limit: 80
+  save_final: true
+  save_optimizer_state: true
+  best_steps: 1
+  selection_metric: rollout_score
+  rollout_score_weights:
+    success_rate: 1.0
+    mean_gate_completion: 0.25
+    mean_speed_mps: 0.0
+    mean_reward: 0.0
+    mean_length: 0.0
+    stage_index: 0.0
+
+  # Disabled because PPO grad norms on the racing plant reach the bf16
+  # representable range during stage transitions; the bridge run's 1.8e13
+  # grad norm was bf16 overflow, not a true gradient. fp32 is ~15% slower
+  # but eliminates this entire class of failure.
+  bf16: false
+  output_dir: outputs/${run.name}
+
+wandb:
+  project: flightmare-ppo
+  entity: andrewolvera
+  run_name: ${run.name}
+  tags: [flightmare, ppo, state-only, ctbr, teacher, v5, racing-plant, stage12]

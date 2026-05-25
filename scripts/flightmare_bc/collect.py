@@ -741,6 +741,29 @@ def main():
     p.add_argument("--max-world-radius", type=float, default=350.0)
     p.add_argument("--max-collective-thrust-g", type=float, default=4.0,
                    help="Total thrust ceiling in multiples of vehicle weight.")
+    # Plant overrides — keep BC collection on the SAME plant the downstream
+    # PPO trainer uses. The stock Flightmare integrator clamps body rates at
+    # 6 rad/s per axis; racing-plant configs lift that to 18, which makes
+    # the (state, action) pairs in tame-plant BC data inconsistent with
+    # racing-plant rollouts (commanded 8 rad/s realized as 6 in the data,
+    # but as 8 in PPO -> immediate distribution shift). Forward these to
+    # QuadParams so the C++ dynamics YAML is rewritten to match.
+    p.add_argument("--mass", type=float, default=None,
+                   help="Vehicle mass (kg). Default keeps Flightmare value (0.73).")
+    p.add_argument("--arm-length", type=float, default=None)
+    p.add_argument("--inertia", nargs=3, type=float, default=None,
+                   help="Diagonal inertia [Ixx Iyy Izz].")
+    p.add_argument("--k-thrust", type=float, default=None)
+    p.add_argument("--k-torque", type=float, default=None)
+    p.add_argument("--motor-omega-min", type=float, default=None)
+    p.add_argument("--motor-omega-max", type=float, default=None)
+    p.add_argument("--motor-tau", type=float, default=None)
+    p.add_argument("--thrust-map", nargs=3, type=float, default=None,
+                   help="Quadratic thrust map coefficients [a b c] (N per motor).")
+    p.add_argument("--kappa", type=float, default=None)
+    p.add_argument("--omega-max-body", nargs=3, type=float, default=None,
+                   help="C++ integrator body-rate ceiling per axis (rad/s). "
+                        "Stock = [6,6,6]; racing plant uses [18,18,18].")
     p.add_argument("--launch-unity", action="store_true",
                    help="Launch FLIGHTMARE_UNITY_EXECUTABLE before connecting.")
     p.add_argument("--unity-startup-s", type=float, default=3.0,
@@ -780,6 +803,26 @@ def main():
 
     rng = np.random.default_rng(args.seed)
     params = QuadParams()
+    _PLANT_OVERRIDES = {
+        "mass": args.mass,
+        "arm_length": args.arm_length,
+        "inertia": args.inertia,
+        "k_thrust": args.k_thrust,
+        "k_torque": args.k_torque,
+        "motor_omega_min": args.motor_omega_min,
+        "motor_omega_max": args.motor_omega_max,
+        "motor_tau": args.motor_tau,
+        "thrust_map": args.thrust_map,
+        "kappa": args.kappa,
+        "omega_max_body": args.omega_max_body,
+    }
+    for _k, _v in _PLANT_OVERRIDES.items():
+        if _v is None:
+            continue
+        if _k in ("inertia", "thrust_map", "omega_max_body"):
+            setattr(params, _k, tuple(float(x) for x in _v))
+        else:
+            setattr(params, _k, float(_v))
     params.max_collective_thrust = float(args.max_collective_thrust_g) * params.mass * params.g
     controller = GeometricSE3Controller(params=params)
     unity_proc = launch_unity_if_requested(args)

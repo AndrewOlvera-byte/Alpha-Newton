@@ -101,12 +101,26 @@ robotics:
     render: false
     scene: industrial
 
-    # PPO core. n_envs/n_steps chosen to keep ~8k batch with 4 epochs and
-    # 2048 minibatch -> 16 updates per iter; enough for steady BC-anchored
-    # actor moves under target_kl=0.015 without runaway updates.
-    n_envs: 16
-    n_workers: 16
-    n_steps: 512
+    # PPO core. n_envs=32 / n_workers=8 packs 4 envs per worker process —
+    # benchmarks show 6800 rfps vs 5000 rfps at the old 1-env-per-worker
+    # setup, and ~3x rfps vs the previous 16-env config. The bottleneck was
+    # the parent's serial IPC gather: a single env in-process already does
+    # ~5300 fps, so 32 procs gathering 32 small results was adding ~3 ms per
+    # step that the workers could not amortize. Packing 4 envs/worker
+    # collapses the gather into 8 receives. Each worker still steps its envs
+    # sequentially in Python, but with the patched UnityBridge reading
+    # FLIGHTMARE_PUB_PORT/SUB_PORT at construct time (set per-env inside
+    # _subproc_worker) there are no ZMQ port collisions.
+    #
+    # n_steps=256 keeps total samples/iter at 8192 so PPO update geometry
+    # (4 epochs × 4 minibatches of 2048) is unchanged. To trade more samples
+    # per gradient step for the same wall clock, bump n_steps to 512 (16k
+    # samples/iter, ~2.4 s/iter). Larger budgets (n_envs=64 / n_workers=16
+    # hits ~11k rfps) are possible but oversubscribe the 8-core / 16-thread
+    # host and yield diminishing returns.
+    n_envs: 32
+    n_workers: 8
+    n_steps: 256
     ppo_epochs: 4
     minibatch_size: 2048
     clip_eps: 0.05

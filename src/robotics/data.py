@@ -831,6 +831,7 @@ class FlightmareBCStateV3Dataset(Dataset):
         normalize_obs: bool = True,
         normalize_action: bool = True,
         action_normalization: Literal["auto", "standard", "bounds"] = "auto",
+        preload: bool = True,
     ):
         if action_type not in self.ACTION_TYPES:
             raise ValueError(f"action_type must be one of {self.ACTION_TYPES}, got {action_type!r}")
@@ -840,6 +841,7 @@ class FlightmareBCStateV3Dataset(Dataset):
         self.normalize_obs = normalize_obs
         self.normalize_action = normalize_action
         self.action_normalization = action_normalization
+        self.preload = preload
 
         with open(self.data_dir / "index.json") as f:
             manifest = json.load(f)
@@ -910,7 +912,83 @@ class FlightmareBCStateV3Dataset(Dataset):
         self._handles: Dict[int, h5py.File] = {}
         self._owner_pid: Optional[int] = None
 
+        # Preload everything into flat tensors. The whole BC dataset is small
+        # (~800k samples * ~50 floats = ~160 MB), and the model is tiny, so
+        # h5 random reads in __getitem__ dominate the step time. After preload
+        # we apply normalization once, then __getitem__ is pure tensor indexing
+        # and worker processes can run with num_workers=0.
+        self._pre_state: Optional[torch.Tensor] = None
+        self._pre_prev: Optional[torch.Tensor] = None
+        self._pre_action: Optional[torch.Tensor] = None
+        if self.preload:
+            self._build_preload(episodes)
+
+    def _build_preload(self, episodes: list) -> None:
+        proprio_blocks: List[np.ndarray] = []
+        gate_blocks: List[np.ndarray] = []
+        aux_blocks: List[np.ndarray] = []
+        action_blocks: List[np.ndarray] = []
+        prev_action_blocks: List[np.ndarray] = []
+        action_key = f"action/{self.action_type}"
+        for ei, ep in enumerate(episodes):
+            T = int(ep["length"])
+            t0 = min(self.skip_initial_frames, T)
+            if T <= t0:
+                continue
+            with h5py.File(self._episode_paths[ei], "r", libver="latest") as h:
+                proprio_blocks.append(h["obs/proprio_core"][t0:T].astype(np.float32, copy=False))
+                gate_blocks.append(h["obs/gate"][t0:T].astype(np.float32, copy=False))
+                aux_blocks.append(h["obs/aux"][t0:T].astype(np.float32, copy=False))
+                a = h[action_key][:T].astype(np.float32, copy=False)
+                action_blocks.append(a[t0:T])
+                prev = np.empty_like(a[t0:T])
+                if t0 == 0:
+                    prev[0] = 0.0
+                    prev[1:] = a[: T - 1]
+                else:
+                    prev[:] = a[t0 - 1 : T - 1]
+                prev_action_blocks.append(prev)
+
+        proprio = torch.from_numpy(np.concatenate(proprio_blocks, axis=0))
+        gate = torch.from_numpy(np.concatenate(gate_blocks, axis=0))
+        aux = torch.from_numpy(np.concatenate(aux_blocks, axis=0))
+        action = torch.from_numpy(np.concatenate(action_blocks, axis=0))
+        prev_action = torch.from_numpy(np.concatenate(prev_action_blocks, axis=0))
+
+        if self.normalize_obs:
+            proprio = (proprio - self.proprio_mean) / self.proprio_std
+            gate = (gate - self.gate_mean) / self.gate_std
+            aux = (aux - self.aux_mean) / self.aux_std
+        if self.normalize_action:
+            if self.action_norm_mode == "bounds":
+                scale = torch.clamp(self.action_high - self.action_low, min=1e-6)
+                action = 2.0 * (action - self.action_low) / scale - 1.0
+                prev_action = 2.0 * (prev_action - self.action_low) / scale - 1.0
+            else:
+                action = (action - self.action_mean) / self.action_std
+                prev_action = (prev_action - self.action_mean) / self.action_std
+
+        self._pre_state = torch.cat([proprio, gate, aux], dim=1).contiguous()
+        self._pre_prev = prev_action.contiguous()
+        self._pre_action = action.contiguous()
+        N = self._pre_state.shape[0]
+        if N != len(self._index):
+            # Replace index with simple [0..N) since preload already applied skip.
+            self._index = [(0, i) for i in range(N)]
+        bytes_total = sum(
+            t.numel() * t.element_size()
+            for t in (self._pre_state, self._pre_prev, self._pre_action)
+        )
+        print(
+            f"[FlightmareBCStateV3] preloaded split={self.split!r} "
+            f"samples={N} state_dim={self._pre_state.shape[1]} "
+            f"action_dim={self._pre_action.shape[1]} "
+            f"mem={bytes_total / 1e6:.1f} MB"
+        )
+
     def __len__(self) -> int:
+        if self._pre_state is not None:
+            return self._pre_state.shape[0]
         return len(self._index)
 
     def _get_handle(self, ep_idx: int) -> h5py.File:
@@ -926,7 +1004,27 @@ class FlightmareBCStateV3Dataset(Dataset):
             self._handles[ep_idx] = h
         return h
 
+    def collate_preloaded(self, batch: list) -> Dict[str, Any]:
+        """Custom collate used when preload is on: avoids torch.stack of
+        16k tiny tensors by doing one index_select per field. Pass this via
+        DataLoader(collate_fn=ds.collate_preloaded) — see the trainer.
+        """
+        # Bypass default collate; recover the indices from the dict entries
+        # is not possible, so the trainer is expected to use a BatchSampler
+        # that yields a list[int] AND set collate_fn=self._collate_indices.
+        states = torch.stack([b["state"] for b in batch], dim=0)
+        prevs = torch.stack([b["prev_actions"] for b in batch], dim=0)
+        acts = torch.stack([b["action"] for b in batch], dim=0)
+        return {"images": {}, "state": states, "prev_actions": prevs, "action": acts}
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if self._pre_state is not None:
+            return {
+                "images": {},
+                "state": self._pre_state[idx],
+                "prev_actions": self._pre_prev[idx],
+                "action": self._pre_action[idx],
+            }
         ep_idx, t = self._index[idx]
         h = self._get_handle(ep_idx)
 
@@ -981,6 +1079,7 @@ def build_flightmare_bc_state_v3(
     normalize_obs: bool = True,
     normalize_action: bool = True,
     action_normalization: Literal["auto", "standard", "bounds"] = "auto",
+    preload: bool = True,
     **_: Any,
 ) -> Dict[str, Any]:
     """Build train/val Swift-obs-v3 Flightmare BC datasets."""
@@ -990,6 +1089,7 @@ def build_flightmare_bc_state_v3(
         normalize_obs=normalize_obs,
         normalize_action=normalize_action,
         action_normalization=action_normalization,
+        preload=preload,
     )
     train_ds = FlightmareBCStateV3Dataset(split="train", **common)
     try:

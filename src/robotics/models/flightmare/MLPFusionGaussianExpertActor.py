@@ -68,11 +68,16 @@ class MLPFusionGaussianExpertActor(nn.Module):
         critic_hidden_dim: int = 256,
         critic_depth: int = 2,
         action_clip: float = 5.0,
+        squash_actions: bool = False,
         bc_loss_type: str = "gnll",
+        bc_huber_delta: float = 0.25,
+        expert_std_loss_weight: float = 0.0,
     ):
         super().__init__()
         self.action_dim = action_dim
         self.bc_loss_type = bc_loss_type
+        self.bc_huber_delta = float(bc_huber_delta)
+        self.expert_std_loss_weight = float(expert_std_loss_weight)
         self.action_clip = action_clip
         self.fusion_kind = fusion
 
@@ -134,6 +139,7 @@ class MLPFusionGaussianExpertActor(nn.Module):
             critic_hidden_dim=critic_hidden_dim,
             critic_depth=critic_depth,
             action_clip=action_clip,
+            squash_actions=squash_actions,
         )
 
     @property
@@ -159,10 +165,30 @@ class MLPFusionGaussianExpertActor(nn.Module):
             per_sample = per_elem.mean(dim=-1)
         elif self.bc_loss_type == "mse":
             per_sample = F.mse_loss(mu, target, reduction="none").mean(dim=-1)
+        elif self.bc_loss_type == "huber":
+            per_sample = F.huber_loss(
+                mu,
+                target,
+                reduction="none",
+                delta=self.bc_huber_delta,
+            ).mean(dim=-1)
         else:
             raise ValueError(f"unknown bc_loss_type {self.bc_loss_type!r}")
 
-        return {"loss": per_sample.mean(), "_loss_per_sample": per_sample.detach()}
+        if self.expert_std_loss_weight > 0.0 and "expert_log_std" in batch:
+            expert_log_std = self._squeeze_chunk(batch["expert_log_std"]).to(log_std.device)
+            std_loss = F.mse_loss(log_std, expert_log_std, reduction="none").mean(dim=-1)
+            per_sample = per_sample + self.expert_std_loss_weight * std_loss
+
+        loss = per_sample.mean()
+        if "sample_weight" in batch:
+            weight = batch["sample_weight"].to(per_sample.device).float()
+            if weight.ndim > 1:
+                weight = weight.squeeze(-1)
+            weight = torch.clamp(weight, min=0.0)
+            loss = (per_sample * weight).sum() / torch.clamp(weight.sum(), min=1e-6)
+
+        return {"loss": loss, "_loss_per_sample": per_sample.detach()}
 
     @torch.no_grad()
     def predict(self, batch: dict, **_) -> torch.Tensor:

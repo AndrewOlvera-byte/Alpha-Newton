@@ -1,0 +1,134 @@
+# Teacher CTBR BC v6: racing plant, expert + recovery + DAgger data.
+#
+# Collect:
+#   docker compose exec alpha-newton python -m scripts.flightmare_bc.collect_dataset \
+#     --config configs/flightmare_bc/ctbr_v6.yaml
+#
+# Train:
+#   docker compose exec alpha-newton python -m src.entrypoints.train_bc \
+#     --exp flightmare/paper/teacher/ctbr_bc_v6
+
+run:
+  name: paper_teacher_ctbr_bc_v6
+  mode: bc
+  seed: 0
+
+data:
+  type: flightmare_bc_state_v3
+  data_dir: data/flightmare/bc_v7
+  action_type: ctbr
+  normalize_obs: true
+  normalize_action: true
+  action_normalization: bounds
+
+robotics:
+  architecture:
+    type: flightmare_actor
+    mode: bc
+    action_type: ctbr
+
+    fusion: swift
+    proprio_core_dim: 9
+    gate_dim: 24
+    aux_dim: 3
+    action_dim: 4
+    use_vision: false
+    include_prev_action: true
+
+    proprio_hidden_dim: 128
+    proprio_embed_dim: 128
+    gate_hidden_dim: 128
+    gate_embed_dim: 128
+    trunk_hidden_dim: 768
+    trunk_depth: 3
+    dropout: 0.05
+
+    head_hidden_dim: 256
+    head_depth: 2
+    # GNLL BC setup: learn per-state action uncertainty so the supervised
+    # objective can reweight CTBR channels instead of using plain averaged
+    # bounds-space error.
+    state_dependent_std: true
+    init_log_std: -1.0
+    log_std_min: -5.0
+    log_std_max: 0.5
+
+    with_critic: false
+    bc_loss_type: gnll
+    action_clip: 1.2
+
+training:
+  trainer_type: bc_flow_matching_robosuite
+  per_device_train_batch_size: 16384
+  per_device_eval_batch_size: 16384
+  gradient_accumulation_steps: 1
+  learning_rate: 6.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 1500
+  max_steps: 12000
+  max_grad_norm: 5.0
+  logging_steps: 50
+  save_steps: 1000
+  eval_steps: 250
+  bf16: true
+  fp8: false
+  torch_compile: false
+  dataloader_num_workers: 2
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+  selection_metric: flightmare_rollout_score
+  early_stopping_patience: 12
+  save_total_limit: 8
+  output_dir: outputs/${run.name}
+  rollout_eval:
+    enabled: true
+    type: flightmare
+    every_steps: 1000
+    episodes: 24
+    seed: 11
+    backend: flightgym
+    fail_on_fallback: true
+    max_steps: 2200            # wide procedural courses (~60-130 m) need more steps at low speed
+    max_body_rate: 12.0        # data labels reach ~10 rad/s; don't clip legit outputs
+    max_waypoint_speed: 15.0
+    max_world_radius: 350.0
+    min_z: -0.25
+    gate_vehicle_radius: 0.20  # match collection (manifest already carries this, set explicitly)
+    terminate_on_gate_miss: true
+    # Evaluate on the SAME procedural distribution the data was collected on
+    # (the manifest only surfaces the swift_v4 fallback course, which is ~15%
+    # of training). Mirrors configs/flightmare_bc/ctbr_v7.yaml.
+    course_distribution:
+      max_resample_tries: 24
+      bounds:
+        arena_radius: 80.0
+        z_min: 1.0
+        z_max: 6.0
+        min_gate_clearance_m: 0.8
+        min_consecutive_m: 7.0
+        max_consecutive_m: 16.0
+        max_climb_angle_rad: 1.0472
+        max_heading_change_rad: 1.7453
+        total_length_range: [40.0, 135.0]
+        vehicle_radius: 0.20
+      scenarios:
+        - {name: flow_upright, family: procedural_flow, weight: 0.30, num_gates_range: [5, 7], spacing_range: [10.0, 13.0], z_range: [1.8, 4.0], gate_size: 1.6, gate_approach_m: 3.0, heading_step_range: [0.0, 0.3], lateral_jitter_m: 1.0, pos_noise_xyz: [0.12, 0.12, 0.08], yaw_noise_rad: 0.04}
+        - {name: chicane, family: procedural_chicane, weight: 0.20, num_gates_range: [5, 7], spacing_range: [10.0, 13.0], z_range: [1.8, 3.5], gate_size: 1.6, gate_approach_m: 3.0, heading_step_range: [0.25, 0.45], lateral_jitter_m: 0.8, pos_noise_xyz: [0.12, 0.12, 0.08], yaw_noise_rad: 0.04}
+        - {name: split_s, family: procedural_split_s, weight: 0.20, num_gates_range: [6, 7], spacing_range: [10.0, 13.0], z_range: [2.0, 4.5], gate_size: 1.6, gate_approach_m: 3.0, num_inverted_range: [1, 1], inverted_roll_jitter_rad: 0.2618, pos_noise_xyz: [0.12, 0.12, 0.08], yaw_noise_rad: 0.04}
+        - {name: mixed_inverted, family: mixed_inverted, weight: 0.15, num_gates_range: [5, 7], spacing_range: [10.0, 13.0], z_range: [2.0, 4.5], gate_size: 1.6, gate_approach_m: 3.0, num_inverted_range: [0, 2], inverted_roll_jitter_rad: 0.2618, pos_noise_xyz: [0.12, 0.12, 0.08], yaw_noise_rad: 0.04}
+        - {name: swift_v4_canonical, family: swift_v4_canonical, weight: 0.07, num_gates_range: [7, 7], gate_size: 1.6, gate_approach_m: 3.0, num_inverted_range: [1, 1], random_direction: false}
+        - {name: swift_v4_noisy, family: swift_v4_noisy, weight: 0.08, num_gates_range: [7, 7], gate_size: 1.6, gate_approach_m: 3.0, num_inverted_range: [1, 1], inverted_roll_jitter_rad: 0.2618, pos_noise_xyz: [0.20, 0.20, 0.15], yaw_noise_rad: 0.05, random_direction: false}
+    score_weights:
+      success_rate: 4.0
+      mean_gate_completion: 10.0
+      mean_speed_mps: 0.04
+      gate_miss_rate: -2.0
+      thrust_saturation_frac: -0.6
+      body_rate_saturation_frac: -0.8
+      mean_final_distance_to_gate_m: -0.03
+
+wandb:
+  project: flightmare-bc
+  entity: andrewolvera
+  run_name: ${run.name}
+  tags: [flightmare, bc, state-only, ctbr, v6, recovery, dagger, teacher, racing-plant]

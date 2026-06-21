@@ -1,0 +1,143 @@
+# DAgger distillation v2: geometric expert, balanced replay, matched eval.
+#
+# This config is intentionally narrower than the earlier MPPI/procedural plan:
+# first learn to clear the geometric expert's Swift-v4 collection curriculum,
+# then widen collection/eval once closed-loop behavior is useful.
+#
+# Run without cloud logging:
+#   docker compose exec alpha-newton python -m src.entrypoints.train_distill \
+#     --exp flightmare/paper/teacher/ctbr_distill_geometric_balanced_v2 --no-wandb
+
+run:
+  name: paper_teacher_ctbr_distill_geometric_balanced_v2
+  mode: distill
+  seed: 0
+
+data:
+  type: flightmare_bc_state_v3
+  data_dir: outputs/${run.name}/round_000/aggregate
+  action_type: ctbr
+  normalize_obs: true
+  normalize_action: true
+  action_normalization: bounds
+  preload: true
+
+robotics:
+  architecture:
+    type: flightmare_actor
+    mode: bc
+    action_type: ctbr
+
+    fusion: swift
+    proprio_core_dim: 9
+    gate_dim: 24
+    aux_dim: 3
+    action_dim: 4
+    use_vision: false
+    include_prev_action: true
+
+    proprio_hidden_dim: 128
+    proprio_embed_dim: 128
+    gate_hidden_dim: 128
+    gate_embed_dim: 128
+    trunk_hidden_dim: 768
+    trunk_depth: 3
+    dropout: 0.05
+
+    head_hidden_dim: 256
+    head_depth: 2
+    state_dependent_std: true
+    init_log_std: -1.0
+    log_std_min: -5.0
+    log_std_max: 0.5
+    with_critic: false
+    bc_loss_type: gnll
+    expert_std_loss_weight: 0.02
+    action_clip: 1.2
+
+training:
+  trainer_type: flightmare_dagger_distill
+  output_dir: outputs/${run.name}
+  selection_metric: flightmare_rollout_score
+  per_device_train_batch_size: 16384
+  per_device_eval_batch_size: 16384
+  gradient_accumulation_steps: 1
+  learning_rate: 5.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  max_steps: 3000
+  max_grad_norm: 5.0
+  logging_steps: 50
+  save_steps: 1000
+  eval_steps: 500
+  bf16: true
+  fp8: false
+  torch_compile: false
+  dataloader_num_workers: 2
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+  early_stopping_patience: 8
+  save_total_limit: 4
+  sample_kind_balancing:
+    enabled: true
+    target_mix:
+      dagger: 0.65
+      synthetic_recovery: 0.20
+      expert: 0.15
+    min_weight: 0.0
+  rollout_eval:
+    enabled: true
+    type: flightmare
+    every_steps: 1000
+    episodes: 24
+    seed: 23
+    backend: flightgym
+    fail_on_fallback: true
+    max_steps: 2200
+    max_body_rate: 18.0
+    max_waypoint_speed: 15.0
+    max_world_radius: 350.0
+    min_z: -0.25
+    gate_vehicle_radius: 0.20
+    terminate_on_gate_miss: true
+    score_weights:
+      success_rate: 4.0
+      mean_gate_completion: 10.0
+      mean_speed_mps: 0.04
+      gate_miss_rate: -2.0
+      thrust_saturation_frac: -0.6
+      body_rate_saturation_frac: -0.8
+      mean_final_distance_to_gate_m: -0.03
+
+distill:
+  rounds: 6
+  episodes_per_round: 160
+  bootstrap_episodes: 128
+  val_frac: 0.1
+  seed: 0
+  collection_mode: flightmare
+  collection_config: configs/flightmare_bc/ctbr_v6.yaml
+  skip_controller_eval: false
+  clean_expert_fraction: 0.05
+  synthetic_recovery_fraction: 0.25
+  aggregate:
+    max_rounds_kept: 3
+  expert:
+    type: classical_hybrid
+    primary: geometric_minjerk
+    fallback: null
+  student:
+    init_checkpoint: null
+  inner_training:
+    trainer_type: bc_flow_matching_robosuite
+    max_steps: 3000
+    warmup_steps: 500
+    save_steps: 1000
+    eval_steps: 500
+    save_total_limit: 4
+
+wandb:
+  project: flightmare-bc
+  entity: andrewolvera
+  run_name: ${run.name}
+  tags: [flightmare, distill, dagger, ctbr, geometric, balanced, teacher, state-only]

@@ -138,6 +138,9 @@ def collect_flightmare_rollouts(
     ep_lengths: list[int] = []
     successes: list[bool] = []
     gate_completion: list[float] = []
+    goal_completion: list[float] = []
+    start_gate_counts: dict[int, int] = {}
+    trajectory_replay_episodes = 0
     gate_passes = 0
     gate_misses = 0
     crash_count = 0
@@ -223,6 +226,12 @@ def collect_flightmare_rollouts(
                 ep_lengths.append(int(current_lengths[i]))
                 successes.append(bool(info.get("success", False)))
                 gate_completion.append(float(info.get("gate_completion", 0.0)))
+                goal_completion.append(float(info.get("goal_completion", 0.0)))
+                if "start_gate_index" in info:
+                    start_gate = int(info.get("start_gate_index", -1))
+                    start_gate_counts[start_gate] = start_gate_counts.get(start_gate, 0) + 1
+                if bool(info.get("trajectory_replay_used", False)):
+                    trajectory_replay_episodes += 1
                 current_rewards[i] = 0.0
                 current_lengths[i] = 0
                 next_obs[i] = reset_obs_by_env[i]
@@ -269,6 +278,7 @@ def collect_flightmare_rollouts(
         "mean_length": float(lengths_arr.mean()) if ep_lengths else 0.0,
         "success_rate": float(np.mean(successes)) if successes else 0.0,
         "mean_gate_completion": float(np.mean(gate_completion)) if gate_completion else 0.0,
+        "mean_goal_completion": float(np.mean(goal_completion)) if goal_completion else 0.0,
         "n_episodes": len(ep_rewards),
         "gate_passes": int(gate_passes),
         "gate_misses": int(gate_misses),
@@ -276,6 +286,9 @@ def collect_flightmare_rollouts(
         "mean_speed_mps": float(speed_sum / max(1, speed_count)),
         "max_speed_mps": float(max_speed),
         "action_clip_fraction": float(action_clip_sum / max(1, action_clip_count)),
+        "start_gate_counts": {str(k): int(v) for k, v in sorted(start_gate_counts.items())},
+        "trajectory_replay_episodes": int(trajectory_replay_episodes),
+        "trajectory_replay_rate": float(trajectory_replay_episodes / max(1, len(ep_rewards))),
     }
     if reward_term_sums:
         denom = max(1, reward_term_count)
@@ -325,6 +338,7 @@ class FlightmarePPOTrainer:
         default_score_weights = {
             "success_rate": 1.0,
             "mean_gate_completion": 0.1,
+            "mean_goal_completion": 0.0,
             "mean_reward": 0.0,
             "mean_speed_mps": 0.0,
             "mean_length": 0.0,
@@ -349,13 +363,15 @@ class FlightmarePPOTrainer:
         self.collapse_guard_max_gate_completion = float(guard_cfg.get("max_gate_completion", 0.25))
         self.collapse_guard_skip_update = bool(guard_cfg.get("skip_update", True))
         self._collapse_guard_count = 0
+        self.restore_best_on_stage_transition = bool(ppo.get("restore_best_on_stage_transition", False))
         # When set, the trainer restores actor+critic weights, the AdamW
         # optimizer state, and the rolling best-score from this directory at
         # the start of train(). Falls back gracefully when optimizer.pt or
-        # training_state.json are missing — e.g. when the source checkpoint
+        # training_state.json are missing; e.g. when the source checkpoint
         # was saved before save_optimizer_state was enabled, in which case
         # only the model weights are restored and the optimizer starts fresh.
         self.resume_from = ppo.get("resume_from") or training_cfg.get("resume_from")
+        self.reset_best_on_resume = bool(ppo.get("reset_best_on_resume", training_cfg.get("reset_best_on_resume", False)))
         self.start_iteration = 1
         self.save_total_limit = training_cfg.get("save_total_limit")
         self.save_total_limit = int(self.save_total_limit) if self.save_total_limit else None
@@ -418,6 +434,8 @@ class FlightmarePPOTrainer:
             "gate_yaw_noise": ppo.get("gate_yaw_noise", 0.25),
             "gate_size": ppo.get("gate_size", 1.0),
             "gate_approach_m": ppo.get("gate_approach_m", 1.2),
+            "inverted_roll_jitter_rad": ppo.get("inverted_roll_jitter_rad", 0.2618),
+            "course_distribution": ppo.get("course_distribution"),
             "z_min": ppo.get("z_min", 1.0),
             "gate_vehicle_radius": ppo.get("gate_vehicle_radius", 0.15),
             "max_world_radius": ppo.get("max_world_radius", 120.0),
@@ -432,13 +450,30 @@ class FlightmarePPOTrainer:
             "plant": ppo.get("plant"),
             "action_bounds_override": ppo.get("action_bounds_override"),
             "reset_mode": ppo.get("reset_mode", "course_start"),
+            "course_start_sample_prob": ppo.get("course_start_sample_prob", 0.0),
             "start_gate_index": ppo.get("start_gate_index"),
             "start_gate_choices": ppo.get("start_gate_choices"),
             "start_offset_m": ppo.get("start_offset_m", 3.0),
             "start_offset_range": ppo.get("start_offset_range"),
+            "start_lateral_range_m": ppo.get("start_lateral_range_m"),
+            "start_vertical_range_m": ppo.get("start_vertical_range_m"),
+            "start_yaw_noise_rad": ppo.get("start_yaw_noise_rad", 0.0),
+            "start_speed_noise_mps": ppo.get("start_speed_noise_mps", 0.0),
             "reference_speed_mps": ppo.get("reference_speed_mps", 4.0),
             "goal_mode": ppo.get("goal_mode", "finish_remaining_course"),
             "goal_gate_span": ppo.get("goal_gate_span"),
+            "post_pass_success_steps": ppo.get("post_pass_success_steps", 0),
+            "post_pass_max_speed_mps": ppo.get("post_pass_max_speed_mps"),
+            "post_pass_max_body_rate": ppo.get("post_pass_max_body_rate"),
+            "post_pass_max_center_error_norm": ppo.get("post_pass_max_center_error_norm"),
+            "post_pass_min_gate_signed_distance_m": ppo.get("post_pass_min_gate_signed_distance_m"),
+            "trajectory_replay_capacity_per_gate": ppo.get("trajectory_replay_capacity_per_gate", 0),
+            "trajectory_replay_sample_prob": ppo.get("trajectory_replay_sample_prob", 0.0),
+            "trajectory_replay_min_samples_per_gate": ppo.get("trajectory_replay_min_samples_per_gate", 1),
+            "trajectory_replay_pos_noise_m": ppo.get("trajectory_replay_pos_noise_m", 0.0),
+            "trajectory_replay_vel_noise_mps": ppo.get("trajectory_replay_vel_noise_mps", 0.0),
+            "trajectory_replay_omega_noise_radps": ppo.get("trajectory_replay_omega_noise_radps", 0.0),
+            "trajectory_replay_yaw_noise_rad": ppo.get("trajectory_replay_yaw_noise_rad", 0.0),
             "action_clip": ppo.get(
                 "action_clip",
                 (self.robotics_cfg.get("architecture", {}) or {}).get("action_clip", 5.0),
@@ -470,12 +505,23 @@ class FlightmarePPOTrainer:
                 **(env_kwargs.get("action_bounds_override") or {}),
                 **(bounds_overrides or {}),
             }
-        # Trainer-side overrides (entropy coefficient).
+        # Trainer-side overrides (entropy coefficient + actor LR warmup).
         trainer_overrides = self.curriculum.trainer_overrides()
         if "ent_coeff_override" in trainer_overrides:
             self.ent_coeff = float(trainer_overrides["ent_coeff_override"])
         else:
             self.ent_coeff = float(self._base_ent_coeff)
+        # Re-apply configured LRs after checkpoint resume because
+        # optimizer.load_state_dict restores LR values from the source run.
+        # actor_lr_override lets a stage throttle the policy step while leaving
+        # the critic at full LR for critic-dominant warmup.
+        optimizer = getattr(self, "_optimizer", None)
+        if optimizer is not None and optimizer.param_groups:
+            optimizer.param_groups[0]["lr"] = float(
+                trainer_overrides.get("actor_lr_override", self.actor_lr)
+            )
+            if len(optimizer.param_groups) > 1:
+                optimizer.param_groups[1]["lr"] = float(self.critic_lr)
         return merged
 
     def _split_params(self):
@@ -557,27 +603,31 @@ class FlightmarePPOTrainer:
             return float(stats["mean_reward"])
         if self.selection_metric == "gate_completion":
             return float(stats["mean_gate_completion"])
+        if self.selection_metric == "goal_completion":
+            return float(stats["mean_goal_completion"])
         if self.selection_metric != "rollout_score":
             raise ValueError(
                 "training.selection_metric must be one of "
-                "'rollout_score', 'success_rate', 'mean_reward', or 'gate_completion'."
+                "'rollout_score', 'success_rate', 'mean_reward', 'gate_completion', or 'goal_completion'."
             )
         stage_idx = int(self.curriculum.active_index) if self.curriculum is not None else 0
         return float(
             self.rollout_score_weights["success_rate"] * stats["success_rate"]
             + self.rollout_score_weights["mean_gate_completion"] * stats["mean_gate_completion"]
+            + self.rollout_score_weights["mean_goal_completion"] * stats["mean_goal_completion"]
             + self.rollout_score_weights["mean_reward"] * stats["mean_reward"]
             + self.rollout_score_weights["mean_speed_mps"] * stats["mean_speed_mps"]
             + self.rollout_score_weights["mean_length"] * stats["mean_length"]
             + self.rollout_score_weights["stage_index"] * stage_idx
         )
 
-    def _checkpoint_metrics(self, stats: dict, score: float) -> dict[str, float | int]:
-        return {
+    def _checkpoint_metrics(self, stats: dict, score: float) -> dict[str, float | int | dict]:
+        metrics = {
             "selection_score": float(score),
             "stage_index": int(self.curriculum.active_index) if self.curriculum is not None else 0,
             "success_rate": float(stats["success_rate"]),
             "mean_gate_completion": float(stats["mean_gate_completion"]),
+            "mean_goal_completion": float(stats["mean_goal_completion"]),
             "mean_reward": float(stats["mean_reward"]),
             "step_reward_mean": float(stats["step_reward_mean"]),
             "mean_length": float(stats["mean_length"]),
@@ -588,7 +638,12 @@ class FlightmarePPOTrainer:
             "mean_speed_mps": float(stats["mean_speed_mps"]),
             "max_speed_mps": float(stats["max_speed_mps"]),
             "action_clip_fraction": float(stats["action_clip_fraction"]),
+            "trajectory_replay_episodes": int(stats.get("trajectory_replay_episodes", 0)),
+            "trajectory_replay_rate": float(stats.get("trajectory_replay_rate", 0.0)),
         }
+        if stats.get("start_gate_counts"):
+            metrics["start_gate_counts"] = dict(stats["start_gate_counts"])
+        return metrics
 
     def _collapse_guard_bad_rollout(self, iteration: int, stats: dict) -> bool:
         if not self.collapse_guard_enabled:
@@ -600,11 +655,24 @@ class FlightmarePPOTrainer:
             and float(stats["mean_gate_completion"]) <= self.collapse_guard_max_gate_completion
         )
 
-    def _restore_best_checkpoint(self, model: nn.Module, optimizer) -> bool:
+    def _restore_best_checkpoint(
+        self,
+        model: nn.Module,
+        optimizer,
+        *,
+        restore_optimizer: bool = True,
+        restore_training_state: bool = False,
+    ) -> bool:
         best_dir = os.path.join(self.output_dir, "best")
         if not os.path.isdir(best_dir):
             return False
-        self._restore_from_checkpoint(best_dir, model, optimizer)
+        self._restore_from_checkpoint(
+            best_dir,
+            model,
+            optimizer,
+            restore_optimizer=restore_optimizer,
+            restore_training_state=restore_training_state,
+        )
         model.to(self.device)
         return True
 
@@ -612,7 +680,11 @@ class FlightmarePPOTrainer:
         disabled_dropout = self._disable_dropout()
         if disabled_dropout:
             print(f"[Flightmare PPO] Disabled {disabled_dropout} dropout layer(s) for PPO.")
-        vec_env = make_flightmare_vec_env(n_envs=min(2, self.n_envs), seed=0, **self._env_kwargs())
+        base_env_kwargs = self._env_kwargs()
+        if self.curriculum is not None:
+            self.curriculum.update(self.start_iteration, None)
+        env_kwargs = self._apply_curriculum_overrides(base_env_kwargs)
+        vec_env = make_flightmare_vec_env(n_envs=min(2, self.n_envs), seed=0, **env_kwargs)
         try:
             obs_list, infos = vec_env.reset(seed=0)
             print(f"[Flightmare PPO Test] envs={len(obs_list)} fallback={infos[0].get('using_fallback')}")
@@ -635,7 +707,7 @@ class FlightmarePPOTrainer:
                 8,
                 self.device,
                 self.use_bf16,
-                action_clip=float(self._env_kwargs().get("action_clip", 1.0)),
+                action_clip=float(env_kwargs.get("action_clip", 1.0)),
             )
             buffer.compute_advantages(stats["last_values"], self.gamma, self.gae_lambda)
             buffer.normalize_advantages()
@@ -667,6 +739,9 @@ class FlightmarePPOTrainer:
             {"params": actor_params, "lr": self.actor_lr, "weight_decay": 1e-4},
             {"params": critic_params, "lr": self.critic_lr, "weight_decay": 1e-4},
         ])
+        # Exposed so _apply_curriculum_overrides can honor a stage-local
+        # actor_lr_override (critic warmup at goal_mode boundaries).
+        self._optimizer = optimizer
 
         if self.resume_from:
             self._restore_from_checkpoint(self.resume_from, model, optimizer)
@@ -715,11 +790,20 @@ class FlightmarePPOTrainer:
                 if self.curriculum is not None and self.curriculum.update(
                     iteration, last_rollout_stats
                 ):
+                    transition_restored_best = False
+                    if self.restore_best_on_stage_transition:
+                        transition_restored_best = self._restore_best_checkpoint(
+                            model,
+                            optimizer,
+                            restore_optimizer=True,
+                            restore_training_state=False,
+                        )
                     new_kwargs = self._apply_curriculum_overrides(base_env_kwargs)
                     env_kwargs = new_kwargs
                     print(
                         f"[Flightmare PPO] Curriculum transition at iter {iteration}: "
-                        f"{self.curriculum.describe()} (ent_coeff={self.ent_coeff})"
+                        f"{self.curriculum.describe()} (ent_coeff={self.ent_coeff}, "
+                        f"restored_best={int(transition_restored_best)})"
                     )
                     try:
                         vec_env.close()
@@ -728,7 +812,6 @@ class FlightmarePPOTrainer:
                     vec_env = make_flightmare_vec_env(n_envs=self.n_envs, seed=env_seed + iteration, **new_kwargs)
                     obs_list, infos = vec_env.reset(seed=env_seed + iteration)
                     prev_actions = _initial_prev_actions(infos, self.n_envs, action_dim)
-                iter_t0 = time.time()
                 model.eval()
                 obs_list, prev_actions, stats = collect_flightmare_rollouts(
                     vec_env,
@@ -834,6 +917,7 @@ class FlightmarePPOTrainer:
                         "rollout/mean_reward": stats["mean_reward"],
                         "rollout/success_rate": stats["success_rate"],
                         "rollout/mean_gate_completion": stats["mean_gate_completion"],
+                        "rollout/mean_goal_completion": stats["mean_goal_completion"],
                         "rollout/n_episodes": stats["n_episodes"],
                         "rollout/mean_length": stats["mean_length"],
                         "rollout/gate_passes": stats["gate_passes"],
@@ -846,6 +930,12 @@ class FlightmarePPOTrainer:
                         "rollout/reward_step_std": stats["step_reward_std"],
                         "rollout/reward_step_min": stats["step_reward_min"],
                         "rollout/reward_step_max": stats["step_reward_max"],
+                        "rollout/trajectory_replay_episodes": stats.get("trajectory_replay_episodes", 0),
+                        "rollout/trajectory_replay_rate": stats.get("trajectory_replay_rate", 0.0),
+                        **{
+                            f"rollout/start_gate_{key}_episodes": float(value)
+                            for key, value in stats.get("start_gate_counts", {}).items()
+                        },
                         "time/fps": fps,
                         "time/rollout_fps": stats["rollout_fps"],
                         "time/rollout_time": stats["rollout_time"],
@@ -872,6 +962,9 @@ class FlightmarePPOTrainer:
                             for key, value in stats.get("reward_terms", {}).items()
                         },
                     }
+                    start_gate_summary = ",".join(
+                        f"{key}:{value}" for key, value in stats.get("start_gate_counts", {}).items()
+                    )
                     print(
                         f"[{iteration}/{self.max_iterations}] "
                         f"ep_r={stats['mean_reward']:.2f} "
@@ -879,6 +972,9 @@ class FlightmarePPOTrainer:
                         f"eps={stats['n_episodes']} len={stats['mean_length']:.0f} "
                         f"sr={stats['success_rate']:.1%} "
                         f"gc={stats['mean_gate_completion']:.1%} "
+                        f"goal={stats['mean_goal_completion']:.1%} "
+                        f"replay={stats.get('trajectory_replay_rate', 0.0):.1%} "
+                        f"sg={start_gate_summary or '-'} "
                         f"pass={stats['gate_passes']} miss={stats['gate_misses']} crash={stats['crashes']} "
                         f"v={stats['mean_speed_mps']:.1f}/{stats['max_speed_mps']:.1f} "
                         f"aclip={stats['action_clip_fraction']:.2f} "
@@ -898,7 +994,8 @@ class FlightmarePPOTrainer:
                             "  [best] "
                             f"score={selection_score:.3f} "
                             f"sr={stats['success_rate']:.1%} "
-                            f"gc={stats['mean_gate_completion']:.1%}"
+                            f"gc={stats['mean_gate_completion']:.1%} "
+                            f"goal={stats['mean_goal_completion']:.1%}"
                         )
 
                 if self.save_steps > 0 and iteration % self.save_steps == 0:
@@ -924,7 +1021,15 @@ class FlightmarePPOTrainer:
         if getattr(self, "_wandb", None) is not None and self._wandb.run:
             self._wandb.finish()
 
-    def _restore_from_checkpoint(self, path: str, model: nn.Module, optimizer) -> None:
+    def _restore_from_checkpoint(
+        self,
+        path: str,
+        model: nn.Module,
+        optimizer,
+        *,
+        restore_optimizer: bool = True,
+        restore_training_state: bool = True,
+    ) -> None:
         """Restore actor+critic weights, optimizer state, and best-score
         bookkeeping from a previous PPO checkpoint directory.
 
@@ -955,35 +1060,44 @@ class FlightmarePPOTrainer:
             print(f"  unexpected keys ({len(unexpected)}): {unexpected[:5]}{' ...' if len(unexpected) > 5 else ''}")
 
         opt_path = os.path.join(ckpt_dir, "optimizer.pt")
-        if os.path.exists(opt_path):
+        if restore_optimizer and os.path.exists(opt_path):
             try:
                 opt_state = torch.load(opt_path, map_location=self.device, weights_only=True)
                 optimizer.load_state_dict(opt_state.get("optimizer", opt_state))
                 print(f"[Flightmare PPO] Resumed optimizer state from {opt_path}")
-            except Exception as exc:  # noqa: BLE001 — broad on purpose; downgrade to warn
+            except Exception as exc:  # noqa: BLE001 - broad on purpose; downgrade to warn
                 print(
                     f"[Flightmare PPO] WARNING: failed to load optimizer state from {opt_path}: "
                     f"{type(exc).__name__}: {exc}. Continuing with fresh optimizer."
                 )
-        else:
+        elif restore_optimizer:
             print(
                 "[Flightmare PPO] No optimizer.pt found alongside the resumed model "
                 "(was save_optimizer_state disabled when this checkpoint was written?). "
-                "Optimizer starts fresh — fine for low-LR PPO; momentum/variance estimates rebuild quickly."
+                "Optimizer starts fresh; fine for low-LR PPO. Momentum/variance estimates rebuild quickly."
             )
+        else:
+            print("[Flightmare PPO] Skipped optimizer restore for this checkpoint load.")
 
         ts_path = os.path.join(ckpt_dir, "training_state.json")
-        if os.path.exists(ts_path):
+        if not restore_training_state:
+            print("[Flightmare PPO] Skipped training-state restore for this checkpoint load.")
+        elif os.path.exists(ts_path):
             try:
                 with open(ts_path) as f:
                     ts = json.load(f)
                 resume_iteration = int(ts.get("iteration") or 0)
                 if resume_iteration > 0:
                     self.start_iteration = resume_iteration + 1
-                bs = ts.get("best_score")
-                if bs is not None and np.isfinite(bs):
-                    self.best_score = float(bs)
-                self.best_iteration = int(ts.get("best_iteration") or 0)
+                if self.reset_best_on_resume:
+                    self.best_score = float("-inf")
+                    self.best_iteration = 0
+                    print("[Flightmare PPO] reset_best_on_resume=true; best-score bookkeeping starts fresh.")
+                else:
+                    bs = ts.get("best_score")
+                    if bs is not None and np.isfinite(bs):
+                        self.best_score = float(bs)
+                    self.best_iteration = int(ts.get("best_iteration") or 0)
                 print(
                     f"[Flightmare PPO] Restored training state: "
                     f"next_iteration={self.start_iteration} "

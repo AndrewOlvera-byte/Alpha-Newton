@@ -99,7 +99,7 @@ class FlightmareNormStats:
             for needed in ("proprio_core_mean", "gate_mean", "aux_mean"):
                 if needed not in stats.files:
                     raise RuntimeError(
-                        f"{path} missing v3 stats {needed!r} — rerun "
+                        f"{path} missing v3 stats {needed!r}; rerun "
                         f"`python -m scripts.flightmare_bc.transform_to_v3`."
                     )
             v3_kwargs = dict(
@@ -226,14 +226,31 @@ class FlightmareRacingEnvConfig:
     # aggressive racing plant. Schema: {"ctbr": {"low": [...], "high": [...]},
     # "motor": {...}, "waypoint": {...}}.
     action_bounds_override: dict[str, Any] | None = None
-    reset_mode: str = "course_start"  # course_start|gate_pre_entry|reference_state|segment_window
+    reset_mode: str = "course_start"  # course_start|gate_pre_entry|reference_state|segment_window|trajectory_replay_or_reference
+    course_start_sample_prob: float = 0.0
     start_gate_index: int | None = None
     start_gate_choices: list[int] | None = None
     start_offset_m: float = 3.0
     start_offset_range: tuple[float, float] | None = None
+    start_lateral_range_m: tuple[float, float] | None = None
+    start_vertical_range_m: tuple[float, float] | None = None
+    start_yaw_noise_rad: float = 0.0
+    start_speed_noise_mps: float = 0.0
     reference_speed_mps: float = 4.0
-    goal_mode: str = "finish_remaining_course"  # pass_gate_i|gate_i_to_i+1|gate_i_to_i+2|finish_remaining_course
+    goal_mode: str = "finish_remaining_course"  # pass_gate_i|pass_gate_i_survive|pass_gate_i_align_next|gate_i_to_i+1|gate_i_to_i+2|finish_remaining_course
     goal_gate_span: int | None = None
+    post_pass_success_steps: int = 0
+    post_pass_max_speed_mps: float | None = None
+    post_pass_max_body_rate: float | None = None
+    post_pass_max_center_error_norm: float | None = None
+    post_pass_min_gate_signed_distance_m: float | None = None
+    trajectory_replay_capacity_per_gate: int = 0
+    trajectory_replay_sample_prob: float = 0.0
+    trajectory_replay_min_samples_per_gate: int = 1
+    trajectory_replay_pos_noise_m: float = 0.0
+    trajectory_replay_vel_noise_mps: float = 0.0
+    trajectory_replay_omega_noise_radps: float = 0.0
+    trajectory_replay_yaw_noise_rad: float = 0.0
 
 
 class FlightmareRacingEnv(gymnasium.Env):
@@ -324,6 +341,13 @@ class FlightmareRacingEnv(gymnasium.Env):
         self._prev_pos = None
         self._start_gate_index = 0
         self._goal_terminal_gate_index = 0
+        self._post_pass_start_step: int | None = None
+        self._segment_start_pos = np.zeros(3, dtype=np.float64)
+        self._trajectory_replay: dict[int, list[dict[str, Any]]] = {}
+        self._last_reset_replay_used = False
+        self._last_reset_replay_buffer_size = 0
+        self._last_reset_course_start_used = False
+        self._last_effective_reset_mode = str(cfg.reset_mode)
 
     @property
     def using_fallback(self) -> bool:
@@ -442,6 +466,30 @@ class FlightmareRacingEnv(gymnasium.Env):
     def _quat_from_yaw(yaw: float) -> np.ndarray:
         return np.array([np.cos(0.5 * yaw), 0.0, 0.0, np.sin(0.5 * yaw)], dtype=np.float64)
 
+    @staticmethod
+    def _quat_normalize(quat: np.ndarray) -> np.ndarray:
+        quat = np.asarray(quat, dtype=np.float64)
+        norm = float(np.linalg.norm(quat))
+        if norm < 1e-12:
+            return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        return quat / norm
+
+    @classmethod
+    def _quat_multiply(cls, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        aw, ax, ay, az = np.asarray(a, dtype=np.float64)
+        bw, bx, by, bz = np.asarray(b, dtype=np.float64)
+        return cls._quat_normalize(
+            np.array(
+                [
+                    aw * bw - ax * bx - ay * by - az * bz,
+                    aw * bx + ax * bw + ay * bz - az * by,
+                    aw * by - ax * bz + ay * bw + az * bx,
+                    aw * bz + ax * by - ay * bx + az * bw,
+                ],
+                dtype=np.float64,
+            )
+        )
+
     def _select_start_gate_index(self) -> int:
         n = len(self._gates)
         if n <= 0:
@@ -453,7 +501,7 @@ class FlightmareRacingEnv(gymnasium.Env):
                 return int(valid[int(self.rng.integers(0, len(valid)))])
         if self.cfg.start_gate_index is not None:
             return int(np.clip(int(self.cfg.start_gate_index), 0, n - 1))
-        if self.cfg.reset_mode in {"gate_pre_entry", "reference_state", "segment_window"}:
+        if self.cfg.reset_mode in {"gate_pre_entry", "reference_state", "segment_window", "trajectory_replay_or_reference"}:
             return int(self.rng.integers(0, n))
         return 0
 
@@ -466,6 +514,24 @@ class FlightmareRacingEnv(gymnasium.Env):
             return float(self.rng.uniform(lo, hi))
         return float(self.cfg.start_offset_m)
 
+    def _sample_range(self, value_range: tuple[float, float] | list[float] | None) -> float:
+        if value_range is None:
+            return 0.0
+        lo, hi = float(value_range[0]), float(value_range[1])
+        if hi < lo:
+            lo, hi = hi, lo
+        return float(self.rng.uniform(lo, hi))
+
+    def _use_course_start_reset(self, reset_mode: str) -> bool:
+        if reset_mode == "course_start":
+            return True
+        prob = float(np.clip(float(self.cfg.course_start_sample_prob), 0.0, 1.0))
+        if prob <= 0.0:
+            return False
+        if reset_mode not in {"gate_pre_entry", "reference_state", "segment_window", "trajectory_replay_or_reference"}:
+            return False
+        return bool(self.rng.random() < prob)
+
     def _goal_terminal_index(self, start_gate: int) -> int:
         n = len(self._gates)
         if n <= 0:
@@ -473,7 +539,7 @@ class FlightmareRacingEnv(gymnasium.Env):
         if self.cfg.goal_gate_span is not None:
             return int(np.clip(start_gate + int(self.cfg.goal_gate_span), start_gate + 1, n))
         mode = str(self.cfg.goal_mode)
-        if mode == "pass_gate_i":
+        if mode in {"pass_gate_i", "pass_gate_i_survive", "pass_gate_i_align_next"}:
             return min(n, start_gate + 1)
         if mode == "gate_i_to_i+1":
             return min(n, start_gate + 2)
@@ -483,14 +549,123 @@ class FlightmareRacingEnv(gymnasium.Env):
             return n
         raise ValueError(f"Unsupported goal_mode={self.cfg.goal_mode!r}")
 
+    def _valid_start_gate_for_goal(self, start_gate: int) -> bool:
+        n = len(self._gates)
+        if not (0 <= int(start_gate) < n):
+            return False
+        choices = self.cfg.start_gate_choices
+        if choices:
+            valid = {int(i) for i in choices if 0 <= int(i) < n}
+            if int(start_gate) not in valid:
+                return False
+        return self._goal_terminal_index(int(start_gate)) > int(start_gate)
+
+    def _valid_trajectory_replay_goal(self, start_gate: int, goal_terminal_gate: int) -> bool:
+        n = len(self._gates)
+        start_gate = int(start_gate)
+        goal_terminal_gate = int(goal_terminal_gate)
+        return 0 <= start_gate < n and start_gate < goal_terminal_gate <= n
+
+    def _trajectory_replay_count(self) -> int:
+        return int(sum(len(v) for v in self._trajectory_replay.values()))
+
+    def _record_trajectory_replay_state(
+        self,
+        *,
+        start_gate: int,
+        action_norm: np.ndarray,
+        raw_action: np.ndarray,
+    ) -> None:
+        capacity = max(0, int(self.cfg.trajectory_replay_capacity_per_gate))
+        goal_terminal_gate = int(self._goal_terminal_gate_index)
+        if capacity <= 0 or not self._valid_trajectory_replay_goal(start_gate, goal_terminal_gate):
+            return
+        record = {
+            "goal_terminal_gate_index": goal_terminal_gate,
+            "pos": np.asarray(self._obs.pos, dtype=np.float64).copy(),
+            "vel": np.asarray(self._obs.vel, dtype=np.float64).copy(),
+            "quat": self._quat_normalize(np.asarray(self._obs.quat, dtype=np.float64)).copy(),
+            "omega": np.asarray(self._obs.omega, dtype=np.float64).copy(),
+            "prev_action_norm": np.asarray(action_norm, dtype=np.float32).copy(),
+            "prev_raw_action": np.asarray(raw_action, dtype=np.float32).copy(),
+        }
+        bucket = self._trajectory_replay.setdefault(int(start_gate), [])
+        bucket.append(record)
+        if len(bucket) > capacity:
+            del bucket[: len(bucket) - capacity]
+
+    def _sample_trajectory_replay_start_state(
+        self,
+    ) -> tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+        if str(self.cfg.reset_mode) != "trajectory_replay_or_reference":
+            return None
+        if float(self.cfg.trajectory_replay_sample_prob) <= 0.0:
+            return None
+        if self.rng.random() > float(self.cfg.trajectory_replay_sample_prob):
+            return None
+        min_samples = max(1, int(self.cfg.trajectory_replay_min_samples_per_gate))
+        candidates = [
+            (int(gate), record)
+            for gate, records in self._trajectory_replay.items()
+            if len(records) >= min_samples
+            for record in records
+            if self._valid_trajectory_replay_goal(
+                int(gate),
+                int(record.get("goal_terminal_gate_index", self._goal_terminal_index(int(gate)))),
+            )
+        ]
+        if not candidates:
+            return None
+        start_gate, record = candidates[int(self.rng.integers(0, len(candidates)))]
+        goal_terminal_gate = int(record.get("goal_terminal_gate_index", self._goal_terminal_index(start_gate)))
+
+        pos = np.asarray(record["pos"], dtype=np.float64).copy()
+        vel = np.asarray(record["vel"], dtype=np.float64).copy()
+        quat = self._quat_normalize(np.asarray(record["quat"], dtype=np.float64).copy())
+        omega = np.asarray(record["omega"], dtype=np.float64).copy()
+
+        pos_noise = abs(float(self.cfg.trajectory_replay_pos_noise_m))
+        if pos_noise > 0.0:
+            pos += self.rng.uniform(-pos_noise, pos_noise, size=3)
+        vel_noise = abs(float(self.cfg.trajectory_replay_vel_noise_mps))
+        if vel_noise > 0.0:
+            vel += self.rng.uniform(-vel_noise, vel_noise, size=3)
+        omega_noise = abs(float(self.cfg.trajectory_replay_omega_noise_radps))
+        if omega_noise > 0.0:
+            omega += self.rng.uniform(-omega_noise, omega_noise, size=3)
+        yaw_noise = abs(float(self.cfg.trajectory_replay_yaw_noise_rad))
+        if yaw_noise > 0.0:
+            yaw_delta = float(self.rng.uniform(-yaw_noise, yaw_noise))
+            quat = self._quat_multiply(self._quat_from_yaw(yaw_delta), quat)
+
+        return (
+            start_gate,
+            goal_terminal_gate,
+            pos.astype(np.float64),
+            vel.astype(np.float64),
+            quat.astype(np.float64),
+            omega.astype(np.float64),
+            np.asarray(record["prev_action_norm"], dtype=np.float32).copy(),
+            np.asarray(record["prev_raw_action"], dtype=np.float32).copy(),
+        )
+
     def _reference_start_state(self, start_gate: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         gate = self._gates[start_gate]
-        center, forward, _, _ = gate_frame(gate)
+        center, forward, right, up = gate_frame(gate)
         offset = self._start_offset()
         pos = center - offset * forward
+        pos = pos + self._sample_range(self.cfg.start_lateral_range_m) * right
+        pos = pos + self._sample_range(self.cfg.start_vertical_range_m) * up
         yaw = float(getattr(gate, "yaw", np.arctan2(forward[1], forward[0])))
+        yaw_noise = abs(float(self.cfg.start_yaw_noise_rad))
+        if yaw_noise > 0.0:
+            yaw += float(self.rng.uniform(-yaw_noise, yaw_noise))
         quat = self._quat_from_yaw(yaw)
-        vel = float(self.cfg.reference_speed_mps) * forward
+        speed = float(self.cfg.reference_speed_mps)
+        speed_noise = abs(float(self.cfg.start_speed_noise_mps))
+        if speed_noise > 0.0:
+            speed += float(self.rng.uniform(-speed_noise, speed_noise))
+        vel = max(0.0, speed) * forward
         omega = np.zeros(3, dtype=np.float64)
         return pos.astype(np.float64), vel.astype(np.float64), quat.astype(np.float64), omega
 
@@ -510,16 +685,35 @@ class FlightmareRacingEnv(gymnasium.Env):
             )
             for g in self._gates
         ]
-        self._start_gate_index = self._select_start_gate_index()
-        self._goal_terminal_gate_index = self._goal_terminal_index(self._start_gate_index)
         reset_mode = str(self.cfg.reset_mode)
-        if reset_mode == "course_start" or not self._gates:
-            yaw = float(self._gates[0].yaw) if self._gates else 0.0
-            self._obs = self.env.reset(init_pos=waypoints[0], yaw=yaw)
+        use_course_start = self._use_course_start_reset(reset_mode) or not self._gates
+        replay_start = None if use_course_start else self._sample_trajectory_replay_start_state()
+        self._last_reset_replay_used = replay_start is not None
+        self._last_reset_replay_buffer_size = self._trajectory_replay_count()
+        self._last_reset_course_start_used = bool(use_course_start)
+        self._last_effective_reset_mode = "course_start" if use_course_start else reset_mode
+        if use_course_start:
             self._start_gate_index = 0
             self._goal_terminal_gate_index = self._goal_terminal_index(0)
-        elif reset_mode in {"gate_pre_entry", "reference_state", "segment_window"}:
-            pos, vel, quat, omega = self._reference_start_state(self._start_gate_index)
+            yaw = float(self._gates[0].yaw) if self._gates else 0.0
+            self._obs = self.env.reset(init_pos=waypoints[0], yaw=yaw)
+            initial_prev_action_norm = self.norm.normalize_action_value(
+                np.zeros(self.norm.action_dim, dtype=np.float32)
+            )
+            initial_prev_raw_action = np.zeros(self.norm.action_dim, dtype=np.float32)
+        elif reset_mode in {"gate_pre_entry", "reference_state", "segment_window", "trajectory_replay_or_reference"}:
+            if replay_start is not None:
+                self._start_gate_index = int(replay_start[0])
+                self._goal_terminal_gate_index = int(replay_start[1])
+                _, _, pos, vel, quat, omega, initial_prev_action_norm, initial_prev_raw_action = replay_start
+            else:
+                self._start_gate_index = self._select_start_gate_index()
+                self._goal_terminal_gate_index = self._goal_terminal_index(self._start_gate_index)
+                pos, vel, quat, omega = self._reference_start_state(self._start_gate_index)
+                initial_prev_action_norm = self.norm.normalize_action_value(
+                    np.zeros(self.norm.action_dim, dtype=np.float32)
+                )
+                initial_prev_raw_action = np.zeros(self.norm.action_dim, dtype=np.float32)
             yaw = float(np.arctan2(2.0 * (quat[0] * quat[3] + quat[1] * quat[2]), 1.0 - 2.0 * (quat[2] ** 2 + quat[3] ** 2)))
             self._obs = self.env.reset(init_pos=pos, yaw=yaw)
             self._obs = self.env.set_state(pos=pos, quat=quat, vel=vel, omega=omega)
@@ -528,21 +722,24 @@ class FlightmareRacingEnv(gymnasium.Env):
             raise ValueError(f"Unsupported reset_mode={self.cfg.reset_mode!r}")
         self._gate_index_v3 = int(self._start_gate_index)
         self._last_pass_step = 0
-        self._prev_raw_action = np.zeros(self.norm.action_dim, dtype=np.float32)
+        self._prev_raw_action = np.asarray(initial_prev_raw_action, dtype=np.float32).copy()
         self._prev_pos = self._obs.pos.copy()
+        self._segment_start_pos = self._obs.pos.copy()
         self._step_count = 0
         self._episode_id += 1
-        initial_prev_action = self.norm.normalize_action_value(
-            np.zeros(self.norm.action_dim, dtype=np.float32)
-        )
+        self._post_pass_start_step = None
         return self._make_obs(), {
             "using_fallback": self.using_fallback,
             "num_gates": len(self._gates),
             "reset_mode": reset_mode,
+            "effective_reset_mode": self._last_effective_reset_mode,
+            "course_start_used": bool(self._last_reset_course_start_used),
             "start_gate_index": int(self._start_gate_index),
             "goal_terminal_gate_index": int(self._goal_terminal_gate_index),
             "goal_mode": str(self.cfg.goal_mode),
-            "initial_prev_action_norm": initial_prev_action,
+            "initial_prev_action_norm": np.asarray(initial_prev_action_norm, dtype=np.float32),
+            "trajectory_replay_used": bool(self._last_reset_replay_used),
+            "trajectory_replay_buffer_size": int(self._last_reset_replay_buffer_size),
         }
 
     def step(self, action: np.ndarray):
@@ -604,7 +801,10 @@ class FlightmareRacingEnv(gymnasium.Env):
         if self._gates and not self._strict_tracker.completed:
             idx = self._strict_tracker.current_index
             curr_center = target_center
-            prev_center = prev_pos if idx == 0 else gate_frame(self._gates[idx - 1])[0]
+            if idx <= int(self._start_gate_index):
+                prev_center = self._segment_start_pos
+            else:
+                prev_center = gate_frame(self._gates[idx - 1])[0]
             seg = curr_center - prev_center
             denom = float(np.linalg.norm(seg))
             segment_progress = 0.0 if denom < 1e-6 else float(np.dot(curr_pos - prev_pos, seg / denom))
@@ -613,9 +813,50 @@ class FlightmareRacingEnv(gymnasium.Env):
         crash_reason = self._crash_reason()
         gate_missed = bool(event is not None and event.missed)
         gate_passed = bool(event is not None and event.passed)
-        success = bool(self._strict_tracker.current_index >= self._goal_terminal_gate_index)
+        if gate_passed:
+            self._record_trajectory_replay_state(
+                start_gate=int(self._strict_tracker.current_index),
+                action_norm=action_norm,
+                raw_action=raw_action,
+            )
         crash = crash_reason is not None
+        goal_reached = bool(self._strict_tracker.current_index >= self._goal_terminal_gate_index)
+        speed_mps = float(np.linalg.norm(self._obs.vel))
+        angular_rate_norm = float(np.linalg.norm(self._obs.omega))
+        post_pass_constraint_ok = True
+        post_pass_alignment_ok = True
+        if self._post_pass_start_step is not None:
+            max_speed = self.cfg.post_pass_max_speed_mps
+            max_rate = self.cfg.post_pass_max_body_rate
+            if max_speed is not None and speed_mps > float(max_speed):
+                post_pass_constraint_ok = False
+            if max_rate is not None and angular_rate_norm > float(max_rate):
+                post_pass_constraint_ok = False
+            max_center = self.cfg.post_pass_max_center_error_norm
+            min_signed = self.cfg.post_pass_min_gate_signed_distance_m
+            if max_center is not None and gate_center_error_norm_next > float(max_center):
+                post_pass_alignment_ok = False
+            if min_signed is not None and gate_signed_distance_next < float(min_signed):
+                post_pass_alignment_ok = False
+        goal_mode = str(self.cfg.goal_mode)
+        if goal_mode in {"pass_gate_i_survive", "pass_gate_i_align_next"}:
+            if goal_reached and self._post_pass_start_step is None:
+                self._post_pass_start_step = int(self._step_count)
+            survival_steps = max(0, int(self.cfg.post_pass_success_steps))
+            success = bool(
+                goal_reached
+                and self._post_pass_start_step is not None
+                and (int(self._step_count) - self._post_pass_start_step) >= survival_steps
+                and post_pass_constraint_ok
+                and (goal_mode != "pass_gate_i_align_next" or post_pass_alignment_ok)
+                and not crash
+            )
+        else:
+            success = goal_reached
         body_z_world = quat_to_R(self._obs.quat)[:, 2]
+        reward_gate_passed = gate_passed
+        if str(self.cfg.goal_mode) == "pass_gate_i_survive" and event is not None:
+            reward_gate_passed = bool(gate_passed and int(event.gate_index) < int(self._goal_terminal_gate_index))
 
         terminated = success
         if gate_missed and self.cfg.terminate_on_gate_miss:
@@ -627,6 +868,7 @@ class FlightmareRacingEnv(gymnasium.Env):
         info = {
             "success": success,
             "gate_passed": gate_passed,
+            "reward_gate_passed": reward_gate_passed,
             "gate_missed": gate_missed,
             "gate_margin_m": float(event.clearance_margin_m) if event is not None else 0.0,
             "gates_completed": int(self._strict_tracker.current_index),
@@ -639,7 +881,15 @@ class FlightmareRacingEnv(gymnasium.Env):
             "start_gate_index": int(self._start_gate_index),
             "goal_terminal_gate_index": int(self._goal_terminal_gate_index),
             "goal_mode": str(self.cfg.goal_mode),
+            "post_pass_start_step": -1 if self._post_pass_start_step is None else int(self._post_pass_start_step),
+            "post_pass_survival_steps": int(self.cfg.post_pass_success_steps),
+            "post_pass_constraint_ok": bool(post_pass_constraint_ok),
+            "post_pass_alignment_ok": bool(post_pass_alignment_ok),
             "reset_mode": str(self.cfg.reset_mode),
+            "effective_reset_mode": self._last_effective_reset_mode,
+            "course_start_used": bool(self._last_reset_course_start_used),
+            "trajectory_replay_used": bool(self._last_reset_replay_used),
+            "trajectory_replay_buffer_size": int(self._last_reset_replay_buffer_size),
             "distance_progress_m": float(distance_progress),
             "segment_progress_m": float(segment_progress),
             "gate_alignment": float(alignment),
@@ -665,10 +915,10 @@ class FlightmareRacingEnv(gymnasium.Env):
             "omega": self._obs.omega.astype(np.float32),
             "body_z_world_z": float(body_z_world[2]),
             "vertical_speed_mps": float(self._obs.vel[2]),
-            "angular_rate_norm": float(np.linalg.norm(self._obs.omega)),
+            "angular_rate_norm": float(angular_rate_norm),
             "step": self._step_count,
             "dt": self.dt,
-            "speed_mps": float(np.linalg.norm(self._obs.vel)),
+            "speed_mps": float(speed_mps),
         }
         reward = self.reward_fn(
             info=info,
@@ -755,6 +1005,10 @@ def build_flightmare_env_config(**kwargs) -> FlightmareRacingEnvConfig:
         course_kwargs["z_min"] = kwargs.pop("z_min")
     if "gate_approach_m" in kwargs:
         course_kwargs["gate_approach_m"] = kwargs.pop("gate_approach_m")
+    if "inverted_roll_jitter_rad" in kwargs:
+        course_kwargs["inverted_roll_jitter_rad"] = kwargs.pop("inverted_roll_jitter_rad")
+    if "course_distribution" in kwargs:
+        course_kwargs["course_distribution"] = kwargs.pop("course_distribution")
     course = CourseConfig(**course_kwargs)
     return FlightmareRacingEnvConfig(course=course, **kwargs)
 
@@ -769,7 +1023,7 @@ def _subproc_worker(remote, env_kwargs_list: list[dict], seeds: list[int], worke
     in use``). Requires the patched ``unity_bridge.cpp`` that reads these
     env vars.
     """
-    import os, sys
+    import os
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     # Self-contained port allocation (no import dependency). Matches
@@ -835,10 +1089,10 @@ class SubprocFlightmareVecEnv:
         # construction time, so as long as the worker sets these env vars
         # before each FlightmareRacingEnv() call (see _subproc_worker), packing
         # multiple envs in one process is safe and dramatically reduces IPC
-        # overhead — a 1-env-per-proc setup spends most of its wall time in
+        # overhead; a 1-env-per-proc setup spends most of its wall time in
         # the parent's serial recv() loop over remotes, not in physics.
         # Direct profiling: 4 envs sequential in one process hits ~6000 fps,
-        # vs ~5000 fps aggregate at 32 procs × 1 env.
+        # vs ~5000 fps aggregate at 32 procs x 1 env.
         n_workers = max(1, min(int(n_workers) or n, n))
         bins = np.array_split(np.arange(n, dtype=np.int64), n_workers)
         self._chunks: list[list[int]] = [list(map(int, b)) for b in bins]

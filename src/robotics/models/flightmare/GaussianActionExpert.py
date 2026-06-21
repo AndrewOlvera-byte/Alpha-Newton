@@ -27,6 +27,7 @@ from torch.distributions import Normal
 
 
 _LOG_2PI = math.log(2.0 * math.pi)
+_TANH_EPS = 1e-6
 
 
 def _orthogonal_(layer: nn.Linear, gain: float) -> None:
@@ -49,6 +50,7 @@ class GaussianActionExpert(nn.Module):
         critic_hidden_dim: int = 256,
         critic_depth: int = 2,
         action_clip: float = 5.0,
+        squash_actions: bool = False,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -57,6 +59,7 @@ class GaussianActionExpert(nn.Module):
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
         self.action_clip = action_clip
+        self.squash_actions = bool(squash_actions)
 
         head_layers: list[nn.Module] = []
         in_dim = feature_dim
@@ -97,7 +100,7 @@ class GaussianActionExpert(nn.Module):
     def has_critic(self) -> bool:
         return self.critic is not None
 
-    def _mu_log_std(self, feature: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _action_mu_log_std(self, feature: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.head_trunk(feature)
         raw_mu = self.mean(h)
         if self.action_clip > 0:
@@ -111,6 +114,21 @@ class GaussianActionExpert(nn.Module):
             log_std = self.log_std_param.expand_as(mu)
         log_std = log_std.clamp(self.log_std_min, self.log_std_max)
         return mu, log_std
+
+    def _mu_log_std(self, feature: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._action_mu_log_std(feature)
+
+    def _squash_loc(self, action_mu: torch.Tensor) -> torch.Tensor:
+        clip = max(float(self.action_clip), _TANH_EPS)
+        y = (action_mu / clip).clamp(-1.0 + _TANH_EPS, 1.0 - _TANH_EPS)
+        return torch.atanh(y)
+
+    def _squashed_log_prob(self, dist: Normal, pre_tanh: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        clip = max(float(self.action_clip), _TANH_EPS)
+        y = (action / clip).clamp(-1.0 + _TANH_EPS, 1.0 - _TANH_EPS)
+        correction = torch.log(torch.as_tensor(clip, dtype=action.dtype, device=action.device))
+        correction = correction + torch.log1p(-(y * y) + _TANH_EPS)
+        return (dist.log_prob(pre_tanh) - correction).sum(-1)
 
     def forward(self, feature: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self._mu_log_std(feature)
@@ -132,7 +150,14 @@ class GaussianActionExpert(nn.Module):
     def sample(
         self, feature: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu, log_std = self._mu_log_std(feature)
+        mu, log_std = self._action_mu_log_std(feature)
+        if self.squash_actions:
+            loc = self._squash_loc(mu)
+            dist = Normal(loc, log_std.exp())
+            pre_tanh = dist.rsample()
+            action = float(self.action_clip) * torch.tanh(pre_tanh)
+            log_prob = self._squashed_log_prob(dist, pre_tanh, action)
+            return action, log_prob, mu, log_std
         dist = Normal(mu, log_std.exp())
         action = dist.rsample()
         log_prob = dist.log_prob(action).sum(-1)
@@ -141,7 +166,16 @@ class GaussianActionExpert(nn.Module):
     def evaluate(
         self, feature: torch.Tensor, action: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu, log_std = self._mu_log_std(feature)
+        mu, log_std = self._action_mu_log_std(feature)
+        if self.squash_actions:
+            loc = self._squash_loc(mu)
+            dist = Normal(loc, log_std.exp())
+            clip = max(float(self.action_clip), _TANH_EPS)
+            y = (action / clip).clamp(-1.0 + _TANH_EPS, 1.0 - _TANH_EPS)
+            pre_tanh = torch.atanh(y)
+            log_prob = self._squashed_log_prob(dist, pre_tanh, action)
+            entropy = dist.entropy().sum(-1)
+            return log_prob, entropy, mu, log_std
         dist = Normal(mu, log_std.exp())
         log_prob = dist.log_prob(action).sum(-1)
         entropy = dist.entropy().sum(-1)

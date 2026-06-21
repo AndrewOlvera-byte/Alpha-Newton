@@ -351,8 +351,49 @@ def _swift_v4_gate_course(rng: np.random.Generator, cfg: argparse.Namespace) -> 
     return gates
 
 
+def _resolve_course_distribution(cfg):
+    """Return a CourseDistributionConfig if the cfg requests one, else None."""
+    dist = _cfg(cfg, "course_distribution", None)
+    if dist is None:
+        return None
+    from src.robotics.flightmare_courses import course_distribution_from_dict  # noqa: PLC0415
+    from src.robotics.flightmare_courses.scenarios import CourseDistributionConfig  # noqa: PLC0415
+
+    if isinstance(dist, CourseDistributionConfig):
+        return dist
+    return course_distribution_from_dict(dist)
+
+
+def sample_course_with_meta(
+    rng: np.random.Generator, cfg: argparse.Namespace,
+) -> tuple[list[GateSpec], dict | None]:
+    """Sample a course, returning gates and optional scenario metadata.
+
+    When ``cfg.course_distribution`` is set, delegate to the shared procedural
+    course module and return its per-episode metadata; otherwise use the legacy
+    single-mode path and return ``None`` metadata.
+    """
+    dist = _resolve_course_distribution(cfg)
+    if dist is not None:
+        from src.robotics.flightmare_courses import sample_course  # noqa: PLC0415
+
+        generated = sample_course(rng, dist)
+        return list(generated.gates), generated.metadata()
+    return sample_gate_course(rng, cfg), None
+
+
 def sample_gate_course(rng: np.random.Generator, cfg: argparse.Namespace) -> list[GateSpec]:
-    """Generate a forward-progressing randomized gate course."""
+    """Generate a forward-progressing randomized gate course.
+
+    If ``cfg.course_distribution`` is set, delegate to the shared procedural
+    course module (``src.robotics.flightmare_courses``); the legacy course-mode
+    branches below remain for back-compat with existing v6 configs/tests.
+    """
+    dist = _resolve_course_distribution(cfg)
+    if dist is not None:
+        from src.robotics.flightmare_courses import sample_course  # noqa: PLC0415
+
+        return list(sample_course(rng, dist).gates)
     course_mode = str(_cfg(cfg, "course_mode", "gates"))
     if course_mode == "swift_like":
         return _swift_like_gate_course(rng, cfg)
@@ -417,17 +458,30 @@ def waypoints_from_gates(
     if not gates:
         return np.array([[0.0, 0.0, max(z_min, 2.0)]], dtype=np.float64)
     points: list[np.ndarray] = []
+    n = len(gates)
+    centers = [np.asarray(g.pos, dtype=np.float64) for g in gates]
     f0 = _gate_forward(gates[0])
     # Lead-in is placed strictly further than the pre-gate approach point so
     # the polynomial sees a non-degenerate first segment regardless of how
     # large d_approach is configured.
     lead_dist = max(d_approach + 2.0, 3.0)
     points.append(gates[0].pos - lead_dist * f0)
-    for g in gates:
+    for i, g in enumerate(gates):
         f = _gate_forward(g)
-        points.append(g.pos - d_approach * f)
+        # Clamp the pre/exit offsets to a fraction of the neighbor spacing so
+        # consecutive gate waypoints never cross (exit_i landing past pre_{i+1}).
+        # Without this, courses whose spacing is < 2*d_approach produce a
+        # back-and-forth min-jerk path: the drone passes gate i then reverses
+        # and misses gate i+1. ``swift_v4`` (>~12 m spacing) is unaffected.
+        d_pre = float(d_approach)
+        d_exit = float(d_approach)
+        if i > 0:
+            d_pre = min(d_pre, 0.45 * float(np.linalg.norm(centers[i] - centers[i - 1])))
+        if i < n - 1:
+            d_exit = min(d_exit, 0.45 * float(np.linalg.norm(centers[i + 1] - centers[i])))
+        points.append(g.pos - d_pre * f)
         points.append(g.pos.copy())
-        points.append(g.pos + d_approach * f)
+        points.append(g.pos + d_exit * f)
     fN = _gate_forward(gates[-1])
     points.append(gates[-1].pos + lead_dist * fN)
     return np.stack(points, axis=0)
@@ -456,8 +510,9 @@ def collect_one_episode(
     lookahead_s: float,
 ) -> dict:
     gates: list[GateSpec] = []
-    if cfg.course_mode in {"gates", "swift_like", "swift_v4", "fixed_gates"}:
-        gates = sample_gate_course(rng, cfg)
+    scenario_meta: dict | None = None
+    if _resolve_course_distribution(cfg) is not None or cfg.course_mode in {"gates", "swift_like", "swift_v4", "fixed_gates"}:
+        gates, scenario_meta = sample_course_with_meta(rng, cfg)
         # Prefix gate IDs with episode index so reused Unity instances don't
         # collide on object IDs across episodes (older gates remain in the
         # scene visually but are unused by the controller / mission tracker).
@@ -488,6 +543,10 @@ def collect_one_episode(
         min_segment_s=float(_cfg(cfg, "trajectory_min_segment_s", 1e-2)),
     )
     mission = MissionTracker(gates, lookahead=LOOKAHEAD_GATES)
+    # Stateful experts (e.g. MPPI) warm-start within an episode; reset so the
+    # previous episode's nominal does not leak into this one.
+    if hasattr(controller, "reset"):
+        controller.reset()
 
     n_steps = int(traj.total_time / env.dt)
     n_steps = max(1, min(n_steps, cfg.max_steps))
@@ -539,6 +598,7 @@ def collect_one_episode(
         "max_track_err": float(np.max(pos_errors)) if pos_errors else 0.0,
         "n_waypoints": int(len(waypoints)),
         "gates": [_gate_record(g) for g in gates],
+        "scenario": scenario_meta,
     }
 
 

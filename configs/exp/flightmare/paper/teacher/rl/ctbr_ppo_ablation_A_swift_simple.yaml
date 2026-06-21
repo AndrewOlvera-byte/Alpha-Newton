@@ -1,0 +1,365 @@
+# =============================================================================
+# Teacher CTBR PPO — Ablation A: swift_v4, SIMPLE gate-count curriculum (control)
+# =============================================================================
+# Goal of the batch: find the best recipe to push a privileged state-only CTBR
+# teacher through 1 -> 2 -> 3 gate chaining on the NEW FAST PLANT
+# (omega_max_body [18,18,18], max_collective_thrust_g 5.5) and then toward
+# near-champion speed, for later distillation into vision/state-estimated students.
+#
+# Ablation axes across the batch (see rl/ctbr_ppo_ablation_{A,B,C}_*):
+#   A (this file): swift_v4 + v11-style simple metric-gated gate-count curriculum,
+#                  reset_mode=reference_state, NO trajectory replay / course-start
+#                  anchor, collapse_guard OFF. This is the CONTROL — it reproduces
+#                  the previously-working pattern on the fast plant.
+#   B: swift_v4 + v13-style trajectory-replay + persistent course-start anchor +
+#      restore_best_on_stage_transition + collapse_guard ON.  (curriculum-mechanism ablation)
+#   C: procedural+swift course_distribution, B's mechanism. (generalization ablation)
+#
+# Shared across A/B/C: BC v4 warm-start (proven ~82% single-gate at iter 0),
+# reward flightmare_racing_v3, identical PPO hyperparameters and plant. Only the
+# curriculum mechanism and course distribution change.
+#
+# Chaining-first, then-speed: reward stays v3; speed is pushed only via the
+# per-stage speed_limit_mps ramp + time_penalty in the final stage. A dedicated
+# champion-speed push (flightmare_racing_v6/v7) is a follow-up once chaining holds.
+#
+# Run:
+#   docker compose exec alpha-newton python -m src.entrypoints.train_ppo \
+#     --exp flightmare/paper/teacher/rl/ctbr_ppo_ablation_A_swift_simple
+
+run:
+  name: paper_teacher_ctbr_ppo_ablA_swift_simple
+  mode: ppo
+  seed: 0
+
+data:
+  type: flightmare_ppo_state
+  data_dir: data/flightmare/bc_v4
+  action_type: ctbr
+  obs_schema: v3
+  normalize_state: true
+  normalize_action: true
+  action_normalization: bounds
+
+robotics:
+  architecture:
+    type: flightmare_actor
+    mode: ppo
+    action_type: ctbr
+    bc_checkpoint: outputs/paper_ctbr_bc_v4/best/model.pt
+
+    fusion: swift
+    proprio_core_dim: 9
+    gate_dim: 24
+    aux_dim: 3
+    action_dim: 4
+    use_vision: false
+    include_prev_action: true
+
+    proprio_hidden_dim: 128
+    proprio_embed_dim: 128
+    gate_hidden_dim: 128
+    gate_embed_dim: 128
+    trunk_hidden_dim: 768
+    trunk_depth: 3
+    dropout: 0.05
+
+    head_hidden_dim: 256
+    head_depth: 2
+    state_dependent_std: false
+    init_log_std: -2.30
+    log_std_min: -4.0
+    log_std_max: -1.6
+    with_critic: true
+    critic_hidden_dim: 256
+    critic_depth: 2
+    bc_loss_type: gnll
+    action_clip: 1.35
+    squash_actions: false
+
+  ppo:
+    bc_checkpoint: outputs/paper_ctbr_bc_v4/best/model.pt
+    # Anti-collapse: if a curriculum transition lands on a degraded policy, snap
+    # back to the best checkpoint instead of carrying the regression forward.
+    resume_from: null
+    reset_best_on_resume: false
+    restore_best_on_stage_transition: true
+    action_type: ctbr
+
+    obs_schema: v3
+    backend: flightgym
+    render: false
+    scene: industrial
+
+    n_envs: 32
+    n_workers: 8
+    n_steps: 768
+    ppo_epochs: 3
+    minibatch_size: 4096
+    clip_eps: 0.06
+    vf_coeff: 0.5
+    ent_coeff: 0.0010
+    gamma: 0.997
+    gae_lambda: 0.95
+    # Hard global cap (can never run forever). Budget is weighted toward the
+    # 2- and 3-gate stages, which take much longer to solve than single-gate.
+    max_iterations: 12000
+    actor_lr: 1.6e-6
+    critic_lr: 1.0e-4
+    target_kl: 0.010
+
+    control_hz: 100.0
+    horizon: 1200
+
+    course_mode: swift_v4
+    num_gates: 7
+    gate_size: 1.6
+    gate_approach_m: 3.0
+    z_min: 1.0
+    fixed_gate_pos_noise: 0.00
+    fixed_gate_yaw_noise: 0.00
+    random_start_gate: false
+    reset_mode: reference_state
+    start_offset_m: 3.0
+    start_offset_range: [2.0, 4.5]
+    start_lateral_range_m: [0.0, 0.0]
+    start_vertical_range_m: [0.0, 0.0]
+    start_yaw_noise_rad: 0.0
+    start_speed_noise_mps: 0.0
+    reference_speed_mps: 3.0
+    goal_mode: pass_gate_i
+    goal_gate_span: null
+
+    gate_vehicle_radius: 0.20
+    max_world_radius: 350.0
+    min_z: -0.25
+    terminate_on_gate_miss: true
+    terminate_on_crash: true
+
+    max_body_rate: 8.0
+    max_collective_thrust_g: 5.5
+    action_clip: 1.35
+
+    plant:
+      mass: 0.73
+      arm_length: 0.17
+      inertia: [0.0025, 0.0021, 0.0043]
+      k_thrust: 1.91e-6
+      k_torque: 2.6e-7
+      motor_omega_min: 150.0
+      motor_omega_max: 3000.0
+      motor_tau: 0.0001
+      thrust_map: [1.3298253500372892e-06, 0.0038360810526746033, -1.7689986848125325]
+      kappa: 0.016
+      omega_max_body: [18.0, 18.0, 18.0]
+
+    reward_fn: flightmare_racing_v3
+    reward_kwargs:
+      gate_normal_progress_scale: 6.0
+      segment_progress_scale: 1.7
+      centerline_progress_scale: 3.2
+      centerline_error_penalty: 0.045
+      aperture_near_penalty: 0.85
+      aperture_near_m: 4.5
+      velocity_alignment_scale: 0.05
+      body_alignment_scale: 0.04
+      gate_pass_bonus: 26.0
+      segment_completion_bonus: 7.0
+      completion_bonus: 175.0
+      gate_miss_penalty: 95.0
+      crash_penalty: 110.0
+      no_progress_penalty: 0.10
+      backward_progress_penalty: 2.0
+      min_forward_velocity_mps: 0.75
+      stall_grace_steps: 25
+      time_penalty: 0.012
+      body_rate_penalty: 0.0010
+      action_smoothness_penalty: 0.010
+      vertical_speed_penalty: 0.0012
+      speed_limit_mps: 8.0
+      speed_limit_penalty: 0.08
+      max_progress_reward: 3.0
+      max_centerline_progress: 2.0
+      max_centerline_error: 6.0
+
+    # Anti-collapse net: if success AND gate-completion are both floored for
+    # `patience` consecutive rollouts, skip the destructive updates and restore
+    # the best checkpoint. Only active after iter 700 so early single-gate
+    # learning is never throttled.
+    collapse_guard:
+      enabled: true
+      after_iter: 700
+      patience: 4
+      min_success_rate: 0.24
+      max_gate_completion: 0.46
+      skip_update: true
+
+    # Advancement semantics for every stage below: advance EARLY once the stage's
+    # `advance_metric` holds above its threshold for `advance_patience` rollouts
+    # ("don't proceed unless it reaches an ok number"); otherwise `until_iter`
+    # acts as a HARD CAP (advance_on_timeout defaults true) so no stage can run
+    # forever. On any transition, restore_best_on_stage_transition snaps back to
+    # the best checkpoint so a timeout never carries a half-baked policy forward.
+    curriculum:
+      enabled: true
+      advance_metric: null
+      advance_threshold: 1.0
+      stages:
+        - name: s1_one_gate
+          until_iter: 600
+          advance_metric: success_rate
+          advance_threshold: 0.92
+          advance_after_iter: 250
+          advance_patience: 8
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5, 6]
+          start_offset_range: [2.0, 4.2]
+          start_lateral_range_m: [-0.15, 0.15]
+          start_vertical_range_m: [-0.10, 0.10]
+          start_yaw_noise_rad: 0.06
+          start_speed_noise_mps: 0.15
+          reference_speed_mps: 3.0
+          goal_mode: pass_gate_i
+          goal_gate_span: null
+          horizon: 650
+          max_collective_thrust_g: 5.2
+          max_body_rate: 8.0
+          ent_coeff_override: 0.0014
+          reward_kwargs:
+            time_penalty: 0.009
+            body_rate_penalty: 0.0012
+            action_smoothness_penalty: 0.011
+            speed_limit_mps: 7.5
+
+        - name: s2_two_gate
+          until_iter: 3200
+          advance_metric: success_rate
+          advance_threshold: 0.70
+          advance_after_iter: 1100
+          advance_patience: 10
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5]
+          start_offset_range: [2.0, 4.5]
+          start_lateral_range_m: [-0.20, 0.20]
+          start_vertical_range_m: [-0.15, 0.15]
+          start_yaw_noise_rad: 0.08
+          start_speed_noise_mps: 0.20
+          reference_speed_mps: 3.0
+          goal_mode: gate_i_to_i+1
+          goal_gate_span: null
+          horizon: 1050
+          max_collective_thrust_g: 5.35
+          max_body_rate: 8.0
+          ent_coeff_override: 0.0011
+          reward_kwargs:
+            centerline_progress_scale: 3.4
+            centerline_error_penalty: 0.045
+            time_penalty: 0.010
+            speed_limit_mps: 8.0
+
+        - name: s3_three_gate
+          until_iter: 7000
+          advance_metric: success_rate
+          advance_threshold: 0.60
+          advance_after_iter: 4200
+          advance_patience: 10
+          reset_mode: segment_window
+          start_gate_choices: [0, 1, 2, 3, 4]
+          start_offset_range: [2.0, 4.5]
+          start_lateral_range_m: [-0.20, 0.20]
+          start_vertical_range_m: [-0.15, 0.15]
+          start_yaw_noise_rad: 0.08
+          start_speed_noise_mps: 0.25
+          reference_speed_mps: 3.2
+          goal_mode: gate_i_to_i+2
+          goal_gate_span: null
+          horizon: 1400
+          max_collective_thrust_g: 5.4
+          max_body_rate: 8.0
+          ent_coeff_override: 0.0010
+          reward_kwargs:
+            centerline_progress_scale: 3.5
+            centerline_error_penalty: 0.048
+            time_penalty: 0.011
+            body_rate_penalty: 0.0009
+            speed_limit_mps: 8.5
+
+        - name: s4_four_gate
+          until_iter: 9500
+          advance_metric: success_rate
+          advance_threshold: 0.50
+          advance_after_iter: 7600
+          advance_patience: 8
+          reset_mode: segment_window
+          start_gate_choices: [0, 1, 2, 3]
+          start_offset_range: [2.0, 4.5]
+          start_lateral_range_m: [-0.20, 0.20]
+          start_vertical_range_m: [-0.15, 0.15]
+          start_yaw_noise_rad: 0.08
+          start_speed_noise_mps: 0.30
+          reference_speed_mps: 3.5
+          goal_mode: finish_remaining_course
+          goal_gate_span: 4
+          horizon: 1700
+          max_collective_thrust_g: 5.5
+          max_body_rate: 8.0
+          ent_coeff_override: 0.0009
+          reward_kwargs:
+            centerline_progress_scale: 3.5
+            centerline_error_penalty: 0.050
+            time_penalty: 0.012
+            body_rate_penalty: 0.0008
+            action_smoothness_penalty: 0.009
+            speed_limit_mps: 9.0
+
+        - name: s5_full_course_speed
+          until_iter: 12000
+          reset_mode: course_start
+          start_gate_choices: [0]
+          start_offset_range: [2.0, 4.5]
+          start_lateral_range_m: [0.0, 0.0]
+          start_vertical_range_m: [0.0, 0.0]
+          start_yaw_noise_rad: 0.0
+          start_speed_noise_mps: 0.0
+          reference_speed_mps: 3.5
+          goal_mode: finish_remaining_course
+          goal_gate_span: null
+          horizon: 2200
+          max_collective_thrust_g: 5.5
+          max_body_rate: 8.0
+          ent_coeff_override: 0.0008
+          reward_kwargs:
+            centerline_progress_scale: 3.3
+            centerline_error_penalty: 0.048
+            time_penalty: 0.013
+            body_rate_penalty: 0.0008
+            action_smoothness_penalty: 0.008
+            speed_limit_mps: 9.5
+
+training:
+  trainer_type: ppo_flightmare
+  max_grad_norm: 0.5
+  logging_steps: 1
+  save_steps: 50
+  save_total_limit: 100
+  save_final: true
+  save_optimizer_state: true
+  best_steps: 1
+  selection_metric: rollout_score
+  rollout_score_weights:
+    success_rate: 1.0
+    mean_goal_completion: 0.30
+    mean_gate_completion: 0.05
+    mean_speed_mps: 0.0
+    mean_reward: 0.0
+    mean_length: 0.0
+    stage_index: 0.12
+
+  bf16: false
+  output_dir: outputs/${run.name}
+
+wandb:
+  project: flightmare-ppo
+  entity: andrewolvera
+  run_name: ${run.name}
+  tags: [flightmare, ppo, state-only, ctbr, teacher, ablation, A, swift_v4, simple-curriculum, racing-plant, bc-v4]

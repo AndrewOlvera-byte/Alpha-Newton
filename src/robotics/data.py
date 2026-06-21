@@ -710,7 +710,10 @@ class FlightmareBCStateDataset(Dataset):
 
         action_key = f"action/{self.action_type}"
         action = torch.from_numpy(h[action_key][t]).float()
-        if t == 0:
+        prev_key = f"{action_key}_prev"
+        if prev_key in h:
+            prev_action = torch.from_numpy(h[prev_key][t]).float()
+        elif t == 0:
             prev_action = torch.zeros_like(action)
         else:
             prev_action = torch.from_numpy(h[action_key][t - 1]).float()
@@ -832,6 +835,7 @@ class FlightmareBCStateV3Dataset(Dataset):
         normalize_action: bool = True,
         action_normalization: Literal["auto", "standard", "bounds"] = "auto",
         preload: bool = True,
+        confidence_floor: float = 1.0,
     ):
         if action_type not in self.ACTION_TYPES:
             raise ValueError(f"action_type must be one of {self.ACTION_TYPES}, got {action_type!r}")
@@ -842,6 +846,10 @@ class FlightmareBCStateV3Dataset(Dataset):
         self.normalize_action = normalize_action
         self.action_normalization = action_normalization
         self.preload = preload
+        # When < 1.0, fold per-sample expert/confidence into the sample weight,
+        # clamped to [confidence_floor, 1.0]. Default 1.0 is a no-op (confidence
+        # never lowers the weight), preserving prior behavior for non-distill data.
+        self.confidence_floor = float(confidence_floor)
 
         with open(self.data_dir / "index.json") as f:
             manifest = json.load(f)
@@ -868,13 +876,27 @@ class FlightmareBCStateV3Dataset(Dataset):
             )
 
         self._episode_paths = [str(self.data_dir / e["path"]) for e in episodes]
+        self._episode_sample_kinds = [
+            str(e.get("sample_kind", "unknown") or "unknown") for e in episodes
+        ]
+        self._sample_kind_names: List[str] = []
+        self._sample_kind_to_id: Dict[str, int] = {}
         skip = int(manifest.get("skip_initial_frames", 0))
         self.skip_initial_frames = max(0, skip)
         self._index: List[tuple[int, int]] = []
+        sample_kind_ids: List[int] = []
         for ei, ep in enumerate(episodes):
+            kind = self._episode_sample_kinds[ei]
+            if kind not in self._sample_kind_to_id:
+                self._sample_kind_to_id[kind] = len(self._sample_kind_names)
+                self._sample_kind_names.append(kind)
+            kind_id = self._sample_kind_to_id[kind]
             T = int(ep["length"])
             t0 = min(self.skip_initial_frames, T)
+            n = max(0, T - t0)
             self._index.extend((ei, t) for t in range(t0, T))
+            sample_kind_ids.extend([kind_id] * n)
+        self._sample_kind_ids = torch.tensor(sample_kind_ids, dtype=torch.long)
 
         stats_path = self.data_dir / "norm_stats.npz"
         if not stats_path.exists():
@@ -911,6 +933,17 @@ class FlightmareBCStateV3Dataset(Dataset):
 
         self._handles: Dict[int, h5py.File] = {}
         self._owner_pid: Optional[int] = None
+        (
+            self._has_sample_weight,
+            self._has_expert_log_std,
+            self._has_confidence,
+        ) = self._scan_distill_fields()
+        # confidence is only consulted when the floor is below 1.0; treat it as a
+        # weight source so a sample_weight tensor is built even if expert/weight
+        # is absent.
+        self._use_confidence = self._has_confidence and self.confidence_floor < 1.0
+        if self._use_confidence:
+            self._has_sample_weight = True
 
         # Preload everything into flat tensors. The whole BC dataset is small
         # (~800k samples * ~50 floats = ~160 MB), and the model is tiny, so
@@ -920,8 +953,27 @@ class FlightmareBCStateV3Dataset(Dataset):
         self._pre_state: Optional[torch.Tensor] = None
         self._pre_prev: Optional[torch.Tensor] = None
         self._pre_action: Optional[torch.Tensor] = None
+        self._pre_weight: Optional[torch.Tensor] = None
+        self._pre_expert_log_std: Optional[torch.Tensor] = None
         if self.preload:
             self._build_preload(episodes)
+
+    def _scan_distill_fields(self) -> tuple[bool, bool, bool]:
+        has_weight = False
+        has_log_std = False
+        has_confidence = False
+        for path in self._episode_paths:
+            with h5py.File(path, "r", libver="latest") as h:
+                has_weight = has_weight or "expert/weight" in h
+                has_log_std = has_log_std or "expert/action_log_std" in h
+                has_confidence = has_confidence or "expert/confidence" in h
+            if has_weight and has_log_std and has_confidence:
+                break
+        return has_weight, has_log_std, has_confidence
+
+    def _confidence_factor(self, conf: np.ndarray) -> np.ndarray:
+        """Map raw expert confidence to a multiplicative weight in [floor, 1]."""
+        return np.clip(conf.astype(np.float32, copy=False), self.confidence_floor, 1.0)
 
     def _build_preload(self, episodes: list) -> None:
         proprio_blocks: List[np.ndarray] = []
@@ -929,6 +981,8 @@ class FlightmareBCStateV3Dataset(Dataset):
         aux_blocks: List[np.ndarray] = []
         action_blocks: List[np.ndarray] = []
         prev_action_blocks: List[np.ndarray] = []
+        weight_blocks: List[np.ndarray] = []
+        expert_log_std_blocks: List[np.ndarray] = []
         action_key = f"action/{self.action_type}"
         for ei, ep in enumerate(episodes):
             T = int(ep["length"])
@@ -941,13 +995,32 @@ class FlightmareBCStateV3Dataset(Dataset):
                 aux_blocks.append(h["obs/aux"][t0:T].astype(np.float32, copy=False))
                 a = h[action_key][:T].astype(np.float32, copy=False)
                 action_blocks.append(a[t0:T])
-                prev = np.empty_like(a[t0:T])
-                if t0 == 0:
-                    prev[0] = 0.0
-                    prev[1:] = a[: T - 1]
+                prev_key = f"{action_key}_prev"
+                if prev_key in h:
+                    prev = h[prev_key][t0:T].astype(np.float32, copy=False)
                 else:
-                    prev[:] = a[t0 - 1 : T - 1]
+                    prev = np.empty_like(a[t0:T])
+                    if t0 == 0:
+                        prev[0] = 0.0
+                        prev[1:] = a[: T - 1]
+                    else:
+                        prev[:] = a[t0 - 1 : T - 1]
                 prev_action_blocks.append(prev)
+                if self._has_sample_weight:
+                    if "expert/weight" in h:
+                        weight = h["expert/weight"][t0:T].astype(np.float32, copy=False)
+                    else:
+                        weight = np.ones((T - t0,), dtype=np.float32)
+                    if self._use_confidence and "expert/confidence" in h:
+                        conf = h["expert/confidence"][t0:T]
+                        weight = weight * self._confidence_factor(conf)
+                    weight_blocks.append(weight)
+                if self._has_expert_log_std:
+                    if "expert/action_log_std" in h:
+                        log_std = h["expert/action_log_std"][t0:T].astype(np.float32, copy=False)
+                    else:
+                        log_std = np.full((T - t0, self.action_dim), -2.0, dtype=np.float32)
+                    expert_log_std_blocks.append(log_std)
 
         proprio = torch.from_numpy(np.concatenate(proprio_blocks, axis=0))
         gate = torch.from_numpy(np.concatenate(gate_blocks, axis=0))
@@ -971,6 +1044,12 @@ class FlightmareBCStateV3Dataset(Dataset):
         self._pre_state = torch.cat([proprio, gate, aux], dim=1).contiguous()
         self._pre_prev = prev_action.contiguous()
         self._pre_action = action.contiguous()
+        if self._has_sample_weight:
+            self._pre_weight = torch.from_numpy(np.concatenate(weight_blocks, axis=0)).float().contiguous()
+        if self._has_expert_log_std:
+            self._pre_expert_log_std = (
+                torch.from_numpy(np.concatenate(expert_log_std_blocks, axis=0)).float().contiguous()
+            )
         N = self._pre_state.shape[0]
         if N != len(self._index):
             # Replace index with simple [0..N) since preload already applied skip.
@@ -990,6 +1069,56 @@ class FlightmareBCStateV3Dataset(Dataset):
         if self._pre_state is not None:
             return self._pre_state.shape[0]
         return len(self._index)
+
+    @property
+    def sample_kind_names(self) -> list[str]:
+        return list(self._sample_kind_names)
+
+    def sample_kind_counts(self) -> dict[str, int]:
+        if self._sample_kind_ids.numel() == 0:
+            return {}
+        counts = torch.bincount(self._sample_kind_ids, minlength=len(self._sample_kind_names))
+        return {
+            name: int(counts[i].item())
+            for i, name in enumerate(self._sample_kind_names)
+            if int(counts[i].item()) > 0
+        }
+
+    def sampling_weights_for_sample_kind_mix(
+        self,
+        target_mix: dict[str, float],
+        *,
+        min_weight: float = 0.0,
+    ) -> torch.Tensor:
+        """Per-sample weights for WeightedRandomSampler.
+
+        ``target_mix`` is a desired sample-kind probability distribution, e.g.
+        ``{"dagger": 0.65, "synthetic_recovery": 0.20, "expert": 0.15}``.
+        The returned weights are inverse-frequency scaled so replacement
+        sampling yields the requested mix in expectation.
+        """
+        if self._sample_kind_ids.numel() != len(self):
+            raise RuntimeError("sample kind metadata is out of sync with dataset length.")
+        counts = torch.bincount(self._sample_kind_ids, minlength=len(self._sample_kind_names)).float()
+        targets = torch.zeros(len(self._sample_kind_names), dtype=torch.float32)
+        total_target = 0.0
+        for name, value in (target_mix or {}).items():
+            if name not in self._sample_kind_to_id:
+                continue
+            v = max(0.0, float(value))
+            targets[self._sample_kind_to_id[name]] = v
+            total_target += v
+        if total_target <= 0.0:
+            raise ValueError(
+                f"sample_kind_balancing target_mix has no kinds present in dataset; "
+                f"available={self.sample_kind_names}"
+            )
+        targets = targets / total_target
+        per_kind = torch.zeros_like(targets)
+        present = counts > 0
+        per_kind[present] = targets[present] / torch.clamp(counts[present], min=1.0)
+        weights = per_kind[self._sample_kind_ids]
+        return torch.clamp(weights, min=float(min_weight))
 
     def _get_handle(self, ep_idx: int) -> h5py.File:
         pid = os.getpid()
@@ -1015,16 +1144,26 @@ class FlightmareBCStateV3Dataset(Dataset):
         states = torch.stack([b["state"] for b in batch], dim=0)
         prevs = torch.stack([b["prev_actions"] for b in batch], dim=0)
         acts = torch.stack([b["action"] for b in batch], dim=0)
-        return {"images": {}, "state": states, "prev_actions": prevs, "action": acts}
+        out = {"images": {}, "state": states, "prev_actions": prevs, "action": acts}
+        if "sample_weight" in batch[0]:
+            out["sample_weight"] = torch.stack([b["sample_weight"] for b in batch], dim=0)
+        if "expert_log_std" in batch[0]:
+            out["expert_log_std"] = torch.stack([b["expert_log_std"] for b in batch], dim=0)
+        return out
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         if self._pre_state is not None:
-            return {
+            out = {
                 "images": {},
                 "state": self._pre_state[idx],
                 "prev_actions": self._pre_prev[idx],
                 "action": self._pre_action[idx],
             }
+            if self._pre_weight is not None:
+                out["sample_weight"] = self._pre_weight[idx]
+            if self._pre_expert_log_std is not None:
+                out["expert_log_std"] = self._pre_expert_log_std[idx]
+            return out
         ep_idx, t = self._index[idx]
         h = self._get_handle(ep_idx)
 
@@ -1038,7 +1177,10 @@ class FlightmareBCStateV3Dataset(Dataset):
 
         action_key = f"action/{self.action_type}"
         action = torch.from_numpy(h[action_key][t]).float()
-        if t == 0:
+        prev_key = f"{action_key}_prev"
+        if prev_key in h:
+            prev_action = torch.from_numpy(h[prev_key][t]).float()
+        elif t == 0:
             prev_action = torch.zeros_like(action)
         else:
             prev_action = torch.from_numpy(h[action_key][t - 1]).float()
@@ -1056,12 +1198,23 @@ class FlightmareBCStateV3Dataset(Dataset):
         # one tensor here keeps the rollout collector / history buffer paths
         # unchanged from the v2 schema.
         state = torch.cat([proprio, gate, aux], dim=0)
-        return {
+        out = {
             "images": {},
             "state": state,
             "prev_actions": prev_action,
             "action": action,
         }
+        if self._has_sample_weight:
+            w = float(h["expert/weight"][t]) if "expert/weight" in h else 1.0
+            if self._use_confidence and "expert/confidence" in h:
+                w *= float(self._confidence_factor(np.asarray(h["expert/confidence"][t])))
+            out["sample_weight"] = torch.tensor(w, dtype=torch.float32)
+        if self._has_expert_log_std:
+            if "expert/action_log_std" in h:
+                out["expert_log_std"] = torch.from_numpy(h["expert/action_log_std"][t]).float()
+            else:
+                out["expert_log_std"] = torch.full((self.action_dim,), -2.0, dtype=torch.float32)
+        return out
 
     @property
     def task_id(self) -> int:
@@ -1080,6 +1233,7 @@ def build_flightmare_bc_state_v3(
     normalize_action: bool = True,
     action_normalization: Literal["auto", "standard", "bounds"] = "auto",
     preload: bool = True,
+    confidence_floor: float = 1.0,
     **_: Any,
 ) -> Dict[str, Any]:
     """Build train/val Swift-obs-v3 Flightmare BC datasets."""
@@ -1090,6 +1244,7 @@ def build_flightmare_bc_state_v3(
         normalize_action=normalize_action,
         action_normalization=action_normalization,
         preload=preload,
+        confidence_floor=confidence_floor,
     )
     train_ds = FlightmareBCStateV3Dataset(split="train", **common)
     try:

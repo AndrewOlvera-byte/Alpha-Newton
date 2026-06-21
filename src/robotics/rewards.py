@@ -293,7 +293,7 @@ def flightmare_racing_v1(
         r -= float(gate_centering_penalty) * near * center_err
         r -= float(gate_violation_penalty) * near * aperture_violation
 
-    if info.get("gate_passed", False):
+    if info.get("reward_gate_passed", info.get("gate_passed", False)):
         margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
         r += float(gate_pass_bonus) + 2.0 * margin
     if info.get("success", False):
@@ -391,7 +391,7 @@ def flightmare_racing_v2(
             low = max(0.05 - float(a[0]), 0.0)
             terms["thrust_saturation"] = -float(thrust_saturation_penalty) * (low * low + high * high)
 
-    if info.get("gate_passed", False):
+    if info.get("reward_gate_passed", info.get("gate_passed", False)):
         margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
         terms["gate_pass"] = float(gate_pass_bonus) + 2.0 * margin
         terms["segment_complete"] = float(segment_completion_bonus)
@@ -437,6 +437,8 @@ def flightmare_racing_v3(
     body_rate_penalty: float = 0.0007,
     action_smoothness_penalty: float = 0.006,
     vertical_speed_penalty: float = 0.001,
+    speed_limit_mps: float | None = None,
+    speed_limit_penalty: float = 0.0,
     thrust_saturation_penalty: float = 0.0,
     max_progress_reward: float = 3.0,
     max_centerline_progress: float = 2.0,
@@ -500,6 +502,10 @@ def flightmare_racing_v3(
 
     vz = float(info.get("vertical_speed_mps", 0.0))
     terms["vertical_speed"] = -float(vertical_speed_penalty) * vz * vz
+    if speed_limit_mps is not None and speed_limit_penalty > 0.0:
+        speed = float(info.get("speed_mps", 0.0))
+        excess = max(0.0, speed - float(speed_limit_mps))
+        terms["speed_limit"] = -float(speed_limit_penalty) * excess * excess
 
     omega = info.get("omega")
     if omega is not None:
@@ -518,7 +524,7 @@ def flightmare_racing_v3(
             low = max(0.05 - float(a[0]), 0.0)
             terms["thrust_saturation"] = -float(thrust_saturation_penalty) * (low * low + high * high)
 
-    if info.get("gate_passed", False):
+    if info.get("reward_gate_passed", info.get("gate_passed", False)):
         margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
         terms["gate_pass"] = float(gate_pass_bonus) + 2.0 * margin
         terms["segment_complete"] = float(segment_completion_bonus)
@@ -658,7 +664,7 @@ def flightmare_racing_v4_speed(
             low = max(0.03 - float(a[0]), 0.0)
             terms["thrust_saturation"] = -float(thrust_saturation_penalty) * (low * low + high * high)
 
-    if info.get("gate_passed", False):
+    if info.get("reward_gate_passed", info.get("gate_passed", False)):
         margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
         pass_speed = min(max(0.0, forward_speed), float(gate_pass_speed_cap_mps))
         terms["gate_pass"] = float(gate_pass_bonus) + 1.5 * margin
@@ -793,7 +799,7 @@ def flightmare_racing_v5_min_time(
             low = max(0.02 - float(a[0]), 0.0)
             terms["thrust_saturation"] = -float(thrust_saturation_penalty) * (low * low + high * high)
 
-    if info.get("gate_passed", False):
+    if info.get("reward_gate_passed", info.get("gate_passed", False)):
         margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
         terms["gate_pass"] = float(gate_pass_bonus) + float(gate_margin_bonus_scale) * margin
         terms["segment_complete"] = float(segment_completion_bonus)
@@ -948,7 +954,7 @@ def flightmare_racing_v6_champion_lap(
             low = max(0.04 - float(a[0]), 0.0)
             terms["thrust_saturation"] = -float(thrust_saturation_penalty) * (low * low + high * high)
 
-    if info.get("gate_passed", False):
+    if info.get("reward_gate_passed", info.get("gate_passed", False)):
         margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
         pass_speed = min(max(0.0, forward_speed), float(gate_pass_speed_cap_mps))
         margin_quality = float(np.clip(margin / 0.35, 0.0, 1.0))
@@ -1125,7 +1131,7 @@ def flightmare_racing_v7_guarded_time_trial(
             low = max(0.025 - float(a[0]), 0.0)
             terms["thrust_saturation"] = -float(thrust_saturation_penalty) * (low * low + high * high)
 
-    if info.get("gate_passed", False):
+    if info.get("reward_gate_passed", info.get("gate_passed", False)):
         margin = max(0.0, float(info.get("gate_margin_m", 0.0)))
         pass_speed = min(max(0.0, forward_speed), float(gate_pass_speed_cap_mps))
         margin_quality = float(np.clip(margin / 0.35, 0.0, 1.0))

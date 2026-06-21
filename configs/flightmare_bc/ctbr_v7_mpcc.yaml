@@ -1,0 +1,136 @@
+# v7 Flightmare BC collection with the MPPI MPC expert (high-speed labels).
+#
+# Same procedural scenario distribution + racing plant as ctbr_v7.yaml, but the
+# expert is the sampling-based MPPI controller (src.robotics.flightmare_experts)
+# which plans over a horizon under the body-rate/thrust limits and therefore
+# produces dynamically-feasible high-speed labels (accelerate on straights,
+# brake into gates) rather than instantaneous P-tracking.
+#
+# High-speed collection is gated: the per-scenario controller preflight must
+# pass before any labels are written. Tune speed_range / min_success_rate to the
+# envelope where the MPPI expert clears every scenario family in Flightmare.
+version: 2
+output_dir: data/flightmare/bc_v7_mpcc
+episodes: 4000
+seed: 0
+val_frac: 0.1
+
+image_size: 224
+cameras: []
+render: false
+backend: flightgym
+scene: industrial
+control_hz: 100.0
+max_steps: 5000
+max_world_radius: 350.0
+action_normalization: bounds
+skip_initial_frames: 0
+bounds_margin: 0.10
+min_gate_completion: 0.99
+gate_vehicle_radius: 0.20
+z_min: 1.0
+
+plant:
+  mass: 0.73
+  arm_length: 0.17
+  inertia: [0.0025, 0.0021, 0.0043]
+  k_thrust: 1.91e-6
+  k_torque: 2.6e-7
+  motor_omega_min: 150.0
+  motor_omega_max: 3000.0
+  motor_tau: 0.0001
+  thrust_map: [1.3298253500372892e-06, 0.0038360810526746033, -1.7689986848125325]
+  kappa: 0.016
+  omega_max_body: [18.0, 18.0, 18.0]
+  max_collective_thrust_g: 5.5
+
+course:
+  course_mode: swift_v4
+  num_gates: 7
+  gate_size: 1.6
+  gate_approach_m: 3.0
+  fixed_gate_pos_noise: 0.20
+  fixed_gate_yaw_noise: 0.05
+  random_start_gate: true
+
+course_distribution:
+  max_resample_tries: 24
+  bounds:
+    arena_radius: 80.0
+    z_min: 1.0
+    z_max: 6.0
+    min_gate_clearance_m: 0.8
+    min_consecutive_m: 7.0
+    max_consecutive_m: 16.0
+    max_climb_angle_rad: 1.0472
+    max_heading_change_rad: 1.7453
+    total_length_range: [40.0, 135.0]
+    vehicle_radius: 0.20
+  scenarios:
+    # Non-straight: meaningful per-gate heading change + lateral jitter so the
+    # teacher learns to turn, not just track a corridor. Bounds (min_consecutive_m,
+    # max_heading_change_rad, total_length_range) keep courses flyable + race-length.
+    - {name: flow_upright, family: procedural_flow, weight: 0.30, num_gates_range: [5, 7], spacing_range: [10.0, 13.0], z_range: [1.8, 4.0], gate_size: 1.6, gate_approach_m: 3.0, heading_step_range: [0.12, 0.45], lateral_jitter_m: 1.4, pos_noise_xyz: [0.12, 0.12, 0.08], yaw_noise_rad: 0.04}
+    - {name: chicane, family: procedural_chicane, weight: 0.20, num_gates_range: [5, 7], spacing_range: [10.0, 13.0], z_range: [1.8, 3.5], gate_size: 1.6, gate_approach_m: 3.0, heading_step_range: [0.35, 0.60], lateral_jitter_m: 1.0, pos_noise_xyz: [0.12, 0.12, 0.08], yaw_noise_rad: 0.04}
+    - {name: split_s, family: procedural_split_s, weight: 0.20, num_gates_range: [6, 7], spacing_range: [10.0, 13.0], z_range: [2.0, 4.5], gate_size: 1.6, gate_approach_m: 3.0, num_inverted_range: [1, 1], inverted_roll_jitter_rad: 0.2618, pos_noise_xyz: [0.12, 0.12, 0.08], yaw_noise_rad: 0.04}
+    - {name: mixed_inverted, family: mixed_inverted, weight: 0.15, num_gates_range: [5, 7], spacing_range: [10.0, 13.0], z_range: [2.0, 4.5], gate_size: 1.6, gate_approach_m: 3.0, num_inverted_range: [0, 2], inverted_roll_jitter_rad: 0.2618, pos_noise_xyz: [0.12, 0.12, 0.08], yaw_noise_rad: 0.04}
+    - {name: swift_v4_canonical, family: swift_v4_canonical, weight: 0.07, num_gates_range: [7, 7], gate_size: 1.6, gate_approach_m: 3.0, num_inverted_range: [1, 1], random_direction: false}
+    - {name: swift_v4_noisy, family: swift_v4_noisy, weight: 0.08, num_gates_range: [7, 7], gate_size: 1.6, gate_approach_m: 3.0, num_inverted_range: [1, 1], inverted_roll_jitter_rad: 0.2618, pos_noise_xyz: [0.20, 0.20, 0.15], yaw_noise_rad: 0.05, random_direction: false}
+
+expert:
+  controller: mpcc          # selects the MPPI backend (src.robotics.flightmare_experts)
+  speed_range: [3.0, 5.0]   # high-speed envelope (MPPI plans over the horizon)
+  lookahead_s: 0.30
+  trajectory_min_segment_s: 0.50
+  gains:                    # used for the motor-label mixer only
+    kp_pos: [6.0, 6.0, 18.0]
+    kd_pos: [4.0, 4.0, 11.0]
+    kp_att: [10.0, 10.0, 4.0]
+    kp_rate: [28.0, 28.0, 12.0]
+
+mpcc:
+  enabled: true
+  backend: mppi
+  mppi:
+    horizon: 25
+    num_samples: 384
+    dt: 0.01
+    temperature: 0.4
+    noise_std: [0.05, 2.2, 2.2, 1.2]
+    max_body_rate: 18.0
+
+# Gate every scenario family before writing high-speed labels. Tune the
+# thresholds/speed to the envelope the MPPI expert clears in Flightmare.
+controller_eval:
+  enabled: true
+  episodes: 6
+  speed_bins: 2
+  min_success_rate: 0.9
+  min_gate_completion: 0.95
+
+# MPPI is the high-quality source; lean on closed-loop expert episodes.
+mix:
+  expert: 0.70
+  synthetic_recovery: 0.30
+  dagger: 0.0
+
+recovery:
+  samples_per_episode: 512
+  gate_transition_probability: 0.60
+  post_gate_probability: 0.45
+  lateral_offset_m: [-1.2, 1.2]
+  vertical_offset_m: [-0.7, 0.7]
+  forward_offset_m: [-1.5, 2.0]
+  yaw_error_rad: [-0.9, 0.9]
+  velocity_error_mps: [-2.5, 2.5]
+  omega_error_radps: [-4.0, 4.0]
+  prev_action_noise: [0.04, 1.0, 1.0, 0.5]
+
+dagger:
+  enabled: false
+
+postprocess:
+  transform_to_v3: true
+  recompute_v3_norm_stats: true
+  diag_v3_geometry: true
+  diag_episodes: 20

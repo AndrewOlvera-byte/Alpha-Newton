@@ -55,6 +55,7 @@ class Config:
     topk_eval: Dict[str, Any] = None  # Top-K checkpoint callback config
     peft: Dict[str, Any] = None  # PEFT/LoRA config
     robotics: Dict[str, Any] = None  # Robotics BC/RL config
+    distill: Dict[str, Any] = None  # Robotics distillation / DAgger config
 
     @classmethod
     def load(cls, path: str | Path, base_configs: List[str | Path] = None):
@@ -74,7 +75,19 @@ class Config:
 
         merged = interpolate_variables(merged)
 
-        known_fields = {'run', 'model', 'tokenizer', 'data', 'training', 'wandb', 'grpo', 'topk_eval', 'peft', 'robotics'}
+        known_fields = {
+            'run',
+            'model',
+            'tokenizer',
+            'data',
+            'training',
+            'wandb',
+            'grpo',
+            'topk_eval',
+            'peft',
+            'robotics',
+            'distill',
+        }
         filtered = {k: v for k, v in merged.items() if k in known_fields}
 
         return cls(**filtered)
@@ -94,7 +107,7 @@ class Config:
         base_configs = [common_path]
         if mode == "rlvr" and rlvr_path.exists():
             base_configs.append(rlvr_path)
-        elif mode in {"bc", "ppo"} and robotics_path.exists():
+        elif mode in {"bc", "ppo", "distill"} and robotics_path.exists():
             base_configs.append(robotics_path)
 
         return cls.load(exp_path, base_configs=base_configs)

@@ -30,12 +30,22 @@ def _stage_overrides(cfg: Config, stage_name: str | None) -> dict[str, Any]:
     if not stage_name:
         return {}
     stages = ((ppo.get("curriculum", {}) or {}).get("stages", []) or [])
+    curriculum_keys = {
+        "name",
+        "until_iter",
+        "advance_metric",
+        "advance_threshold",
+        "advance_after_iter",
+        "advance_after_stage_iters",
+        "advance_patience",
+        "advance_on_timeout",
+        "duration_iters",
+        "ent_coeff_override",
+        "actor_lr_override",
+    }
     for raw in stages:
         if str(raw.get("name")) == stage_name:
-            return {
-                k: v for k, v in dict(raw).items()
-                if k not in {"name", "until_iter", "ent_coeff_override"}
-            }
+            return {k: v for k, v in dict(raw).items() if k not in curriculum_keys}
     raise SystemExit(f"stage {stage_name!r} not found")
 
 
@@ -60,6 +70,7 @@ def _base_env_kwargs(cfg: Config) -> dict[str, Any]:
         "gate_layout": ppo.get("gate_layout"),
         "random_start_gate": ppo.get("random_start_gate", False),
         "fixed_gate_pos_noise": ppo.get("fixed_gate_pos_noise", 0.0),
+        "fixed_gate_pos_noise_xyz": ppo.get("fixed_gate_pos_noise_xyz"),
         "fixed_gate_yaw_noise": ppo.get("fixed_gate_yaw_noise", 0.0),
         "num_gates": ppo.get("num_gates", 7),
         "gate_spacing_range": ppo.get("gate_spacing_range", [4.0, 9.0]),
@@ -69,6 +80,7 @@ def _base_env_kwargs(cfg: Config) -> dict[str, Any]:
         "gate_yaw_noise": ppo.get("gate_yaw_noise", 0.25),
         "gate_size": ppo.get("gate_size", 1.0),
         "gate_approach_m": ppo.get("gate_approach_m", 1.2),
+        "inverted_roll_jitter_rad": ppo.get("inverted_roll_jitter_rad", 0.2618),
         "z_min": ppo.get("z_min", 1.0),
         "gate_vehicle_radius": ppo.get("gate_vehicle_radius", 0.15),
         "max_world_radius": ppo.get("max_world_radius", 120.0),
@@ -80,19 +92,63 @@ def _base_env_kwargs(cfg: Config) -> dict[str, Any]:
         "max_body_rate": ppo.get("max_body_rate", 8.0),
         "max_waypoint_speed": ppo.get("max_waypoint_speed", 15.0),
         "max_collective_thrust_g": ppo.get("max_collective_thrust_g", 4.0),
+        "plant": ppo.get("plant"),
+        "action_bounds_override": ppo.get("action_bounds_override"),
         "reset_mode": ppo.get("reset_mode", "course_start"),
+        "course_start_sample_prob": ppo.get("course_start_sample_prob", 0.0),
         "start_gate_index": ppo.get("start_gate_index"),
         "start_gate_choices": ppo.get("start_gate_choices"),
         "start_offset_m": ppo.get("start_offset_m", 3.0),
         "start_offset_range": ppo.get("start_offset_range"),
+        "start_lateral_range_m": ppo.get("start_lateral_range_m"),
+        "start_vertical_range_m": ppo.get("start_vertical_range_m"),
+        "start_yaw_noise_rad": ppo.get("start_yaw_noise_rad", 0.0),
+        "start_speed_noise_mps": ppo.get("start_speed_noise_mps", 0.0),
         "reference_speed_mps": ppo.get("reference_speed_mps", 4.0),
         "goal_mode": ppo.get("goal_mode", "finish_remaining_course"),
         "goal_gate_span": ppo.get("goal_gate_span"),
+        "post_pass_success_steps": ppo.get("post_pass_success_steps", 0),
+        "post_pass_max_speed_mps": ppo.get("post_pass_max_speed_mps"),
+        "post_pass_max_body_rate": ppo.get("post_pass_max_body_rate"),
+        "post_pass_max_center_error_norm": ppo.get("post_pass_max_center_error_norm"),
+        "post_pass_min_gate_signed_distance_m": ppo.get("post_pass_min_gate_signed_distance_m"),
+        "trajectory_replay_capacity_per_gate": ppo.get("trajectory_replay_capacity_per_gate", 0),
+        "trajectory_replay_sample_prob": ppo.get("trajectory_replay_sample_prob", 0.0),
+        "trajectory_replay_min_samples_per_gate": ppo.get("trajectory_replay_min_samples_per_gate", 1),
+        "trajectory_replay_pos_noise_m": ppo.get("trajectory_replay_pos_noise_m", 0.0),
+        "trajectory_replay_vel_noise_mps": ppo.get("trajectory_replay_vel_noise_mps", 0.0),
+        "trajectory_replay_omega_noise_radps": ppo.get("trajectory_replay_omega_noise_radps", 0.0),
+        "trajectory_replay_yaw_noise_rad": ppo.get("trajectory_replay_yaw_noise_rad", 0.0),
         "action_clip": ppo.get(
             "action_clip",
             ((cfg.robotics or {}).get("architecture", {}) or {}).get("action_clip", 5.0),
         ),
     }
+
+
+def _merge_stage_env_kwargs(base: dict[str, Any], stage: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    stage = dict(stage)
+    reward_overrides = stage.pop("reward_kwargs", None)
+    plant_overrides = stage.pop("plant", None)
+    bounds_overrides = stage.pop("action_bounds_override", None)
+    merged.update(stage)
+    if reward_overrides is not None:
+        merged["reward_kwargs"] = {
+            **(base.get("reward_kwargs", {}) or {}),
+            **(reward_overrides or {}),
+        }
+    if plant_overrides is not None:
+        merged["plant"] = {
+            **(base.get("plant") or {}),
+            **(plant_overrides or {}),
+        }
+    if bounds_overrides is not None:
+        merged["action_bounds_override"] = {
+            **(base.get("action_bounds_override") or {}),
+            **(bounds_overrides or {}),
+        }
+    return merged
 
 
 def _load_state_dict(path: Path) -> dict[str, torch.Tensor]:
@@ -143,8 +199,7 @@ def run_one(
     start_gate: int | None,
     device: torch.device,
 ) -> None:
-    kwargs = _base_env_kwargs(cfg)
-    kwargs.update(_stage_overrides(cfg, stage_name))
+    kwargs = _merge_stage_env_kwargs(_base_env_kwargs(cfg), _stage_overrides(cfg, stage_name))
     if start_gate is not None:
         kwargs["start_gate_index"] = int(start_gate)
         kwargs["start_gate_choices"] = [int(start_gate)]

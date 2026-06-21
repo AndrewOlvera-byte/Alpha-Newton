@@ -44,6 +44,13 @@ from src.robotics.flightmare_autonomy_fsw.plotting import (
     summarize_results,
     write_stats_json,
 )
+from src.robotics.flightmare_policy_eval import (
+    apply_plant_overrides,
+    manifest_gate_size,
+    manifest_num_gates,
+    manifest_thrust_g,
+    plant_config_from_manifest,
+)
 from src.robotics.models.flightmare.MissionWrapper import MissionWrapper
 
 # Register Flightmare architecture builders.
@@ -153,26 +160,19 @@ def _manifest_first_gates(manifest: dict) -> list[dict]:
 
 
 def _manifest_num_gates(manifest: dict, default: int) -> int:
-    gates = _manifest_first_gates(manifest)
-    return len(gates) if gates else int(default)
+    return manifest_num_gates(manifest, default)
 
 
 def _manifest_gate_size(manifest: dict, default: float) -> float:
-    gates = _manifest_first_gates(manifest)
-    if not gates:
-        return float(default)
-    size = gates[0].get("size", default)
-    if isinstance(size, list):
-        return float(size[0])
-    return float(size)
+    return manifest_gate_size(manifest, default)
 
 
 def _manifest_thrust_g(manifest: dict, default: float) -> float:
-    params = manifest.get("params", {}) or {}
-    try:
-        return float(params["max_collective_thrust"]) / (float(params["mass"]) * float(params["g"]))
-    except Exception:
-        return float(default)
+    return manifest_thrust_g(manifest, default)
+
+
+def _apply_plant_overrides(params: QuadParams, plant: dict | None) -> QuadParams:
+    return apply_plant_overrides(params, plant)
 
 
 def _print_episode(result) -> None:
@@ -336,8 +336,15 @@ def main() -> None:
     mission_wrapper.set_dt(1.0 / float(control_hz))
     print(f"[Obs]    schema={obs_schema}")
 
-    params = QuadParams()
+    plant_cfg = ppo_cfg.get("plant") or plant_config_from_manifest(dataset_manifest)
+    params = _apply_plant_overrides(QuadParams(), plant_cfg)
     params.max_collective_thrust = max_collective_thrust_g * params.mass * params.g
+    print(
+        "[Plant]  "
+        f"mass={params.mass:.3f} inertia={tuple(float(x) for x in params.inertia)} "
+        f"omega_max_body={tuple(float(x) for x in params.omega_max_body)}",
+        flush=True,
+    )
     course_config = CourseConfig(
         course_mode=course_mode,
         num_gates=num_gates,
@@ -457,6 +464,17 @@ def main() -> None:
         "max_waypoint_speed": max_waypoint_speed,
         "max_body_rate": max_body_rate,
         "max_collective_thrust_g": max_collective_thrust_g,
+        "plant": {
+            "mass": float(params.mass),
+            "arm_length": float(params.arm_length),
+            "inertia": [float(x) for x in params.inertia],
+            "motor_omega_min": float(params.motor_omega_min),
+            "motor_omega_max": float(params.motor_omega_max),
+            "motor_tau": float(params.motor_tau),
+            "thrust_map": [float(x) for x in params.thrust_map],
+            "kappa": float(params.kappa),
+            "omega_max_body": [float(x) for x in params.omega_max_body],
+        },
         "seed": args.seed,
         "course": {
             "course_mode": course_mode,

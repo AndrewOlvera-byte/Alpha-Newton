@@ -1,0 +1,25 @@
+time="2026-06-21T00:55:19-04:00" level=warning msg="The \"WANDB_API_KEY\" variable is not set. Defaulting to a blank string."
+CONTRIBUTING.md
+Dockerfile
+LICENSE
+README.md
+cache
+configs
+data
+docker-compose.yaml
+experiments
+held_out
+logs
+nohup.out
+outputs
+papers
+requirements
+requirements.txt
+scratch
+scripts
+setup.py
+src
+tea_debug.log
+tests
+tools
+wandb

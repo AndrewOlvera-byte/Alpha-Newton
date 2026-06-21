@@ -220,6 +220,9 @@ class _FlightgymImpl:
         self._runtime_root = Path(tempfile.mkdtemp(prefix="flightmare_cfg_"))
         cfg_dir = self._runtime_root / "flightlib" / "configs"
         cfg_dir.mkdir(parents=True, exist_ok=True)
+        omega_cap = tuple(float(x) for x in getattr(params, "omega_max_body", (6.0, 6.0, 6.0)))
+        tmap = tuple(float(x) for x in getattr(params, "thrust_map",
+                     (1.3298253500372892e-06, 0.0038360810526746033, -1.7689986848125325)))
         (cfg_dir / "quadrotor_env.yaml").write_text(f"""
 quadrotor_env:
    camera: no
@@ -230,12 +233,12 @@ quadrotor_env:
 quadrotor_dynamics:
   mass: {float(params.mass)}
   arm_l: {float(params.arm_length)}
-  motor_omega_min: 150.0
-  motor_omega_max: 3000.0
-  motor_tau: 0.0001
-  thrust_map: [1.3298253500372892e-06, 0.0038360810526746033, -1.7689986848125325]
-  kappa: 0.016
-  omega_max: [6.0, 6.0, 6.0]
+  motor_omega_min: {float(getattr(params, "motor_omega_min", 150.0))}
+  motor_omega_max: {float(getattr(params, "motor_omega_max", 3000.0))}
+  motor_tau: {float(getattr(params, "motor_tau", 0.0001))}
+  thrust_map: [{tmap[0]}, {tmap[1]}, {tmap[2]}]
+  kappa: {float(getattr(params, "kappa", 0.016))}
+  omega_max: [{omega_cap[0]}, {omega_cap[1]}, {omega_cap[2]}]
 
 rl:
   pos_coeff: -0.002

@@ -154,7 +154,10 @@ class FlightmareBCDataset(Dataset):
         state = torch.from_numpy(h["obs/state"][t]).float()
         action_key = f"action/{self.action_type}"
         action = torch.from_numpy(h[action_key][t]).float()
-        if t == 0:
+        prev_key = f"{action_key}_prev"
+        if prev_key in h:
+            prev_action = torch.from_numpy(h[prev_key][t]).float()
+        elif t == 0:
             prev_action = torch.zeros_like(action)
         else:
             prev_action = torch.from_numpy(h[action_key][t - 1]).float()

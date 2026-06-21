@@ -1,0 +1,380 @@
+# Teacher CTBR PPO stage2 v7 - resume from the controlled v7 recovery point
+# and build a slower, alignment-heavy bridge into two-gate flight.
+#
+# Pickup point:
+#   outputs/paper_teacher_ctbr_stage12_v7_ppo/checkpoint-1050/model.pt
+# was the last clean checkpoint before the survival bridge learned the
+# high-speed half-solution: success=100%, misses=0, crashes=0,
+# mean_speed=4.38 m/s, max_speed=7.92 m/s.
+#
+# This config intentionally does not use `resume_from`; the PPO optimizer and
+# best-score bookkeeping start fresh while the actor/critic weights are loaded
+# from the checkpoint above through the normal bc_checkpoint path.
+#
+# Run:
+#   docker compose exec alpha-newton python -m src.entrypoints.train_ppo \
+#     --exp flightmare/paper/teacher/ctbr_stage2_v7_ppo
+
+run:
+  name: paper_teacher_ctbr_stage2_v7_ppo
+  mode: ppo
+  seed: 0
+
+data:
+  type: flightmare_ppo_state
+  data_dir: data/flightmare/bc_v5
+  action_type: ctbr
+  obs_schema: v3
+  normalize_state: true
+  normalize_action: true
+  action_normalization: bounds
+
+robotics:
+  architecture:
+    type: flightmare_actor
+    mode: ppo
+    action_type: ctbr
+    bc_checkpoint: outputs/paper_teacher_ctbr_stage12_v7_ppo/checkpoint-1050/model.pt
+
+    fusion: swift
+    proprio_core_dim: 9
+    gate_dim: 24
+    aux_dim: 3
+    action_dim: 4
+    use_vision: false
+    include_prev_action: true
+
+    proprio_hidden_dim: 128
+    proprio_embed_dim: 128
+    gate_hidden_dim: 128
+    gate_embed_dim: 128
+    trunk_hidden_dim: 768
+    trunk_depth: 3
+    dropout: 0.05
+
+    head_hidden_dim: 256
+    head_depth: 2
+    state_dependent_std: false
+    init_log_std: -2.6
+    log_std_min: -4.2
+    log_std_max: -1.8
+    with_critic: true
+    critic_hidden_dim: 256
+    critic_depth: 2
+    bc_loss_type: gnll
+    action_clip: 1.0
+    squash_actions: true
+
+  ppo:
+    bc_checkpoint: outputs/paper_teacher_ctbr_stage12_v7_ppo/checkpoint-1050/model.pt
+    action_type: ctbr
+
+    obs_schema: v3
+    backend: flightgym
+    render: false
+    scene: industrial
+
+    n_envs: 32
+    n_workers: 8
+    n_steps: 768
+    ppo_epochs: 2
+    minibatch_size: 4096
+    clip_eps: 0.03
+    vf_coeff: 0.5
+    ent_coeff: 0.0008
+    gamma: 0.997
+    gae_lambda: 0.95
+    max_iterations: 4500
+    actor_lr: 1.5e-6
+    critic_lr: 8.0e-5
+    target_kl: 0.006
+
+    control_hz: 100.0
+    horizon: 1000
+
+    course_mode: swift_v4
+    num_gates: 7
+    gate_size: 1.6
+    gate_approach_m: 3.0
+    z_min: 1.0
+    fixed_gate_pos_noise: 0.00
+    fixed_gate_yaw_noise: 0.00
+    random_start_gate: false
+    reset_mode: reference_state
+    start_offset_m: 3.0
+    start_offset_range: [2.0, 4.0]
+    reference_speed_mps: 3.0
+    goal_mode: pass_gate_i_align_next
+
+    gate_vehicle_radius: 0.20
+    max_world_radius: 350.0
+    min_z: -0.25
+    terminate_on_gate_miss: true
+    terminate_on_crash: true
+
+    max_body_rate: 7.0
+    max_collective_thrust_g: 5.0
+    action_clip: 1.0
+
+    plant:
+      mass: 0.73
+      arm_length: 0.17
+      inertia: [0.0025, 0.0021, 0.0043]
+      k_thrust: 1.91e-6
+      k_torque: 2.6e-7
+      motor_omega_min: 150.0
+      motor_omega_max: 3000.0
+      motor_tau: 0.0001
+      thrust_map: [1.3298253500372892e-06, 0.0038360810526746033, -1.7689986848125325]
+      kappa: 0.016
+      omega_max_body: [18.0, 18.0, 18.0]
+
+    reward_fn: flightmare_racing_v3
+    reward_kwargs:
+      gate_normal_progress_scale: 7.0
+      segment_progress_scale: 1.8
+      centerline_progress_scale: 4.2
+      centerline_error_penalty: 0.06
+      aperture_near_penalty: 0.95
+      aperture_near_m: 4.5
+      velocity_alignment_scale: 0.025
+      body_alignment_scale: 0.05
+      gate_pass_bonus: 24.0
+      segment_completion_bonus: 6.0
+      completion_bonus: 200.0
+      gate_miss_penalty: 120.0
+      crash_penalty: 130.0
+      no_progress_penalty: 0.12
+      backward_progress_penalty: 2.5
+      min_forward_velocity_mps: 0.5
+      stall_grace_steps: 30
+      time_penalty: 0.012
+      body_rate_penalty: 0.0012
+      action_smoothness_penalty: 0.011
+      vertical_speed_penalty: 0.0015
+      speed_limit_mps: 7.5
+      speed_limit_penalty: 0.08
+      max_progress_reward: 2.6
+      max_centerline_progress: 2.2
+      max_centerline_error: 6.0
+
+    collapse_guard:
+      enabled: false
+
+    curriculum:
+      enabled: true
+      advance_metric: null
+      advance_threshold: 1.0
+      stages:
+        - name: stage2p0_reanchor_short_recovery
+          until_iter: 150
+          num_gates: 7
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5]
+          start_offset_range: [2.0, 4.0]
+          reference_speed_mps: 3.0
+          goal_mode: pass_gate_i_survive
+          post_pass_success_steps: 20
+          post_pass_max_speed_mps: 8.5
+          post_pass_max_body_rate: 8.0
+          horizon: 760
+          max_collective_thrust_g: 5.0
+          max_body_rate: 6.0
+          ent_coeff_override: 0.0008
+          reward_kwargs:
+            speed_limit_mps: 7.0
+            speed_limit_penalty: 0.10
+            crash_penalty: 140.0
+
+        - name: stage2p1_align_next_lenient
+          until_iter: 450
+          num_gates: 7
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5]
+          start_offset_range: [2.0, 4.0]
+          reference_speed_mps: 3.0
+          goal_mode: pass_gate_i_align_next
+          post_pass_success_steps: 20
+          post_pass_max_speed_mps: 8.5
+          post_pass_max_body_rate: 8.0
+          post_pass_max_center_error_norm: 2.5
+          post_pass_min_gate_signed_distance_m: -12.0
+          horizon: 820
+          max_collective_thrust_g: 5.0
+          max_body_rate: 6.0
+          ent_coeff_override: 0.0008
+          reward_kwargs:
+            centerline_progress_scale: 4.5
+            centerline_error_penalty: 0.065
+            speed_limit_mps: 7.0
+            speed_limit_penalty: 0.10
+            crash_penalty: 140.0
+
+        - name: stage2p2_align_next_medium
+          until_iter: 850
+          num_gates: 7
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5]
+          start_offset_range: [2.0, 4.0]
+          reference_speed_mps: 3.0
+          goal_mode: pass_gate_i_align_next
+          post_pass_success_steps: 60
+          post_pass_max_speed_mps: 8.5
+          post_pass_max_body_rate: 8.0
+          post_pass_max_center_error_norm: 2.0
+          post_pass_min_gate_signed_distance_m: -9.0
+          horizon: 880
+          max_collective_thrust_g: 5.0
+          max_body_rate: 6.0
+          ent_coeff_override: 0.0008
+          reward_kwargs:
+            centerline_progress_scale: 4.8
+            centerline_error_penalty: 0.07
+            speed_limit_mps: 7.0
+            speed_limit_penalty: 0.10
+            crash_penalty: 140.0
+
+        - name: stage2p3_align_next_tight
+          until_iter: 1250
+          num_gates: 7
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5]
+          start_offset_range: [2.0, 4.0]
+          reference_speed_mps: 3.0
+          goal_mode: pass_gate_i_align_next
+          post_pass_success_steps: 100
+          post_pass_max_speed_mps: 8.5
+          post_pass_max_body_rate: 8.0
+          post_pass_max_center_error_norm: 1.5
+          post_pass_min_gate_signed_distance_m: -7.0
+          horizon: 940
+          max_collective_thrust_g: 5.0
+          max_body_rate: 6.0
+          ent_coeff_override: 0.0007
+          reward_kwargs:
+            centerline_progress_scale: 5.0
+            centerline_error_penalty: 0.075
+            speed_limit_mps: 7.0
+            speed_limit_penalty: 0.10
+            crash_penalty: 140.0
+
+        - name: stage2a_two_gate_slow_controlled
+          until_iter: 2200
+          num_gates: 7
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5]
+          start_offset_range: [2.0, 4.0]
+          reference_speed_mps: 2.8
+          goal_mode: gate_i_to_i+1
+          horizon: 1000
+          max_collective_thrust_g: 4.8
+          max_body_rate: 6.0
+          ent_coeff_override: 0.0007
+          reward_kwargs:
+            gate_normal_progress_scale: 7.5
+            centerline_progress_scale: 5.2
+            centerline_error_penalty: 0.08
+            velocity_alignment_scale: 0.02
+            gate_pass_bonus: 22.0
+            segment_completion_bonus: 5.0
+            completion_bonus: 230.0
+            gate_miss_penalty: 140.0
+            crash_penalty: 140.0
+            body_rate_penalty: 0.0013
+            action_smoothness_penalty: 0.012
+            speed_limit_mps: 7.0
+            speed_limit_penalty: 0.12
+
+        - name: stage2b_two_gate_controlled
+          until_iter: 3200
+          num_gates: 7
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5]
+          start_offset_range: [2.0, 4.0]
+          reference_speed_mps: 3.2
+          goal_mode: gate_i_to_i+1
+          horizon: 1000
+          max_collective_thrust_g: 5.0
+          max_body_rate: 7.0
+          ent_coeff_override: 0.0007
+          reward_kwargs:
+            gate_normal_progress_scale: 7.0
+            centerline_progress_scale: 4.8
+            centerline_error_penalty: 0.07
+            velocity_alignment_scale: 0.025
+            completion_bonus: 220.0
+            gate_miss_penalty: 130.0
+            crash_penalty: 130.0
+            speed_limit_mps: 8.0
+            speed_limit_penalty: 0.08
+
+        - name: stage2c_two_gate_target
+          until_iter: 4500
+          num_gates: 7
+          random_start_gate: false
+          fixed_gate_pos_noise: 0.0
+          fixed_gate_yaw_noise: 0.0
+          reset_mode: reference_state
+          start_gate_choices: [0, 1, 2, 3, 4, 5]
+          start_offset_range: [2.0, 4.0]
+          reference_speed_mps: 3.6
+          goal_mode: gate_i_to_i+1
+          horizon: 1000
+          max_collective_thrust_g: 5.25
+          max_body_rate: 7.5
+          ent_coeff_override: 0.0007
+          reward_kwargs:
+            velocity_alignment_scale: 0.03
+            completion_bonus: 210.0
+            gate_miss_penalty: 120.0
+            crash_penalty: 120.0
+            body_rate_penalty: 0.0010
+            action_smoothness_penalty: 0.010
+            speed_limit_mps: 9.0
+            speed_limit_penalty: 0.05
+
+training:
+  trainer_type: ppo_flightmare
+  max_grad_norm: 0.5
+  logging_steps: 1
+  save_steps: 50
+  save_total_limit: 80
+  save_final: true
+  save_optimizer_state: true
+  best_steps: 1
+  selection_metric: rollout_score
+  rollout_score_weights:
+    success_rate: 1.0
+    mean_goal_completion: 0.45
+    mean_gate_completion: 0.0
+    mean_speed_mps: 0.0
+    mean_reward: 0.0
+    mean_length: 0.0
+    stage_index: 0.08
+
+  bf16: false
+  output_dir: outputs/${run.name}
+
+wandb:
+  project: flightmare-ppo
+  entity: andrewolvera
+  run_name: ${run.name}
+  tags: [flightmare, ppo, state-only, ctbr, teacher, stage2, v7, controlled-bridge, align-next]

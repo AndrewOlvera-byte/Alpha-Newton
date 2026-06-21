@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler
 
 from src.core.registry import register
 
@@ -69,6 +69,8 @@ def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
 class BCTrainer:
     """Behavioral Cloning trainer with flow matching loss."""
 
+    _ROLLOUT_SELECTION_METRICS = {"rollout_success", "flightmare_rollout_score"}
+
     def __init__(
         self,
         model: nn.Module,
@@ -79,6 +81,7 @@ class BCTrainer:
         wandb_cfg: Dict[str, Any],
         norm_stats=None,
         dataset_meta: dict = None,
+        data_cfg: dict | None = None,
     ):
         self.model = model
         self.train_dataset = train_dataset
@@ -88,6 +91,7 @@ class BCTrainer:
         self.wandb_cfg = wandb_cfg or {}
         self.norm_stats = norm_stats
         self._dataset_meta = dataset_meta or {}
+        self.data_cfg = data_cfg or {}
 
         self._task_names: Dict[int, str] = {
             i: name for i, name in enumerate(self._dataset_meta.get("_task_names", []))
@@ -123,6 +127,7 @@ class BCTrainer:
 
         rollout_cfg = training_cfg.get("rollout_eval", {}) or {}
         self.rollout_eval_enabled = bool(rollout_cfg.get("enabled", False))
+        self.rollout_eval_type = str(rollout_cfg.get("type", "robomimic"))
         self.rollout_eval_episodes = int(rollout_cfg.get("episodes", 10))
         self.rollout_eval_max_steps = int(rollout_cfg.get("max_steps", 400))
         self.rollout_eval_every = int(rollout_cfg.get("every_steps", self.eval_steps))
@@ -141,6 +146,11 @@ class BCTrainer:
                 f"task={self.rollout_eval_target_task or 'first_task'} "
                 f"episodes={self.rollout_eval_episodes} "
                 f"every={self.rollout_eval_every} steps"
+            )
+        if self.rollout_eval_enabled and self.selection_metric == "flightmare_rollout_score":
+            print(
+                f"[Trainer] Flightmare rollout selection enabled: "
+                f"episodes={self.rollout_eval_episodes} every={self.rollout_eval_every} steps"
             )
 
         self.use_bf16 = training_cfg.get("bf16", True)
@@ -206,7 +216,41 @@ class BCTrainer:
             worker_kwargs["persistent_workers"] = True
 
         _n_task_components = len(getattr(self.train_dataset, "datasets", [None]))
-        if _n_task_components > 1:
+        sample_kind_cfg = training_cfg.get("sample_kind_balancing", {}) or {}
+        if bool(sample_kind_cfg.get("enabled", False)):
+            if _n_task_components > 1:
+                raise ValueError("sample_kind_balancing is only supported for single-component datasets.")
+            if not hasattr(self.train_dataset, "sampling_weights_for_sample_kind_mix"):
+                raise ValueError(
+                    "sample_kind_balancing requires the train dataset to expose "
+                    "sampling_weights_for_sample_kind_mix()."
+                )
+            target_mix = sample_kind_cfg.get("target_mix", {}) or {}
+            weights = self.train_dataset.sampling_weights_for_sample_kind_mix(
+                target_mix,
+                min_weight=float(sample_kind_cfg.get("min_weight", 0.0)),
+            )
+            num_samples = int(sample_kind_cfg.get("num_samples_per_epoch", len(self.train_dataset)))
+            sampler = WeightedRandomSampler(
+                weights=weights.double(),
+                num_samples=num_samples,
+                replacement=True,
+            )
+            print(
+                f"[Trainer] Sample-kind balancing enabled: target_mix={target_mix} "
+                f"counts={self.train_dataset.sample_kind_counts()} "
+                f"samples/epoch={num_samples}"
+            )
+            self.train_loader = DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                sampler=sampler,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                drop_last=True,
+                **worker_kwargs,
+            )
+        elif _n_task_components > 1:
             _batch_sampler = TaskBalancedBatchSampler(self.train_dataset, batch_size=self.batch_size)
             print(f"[Trainer] TaskBalancedBatchSampler: {_n_task_components} tasks, "
                   f"{_batch_sampler.spt} samples/task/batch "
@@ -243,6 +287,7 @@ class BCTrainer:
         self.best_eval_loss = float("inf")
         self.best_rollout_success = float("-inf")
         self.best_rollout_reward = float("-inf")
+        self.best_flightmare_rollout_score = float("-inf")
 
         self.patience = training_cfg.get("early_stopping_patience", 0)
         self._es_counter = 0
@@ -402,6 +447,42 @@ class BCTrainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
+    def _select_flightmare_rollout_checkpoint(
+        self,
+        rollout_metrics: Dict[str, float],
+        eval_loss: float,
+    ) -> bool:
+        score = float(rollout_metrics["score"])
+        gate_completion = float(rollout_metrics.get("mean_gate_completion", 0.0))
+        best_gate_completion = float(getattr(self, "_best_flightmare_gate_completion", -1.0))
+        improved = (
+            score > self.best_flightmare_rollout_score
+            or (
+                math.isclose(score, self.best_flightmare_rollout_score)
+                and gate_completion > best_gate_completion
+            )
+            or (
+                math.isclose(score, self.best_flightmare_rollout_score)
+                and math.isclose(gate_completion, best_gate_completion)
+                and eval_loss < self.best_eval_loss
+            )
+        )
+        if not improved:
+            return False
+        self.best_flightmare_rollout_score = score
+        self._best_flightmare_gate_completion = gate_completion
+        self.best_eval_loss = min(self.best_eval_loss, eval_loss)
+        return True
+
+    def _selection_metric_checked_for_early_stopping(
+        self,
+        rollout_metrics: Dict[str, float],
+    ) -> bool:
+        """Return whether this eval step actually evaluated the selected metric."""
+        if self.selection_metric not in self._ROLLOUT_SELECTION_METRICS:
+            return True
+        return bool(rollout_metrics)
+
     def _resolve_rollout_task(self) -> tuple[Optional[int], Optional[str]]:
         if not self._task_names:
             return None, None
@@ -419,6 +500,8 @@ class BCTrainer:
     def _evaluate_rollouts(self) -> Dict[str, float]:
         if not self.rollout_eval_enabled:
             return {}
+        if self.rollout_eval_type == "flightmare" or self.selection_metric == "flightmare_rollout_score":
+            return self._evaluate_flightmare_rollouts()
 
         task_id, task_name = self._resolve_rollout_task()
         if task_id is None or task_name is None:
@@ -463,6 +546,34 @@ class BCTrainer:
             "avg_reward": float(result["avg_reward"]),
             "avg_length": float(result["avg_length"]),
         }
+
+    @torch.no_grad()
+    def _evaluate_flightmare_rollouts(self) -> Dict[str, float]:
+        from src.robotics.flightmare_policy_eval import evaluate_flightmare_policy
+
+        if not self.data_cfg or not str(self.data_cfg.get("type", "")).startswith("flightmare"):
+            raise ValueError("Flightmare rollout eval requires a flightmare data config.")
+        self._seed_everything(self.rollout_eval_seed)
+        rollout_cfg = dict(self.training_cfg.get("rollout_eval", {}) or {})
+        rollout_cfg.setdefault("episodes", self.rollout_eval_episodes)
+        rollout_cfg.setdefault("seed", self.rollout_eval_seed)
+        metrics = evaluate_flightmare_policy(
+            self.model,
+            data_cfg=self.data_cfg,
+            robotics_cfg=self.robotics_cfg,
+            eval_cfg=rollout_cfg,
+            device=self.device,
+        )
+        out = {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
+        print(
+            f"[Flightmare Rollout @ {self.global_step}] "
+            f"score={out.get('score', 0.0):.4f} "
+            f"success={100.0 * out.get('success_rate', 0.0):.1f}% "
+            f"gates={out.get('mean_gates_completed', 0.0):.2f} "
+            f"gate_completion={100.0 * out.get('mean_gate_completion', 0.0):.1f}% "
+            f"speed={out.get('mean_speed_mps', 0.0):.2f}m/s"
+        )
+        return out
 
     def _grad_norm(self, params) -> float:
         """Total L2 grad norm across a param iterable (pre-clip)."""
@@ -560,7 +671,6 @@ class BCTrainer:
         _window_lps: list = []
 
         t0 = time.time()
-        t_last_log = t0
         _stop_early = False
 
         while self.global_step < self.max_steps:
@@ -676,13 +786,19 @@ class BCTrainer:
                 if self.rollout_eval_enabled and self.global_step % self.rollout_eval_every == 0:
                     rollout_metrics = self._evaluate_rollouts()
                     if rollout_metrics:
-                        self._log({
-                            "rollout/success_rate": rollout_metrics["success_rate"],
-                            "rollout/avg_reward": rollout_metrics["avg_reward"],
-                            "rollout/avg_length": rollout_metrics["avg_length"],
-                        }, self.global_step)
+                        self._log(
+                            {
+                                f"rollout/{k}": float(v)
+                                for k, v in rollout_metrics.items()
+                                if isinstance(v, (int, float))
+                            },
+                            self.global_step,
+                        )
 
                 improved = False
+                selection_metric_checked = self._selection_metric_checked_for_early_stopping(
+                    rollout_metrics
+                )
                 if self.selection_metric == "rollout_success" and rollout_metrics:
                     sr = rollout_metrics["success_rate"]
                     reward = rollout_metrics["avg_reward"]
@@ -698,6 +814,21 @@ class BCTrainer:
                             f"[Eval] New best rollout: SR={sr:.1f}% "
                             f"reward={reward:.3f} eval_loss={eval_loss:.4f}"
                         )
+                elif self.selection_metric == "flightmare_rollout_score" and rollout_metrics:
+                    if self._select_flightmare_rollout_checkpoint(rollout_metrics, eval_loss):
+                        improved = True
+                        print(
+                            f"[Eval] New best Flightmare rollout: score={rollout_metrics['score']:.4f} "
+                            f"gate_completion={100.0 * rollout_metrics.get('mean_gate_completion', 0.0):.1f}% "
+                            f"eval_loss={eval_loss:.4f}"
+                        )
+                elif self.selection_metric in {"rollout_success", "flightmare_rollout_score"}:
+                    if not rollout_metrics:
+                        print(
+                            f"[Eval] {self.selection_metric} selected; eval_loss={eval_loss:.4f} "
+                            "logged without checkpoint selection on this step; "
+                            "early stopping patience unchanged."
+                        )
                 elif eval_loss < self.best_eval_loss:
                     self.best_eval_loss = eval_loss
                     improved = True
@@ -706,11 +837,11 @@ class BCTrainer:
                 if improved:
                     self._es_counter = 0
                     self._save_checkpoint("best")
-                elif self.patience > 0:
+                elif self.patience > 0 and selection_metric_checked:
                     self._es_counter += 1
                     print(f"[EarlyStopping] No improvement {self._es_counter}/{self.patience}")
                     if self._es_counter >= self.patience:
-                        print(f"[EarlyStopping] Patience exhausted - stopping training.")
+                        print("[EarlyStopping] Patience exhausted - stopping training.")
                         _stop_early = True
 
                 self._log({"eval/es_counter": self._es_counter}, self.global_step)
@@ -832,6 +963,8 @@ class BCTrainer:
             "best_eval_loss": self.best_eval_loss,
             "best_rollout_success": self.best_rollout_success,
             "best_rollout_reward": self.best_rollout_reward,
+            "best_flightmare_rollout_score": self.best_flightmare_rollout_score,
+            "best_flightmare_gate_completion": getattr(self, "_best_flightmare_gate_completion", -1.0),
             "optimizer_state_saved": self.save_optimizer_state,
         }
         if self.save_optimizer_state:
@@ -924,6 +1057,8 @@ class BCTrainer:
             self.best_eval_loss = state.get("best_eval_loss", float("inf"))
             self.best_rollout_success = state.get("best_rollout_success", float("-inf"))
             self.best_rollout_reward = state.get("best_rollout_reward", float("-inf"))
+            self.best_flightmare_rollout_score = state.get("best_flightmare_rollout_score", float("-inf"))
+            self._best_flightmare_gate_completion = state.get("best_flightmare_gate_completion", -1.0)
 
         print(f"[Resume] Loaded checkpoint from {path} (step {self.global_step})")
 
@@ -935,6 +1070,7 @@ def build_bc_trainer(
     training_cfg: dict,
     robotics_cfg: dict = None,
     wandb_cfg: dict = None,
+    data_cfg: dict = None,
     **kwargs,
 ) -> BCTrainer:
     dataset_meta = {
@@ -952,4 +1088,5 @@ def build_bc_trainer(
         robotics_cfg=robotics_cfg,
         wandb_cfg=wandb_cfg,
         dataset_meta=dataset_meta,
+        data_cfg=data_cfg,
     )

@@ -17,8 +17,8 @@ import src.robotics.bc_trainer
 import src.robotics.models.robosuite.VLA_like
 import src.robotics.models.robosuite.VLA_MLP
 import src.robotics.models.robosuite.VLA_Gaussian
-import src.robotics.models.flightmare
-import scripts.flightmare_bc.dataset
+import src.robotics.models.flightmare  # noqa: F401
+import scripts.flightmare_bc.dataset  # noqa: F401
 
 
 def test_dataset(cfg: Config):
@@ -34,7 +34,7 @@ def test_dataset(cfg: Config):
     print(f"\nTrain: {len(train_ds)} | Eval: {len(eval_ds)}")
 
     sample = train_ds[0]
-    print(f"\n--- Sample 0 ---")
+    print("\n--- Sample 0 ---")
     print(f"Action shape: {sample['action'].shape} dtype: {sample['action'].dtype}")
     print(f"State shape:  {sample['state'].shape}")
     print(f"Prev actions: {sample['prev_actions'].shape}")
@@ -45,7 +45,7 @@ def test_dataset(cfg: Config):
     from torch.utils.data import DataLoader
     loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=0)
     batch = next(iter(loader))
-    print(f"\n--- Batch (bs=2) ---")
+    print("\n--- Batch (bs=2) ---")
     print(f"Action: {batch['action'].shape}")
     print(f"State:  {batch['state'].shape}")
     for k, v in batch["images"].items():
@@ -55,7 +55,7 @@ def test_dataset(cfg: Config):
     robotics_cfg = cfg.robotics or {}
     arch_cfg = robotics_cfg.get("architecture", {})
     if arch_cfg.get("type"):
-        print(f"\n--- Model ---")
+        print("\n--- Model ---")
         model = build("architecture", **arch_cfg)
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
@@ -93,8 +93,10 @@ def test_dataset(cfg: Config):
     print(f"{'=' * 60}")
 
 
-def main(exp_name: str, test_only: bool = False):
+def main(exp_name: str, test_only: bool = False, no_wandb: bool = False):
     cfg = Config.from_experiment(exp_name)
+    if no_wandb:
+        cfg.wandb = {}
     if cfg.run.get("mode") != "bc":
         raise ValueError(
             f"train_bc.py only accepts run.mode='bc'. "
@@ -118,6 +120,8 @@ def main(exp_name: str, test_only: bool = False):
     arch_type = (cfg.robotics or {}).get("architecture", {}).get("type", "?")
     print(f"[Config] Arch:  {arch_type}")
     print(f"[Config] Output: {cfg.training['output_dir']}")
+    if no_wandb:
+        print("[Config] Wandb: disabled by --no-wandb")
     print()
 
     if test_only:
@@ -143,6 +147,7 @@ def main(exp_name: str, test_only: bool = False):
         training_cfg=cfg.training,
         robotics_cfg=robotics_cfg,
         wandb_cfg=cfg.wandb,
+        data_cfg=cfg.data,
     )
 
     trainer.train()
@@ -152,5 +157,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train BC policy")
     parser.add_argument("--exp", type=str, required=True, help="Experiment config name")
     parser.add_argument("--test", action="store_true", help="Test dataset + model only")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging for this run")
     args = parser.parse_args()
-    main(exp_name=args.exp, test_only=args.test)
+    main(exp_name=args.exp, test_only=args.test, no_wandb=args.no_wandb)

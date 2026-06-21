@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 import torch
 
-from scripts.flightmare_bc.collect import sample_gate_course, waypoints_from_gates
+from scripts.flightmare_bc.collect import sample_course_with_meta, waypoints_from_gates
 from scripts.flightmare_bc.controllers import QuadParams
 from scripts.flightmare_bc.expert_env import FlightmareExpertEnv
 from src.robotics.flightmare_autonomy_fsw.controllers import BaseAutonomyController
@@ -39,6 +39,13 @@ class CourseConfig:
     fixed_gate_pos_noise_xyz: Sequence[float] | None = None
     fixed_gate_yaw_noise: float = 0.0
     gate_approach_m: float = 1.2
+    inverted_roll_jitter_rad: float = 0.2618
+    # Optional shared procedural scenario distribution. When set (a
+    # CourseDistributionConfig or a plain config dict), ``sample_gate_course``
+    # delegates to ``src.robotics.flightmare_courses.sample_course`` and the
+    # legacy single-mode fields above are ignored. Last GeneratedCourse metadata
+    # from a sample is stashed on ``_last_course_meta`` for manifest logging.
+    course_distribution: Any | None = None
 
 
 class FlightmareStateNode:
@@ -80,6 +87,7 @@ class FlightmareStateNode:
         self._step = 0
         self._t = 0.0
         self._course: GateCourse | None = None
+        self.last_course_meta: dict | None = None
         self.last_images: dict[str, np.ndarray] = {}
 
     @property
@@ -93,7 +101,7 @@ class FlightmareStateNode:
         return self._course
 
     def reset(self, episode_id: int, rng: np.random.Generator) -> tuple[GateCourse, VehicleState]:
-        gates = sample_gate_course(rng, self.course_config)
+        gates, self.last_course_meta = sample_course_with_meta(rng, self.course_config)
         for gate in gates:
             gate.gate_id = f"eval_ep{episode_id:06d}_{gate.gate_id}"
         self.env.add_gates(gates)

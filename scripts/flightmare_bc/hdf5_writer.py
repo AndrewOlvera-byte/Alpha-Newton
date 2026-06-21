@@ -78,6 +78,7 @@ class EpisodeWriter:
             )
             for name in ("waypoint", "ctbr", "motor")
         }
+        self._ds_prev_action = None
         # Mission/perception-prior channels: next-K-gates in body frame +
         # progress + distance. Dim is set when first sample is appended.
         self._ds_mission = None
@@ -100,6 +101,7 @@ class EpisodeWriter:
         self._ds_done = self._h5.create_dataset(
             "meta/done", shape=(0,), maxshape=(None,), chunks=(chunk_action,), dtype=bool,
         )
+        self._ds_expert = None
         self._t = 0
 
     @staticmethod
@@ -119,6 +121,8 @@ class EpisodeWriter:
         done: bool,
         mission: np.ndarray | None = None,
         gate_index: int = -1,
+        prev_actions: dict[str, np.ndarray] | None = None,
+        expert: dict | None = None,
     ) -> None:
         i = self._grow(self._ds_state, 1)
         self._ds_state[i] = state.astype(np.float32, copy=False)
@@ -128,6 +132,25 @@ class EpisodeWriter:
         for name, ds in self._ds_action.items():
             self._grow(ds, 1)
             ds[i] = actions[name].astype(np.float32, copy=False)
+        if prev_actions is not None:
+            if self._ds_prev_action is None:
+                self._ds_prev_action = {
+                    name: self._h5.create_dataset(
+                        f"action/{name}_prev", shape=(0, 4), maxshape=(None, 4),
+                        chunks=(256, 4), dtype=np.float32, **_FLOAT_KW,
+                    )
+                    for name in ("waypoint", "ctbr", "motor")
+                }
+            for name, ds in self._ds_prev_action.items():
+                self._grow(ds, 1)
+                value = prev_actions.get(name)
+                if value is None:
+                    value = np.zeros(4, dtype=np.float32)
+                ds[i] = np.asarray(value, dtype=np.float32)
+        elif self._ds_prev_action is not None:
+            for _, ds in self._ds_prev_action.items():
+                self._grow(ds, 1)
+                ds[i] = np.zeros(4, dtype=np.float32)
         if mission is not None:
             mission = np.asarray(mission, dtype=np.float32)
             if self._ds_mission is None:
@@ -149,7 +172,88 @@ class EpisodeWriter:
         self._ds_ref_yaw[i] = float(ref_yaw)
         self._grow(self._ds_done, 1)
         self._ds_done[i] = bool(done)
+        if expert is not None:
+            self._append_expert(i, expert)
+        elif self._ds_expert is not None:
+            self._append_expert(i, {})
         self._t += 1
+
+    def _ensure_expert_datasets(self) -> None:
+        if self._ds_expert is not None:
+            return
+        str_dtype = h5py.string_dtype(encoding="utf-8")
+        self._ds_expert = {
+            "weight": self._h5.create_dataset(
+                "expert/weight", shape=(0,), maxshape=(None,),
+                chunks=(256,), dtype=np.float32, **_FLOAT_KW,
+            ),
+            "confidence": self._h5.create_dataset(
+                "expert/confidence", shape=(0,), maxshape=(None,),
+                chunks=(256,), dtype=np.float32, **_FLOAT_KW,
+            ),
+            "action_log_std": self._h5.create_dataset(
+                "expert/action_log_std", shape=(0, 4), maxshape=(None, 4),
+                chunks=(256, 4), dtype=np.float32, **_FLOAT_KW,
+            ),
+            "cost": self._h5.create_dataset(
+                "expert/cost", shape=(0,), maxshape=(None,),
+                chunks=(256,), dtype=np.float32, **_FLOAT_KW,
+            ),
+            "cost_margin": self._h5.create_dataset(
+                "expert/cost_margin", shape=(0,), maxshape=(None,),
+                chunks=(256,), dtype=np.float32, **_FLOAT_KW,
+            ),
+            "saturation_frac": self._h5.create_dataset(
+                "expert/saturation_frac", shape=(0,), maxshape=(None,),
+                chunks=(256,), dtype=np.float32, **_FLOAT_KW,
+            ),
+            "valid": self._h5.create_dataset(
+                "expert/valid", shape=(0,), maxshape=(None,),
+                chunks=(256,), dtype=bool,
+            ),
+            "source": self._h5.create_dataset(
+                "expert/source", shape=(0,), maxshape=(None,),
+                chunks=(256,), dtype=str_dtype,
+            ),
+            "safety_status": self._h5.create_dataset(
+                "expert/safety_status", shape=(0,), maxshape=(None,),
+                chunks=(256,), dtype=str_dtype,
+            ),
+        }
+        if self._t > 0:
+            for name, ds in self._ds_expert.items():
+                ds.resize(self._t, axis=0)
+                if name == "weight":
+                    ds[:] = 1.0
+                elif name == "confidence":
+                    ds[:] = 1.0
+                elif name == "action_log_std":
+                    ds[:] = np.asarray([-2.0, -2.0, -2.0, -2.0], dtype=np.float32)
+                elif name == "valid":
+                    ds[:] = True
+                elif name in {"source", "safety_status"}:
+                    ds[:] = ""
+                else:
+                    ds[:] = np.nan
+
+    def _append_expert(self, i: int, expert: dict) -> None:
+        self._ensure_expert_datasets()
+        assert self._ds_expert is not None
+        for ds in self._ds_expert.values():
+            if ds.shape[0] <= i:
+                ds.resize(i + 1, axis=0)
+        self._ds_expert["weight"][i] = float(expert.get("weight", 1.0))
+        self._ds_expert["confidence"][i] = float(expert.get("confidence", 1.0))
+        self._ds_expert["action_log_std"][i] = np.asarray(
+            expert.get("action_log_std", [-2.0, -2.0, -2.0, -2.0]),
+            dtype=np.float32,
+        )
+        self._ds_expert["cost"][i] = float(expert.get("cost", np.nan))
+        self._ds_expert["cost_margin"][i] = float(expert.get("cost_margin", np.nan))
+        self._ds_expert["saturation_frac"][i] = float(expert.get("saturation_frac", 0.0))
+        self._ds_expert["valid"][i] = bool(expert.get("valid", True))
+        self._ds_expert["source"][i] = str(expert.get("source", ""))
+        self._ds_expert["safety_status"][i] = str(expert.get("safety_status", ""))
 
     def close(self) -> None:
         if self._h5 is not None:

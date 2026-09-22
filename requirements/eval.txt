@@ -1,4 +1,0 @@
-lm-eval>=0.4.7
-sacrebleu>=2.4.0
-rouge-score>=0.1.2
-antlr4-python3-runtime==4.11

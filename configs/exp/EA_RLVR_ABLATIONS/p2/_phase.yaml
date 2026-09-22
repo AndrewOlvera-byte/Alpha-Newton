@@ -1,0 +1,11 @@
+extends: configs/exp/EA_RLVR_ABLATIONS/_study.yaml
+
+grpo:
+  loss_type: dapo
+  num_generations: 32
+
+training:
+  max_steps: 1000
+
+wandb:
+  tags: [qwen3-0.6b, rlvr, gsm8k, phase-2]

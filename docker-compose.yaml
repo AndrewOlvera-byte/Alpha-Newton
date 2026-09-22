@@ -3,53 +3,21 @@ services:
     build: .
     image: alpha-newton:latest
     container_name: alpha-newton
-
-    # GPU access for RTX 5070 Ti
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu, graphics, compute, utility]
-
-    # Shared memory for PyTorch DataLoader workers (default 64MB is too small)
-    shm_size: "16gb"
-
-    # Mount project directory for live code changes
+              capabilities: [gpu]
+    shm_size: 16gb
     volumes:
       - .:/workspace
-      - ./cache:/workspace/cache              # HuggingFace cache
-      - ./outputs:/workspace/outputs          # Model checkpoints
-      - ./experiments:/workspace/experiments  # Experiment configs
-      - ~/.cache/huggingface:/root/.cache/huggingface  # Share HF cache with host
-      - /tmp/.X11-unix:/tmp/.X11-unix:rw      # Unity renderer display socket
-
-    # Keep container running for interactive CLI
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    env_file:
+      - .env.vllm
+    environment:
+      CUDA_VISIBLE_DEVICES: 0
+      WANDB_API_KEY: ${WANDB_API_KEY}
     stdin_open: true
     tty: true
-
-    # Override default command to keep alive
-    command: tail -f /dev/null
-
-    # Environment variables
-    env_file:
-      - .env.vllm  # vLLM configuration (FlashInfer backend, torch.compile disabled)
-    environment:
-      - CUDA_VISIBLE_DEVICES=0
-      - WANDB_API_KEY=${WANDB_API_KEY}  # Pass from host environment
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display
-      - DISPLAY=${DISPLAY:-:0}
-      - QT_X11_NO_MITSHM=1
-      - SDL_VIDEODRIVER=x11
-      - __GLX_VENDOR_LIBRARY_NAME=nvidia
-      - MUJOCO_GL=egl
-      - PYOPENGL_PLATFORM=egl
-      - FLIGHTMARE_PATH=/opt/flightmare
-      - FLIGHTMARE_UNITY_EXECUTABLE=/opt/flightmare/flightrender/RPG_Flightmare.x86_64
-
-    # Port mappings
-    ports:
-      - "7860:7860"  # Gradio web UI
-      - "6006:6006"  # TensorBoard (if needed)

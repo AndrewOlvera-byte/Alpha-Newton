@@ -1,35 +1,9 @@
-# PyTorch: Base image has 2.5.1, vLLM 0.11.2 auto-upgrades to 2.9.0 (required for RTX 5070 Ti Blackwell support)
-# vLLM 0.11.2 chosen for TRL compatibility (TRL 0.26.x only supports vLLM 0.10.2-0.11.2)
-# torch.compile disabled via VLLM_TORCH_COMPILE_LEVEL=0 to avoid PyTorch 2.9.0 crash
 transformers>=4.47.0
 datasets>=2.14.0
-trl>=0.26.0  # Latest version, supports vLLM colocate mode
-pyyaml>=6.0
+trl>=0.26.0
 accelerate>=0.20.0
-wandb>=0.15.0
 peft>=0.8.0
 bitsandbytes>=0.41.0
-gradio>=4.0.0
-vllm==0.11.2  # Highest version supported by TRL
-
-# FP8 training (requires PyTorch 2.9+, sm_89/sm_90/sm_120)
-torchao>=0.17.0
-
-# Robotics BC / RL
-h5py>=3.0.0
-robosuite>=1.5.0
-robomimic>=0.3.0
-imageio>=2.20.0
-imageio-ffmpeg>=0.4.0
-opencv-python>=4.5.0
-gymnasium>=0.29.0
-matplotlib>=3.7.0
-
-# Flightmare / flightgym integration
-gym>=0.26.2,<0.27
-ruamel.yaml>=0.17.0
-scikit-build>=0.17.0
-pybind11>=2.10.0
-pyzmq>=25.0.0
-shimmy>=2.0.0
-stable-baselines3>=2.3.0
+pyyaml>=6.0
+wandb>=0.15.0
+vllm==0.11.2

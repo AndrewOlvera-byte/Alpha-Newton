@@ -2,8 +2,15 @@ from src.core.registry import register
 from transformers import AutoModelForCausalLM
 
 @register("model", "hf_causal")
-def build_hf_model(id: str, revision: str, dtype: str, trust_remote_code: bool, load_in_4bit: bool, gradient_checkpointing: bool, attn_implementation: str = "sdpa"):
-
+def build_hf_model(
+    id: str,
+    revision: str,
+    dtype: str,
+    trust_remote_code: bool,
+    load_in_4bit: bool,
+    gradient_checkpointing: bool,
+    attn_implementation: str = "sdpa",
+):
     model = AutoModelForCausalLM.from_pretrained(
         id,
         revision=revision,
@@ -15,6 +22,5 @@ def build_hf_model(id: str, revision: str, dtype: str, trust_remote_code: bool, 
 
     if gradient_checkpointing:
         model.gradient_checkpointing_enable()
-    print(next(model.parameters()).dtype)
-    print(model.dtype if hasattr(model, "dtype") else None)
+    print(f"[Model] Loaded {id} with dtype={next(model.parameters()).dtype}")
     return model

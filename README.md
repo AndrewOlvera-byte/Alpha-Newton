@@ -1,367 +1,94 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/PyTorch-2.7+-ee4c2c?logo=pytorch&logoColor=white" alt="PyTorch">
-  <img src="https://img.shields.io/badge/Transformers-4.40+-yellow?logo=huggingface&logoColor=white" alt="Transformers">
-  <img src="https://img.shields.io/badge/TRL-0.8+-blue" alt="TRL">
-  <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
-  <img src="https://img.shields.io/badge/PRs-Welcome-brightgreen" alt="PRs Welcome">
-</p>
+# Alpha-Newton
 
-<h1 align="center">Alpha-Newton</h1>
+Alpha-Newton is a focused research codebase for a two-phase study of group-based reinforcement learning with verifiable rewards on mathematical reasoning. The study asks two related questions:
 
-<p align="center">
-  <strong>A modular LLM post-training framework for building instruction-tuned and reasoning-capable language models.</strong>
-</p>
+1. How do GRPO and DAPO behave as the number of sampled completions per prompt changes?
+2. Once that training regime is fixed, how does reward design change the learning signal?
 
-<p align="center">
-  <a href="#features">Features</a> •
-  <a href="#installation">Installation</a> •
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#architecture">Architecture</a> •
-  <a href="#configuration">Configuration</a> •
-  <a href="#contributing">Contributing</a>
-</p>
+This repository contains the training, reward, configuration, and checkpoint-selection code for those ablations. Model checkpoints, generated evaluation sets, run logs, plots, and result claims are intentionally not part of the public tree.
 
----
+## Research design
 
-## Features
+All experiments start from the same Qwen3-0.6B reasoning checkpoint and train on `allenai/RLVR-GSM`. TRL supplies the GRPO trainer and vLLM supplies colocated generation. A deterministic held-out GSM set ranks checkpoints during training.
 
-- **Modular Registry System** — Clean separation of concerns with pluggable components for models, tokenizers, datasets, and trainers
-- **Multi-Stage Training Pipeline** — SFT → DPO workflow for building aligned language models
-- **Mixed Dataset Training** — Combine multiple datasets with weighted sampling for diverse training
-- **Flash Attention 2** — Optimized attention for faster training and lower memory usage
-- **Sequence Packing** — Efficient batching by concatenating sequences to maximize GPU utilization
-- **WandB Integration** — Real-time training metrics and experiment tracking
-- **Gradio Chat Interface** — Interactive web UI to test your trained models
-- **Docker-First** — Reproducible environments with GPU support out of the box
+### Phase 1: optimization and group size
 
----
+Phase 1 separates the effect of the policy objective from the number of completions sampled for each prompt.
 
-## Installation
+| Factor | Values represented in the configs |
+| --- | --- |
+| Objective | GRPO, DAPO |
+| Group size | 8, 16, 32 generations |
+| KL reference penalty | `beta=0.03`, plus DAPO no-KL variants |
+| Horizon check | DAPO K=32 extended from 780 to 1,200 steps |
 
-### Using Docker (Recommended)
+The configs live directly under [`configs/exp/EA_RLVR_ABLATIONS`](configs/exp/EA_RLVR_ABLATIONS). Each file contains only the experimental override; shared model, data, generation, and optimization settings are inherited from `_study.yaml` and the base configs.
 
-```bash
-# Clone the repository
-git clone https://github.com/your-username/Alpha-Newton.git
-cd Alpha-Newton
+### Phase 2: reward shaping
 
-# Build and start the container
-docker compose build
-docker compose up -d
+Phase 2 fixes DAPO at 32 generations and compares three reward signals:
 
-# Verify GPU access
-docker compose exec alpha-newton nvidia-smi
-```
+- `ppo_binary`: correctness-only verification.
+- `dapo_rank_stratified`: ranks responses within correctness strata using a quality score.
+- `dapo_structure_balanced`: combines correctness with explicit reasoning-structure checks.
 
-### Local Installation
+Each reward is represented with and without the KL reference penalty. The code also includes longer 2,000-step checks and a DoRA parameter-efficient variant. These are controlled comparisons, not separate training pipelines.
 
-```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
+## Code map
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Install Flash Attention (requires CUDA)
-pip install flash-attn --no-build-isolation
-```
-
-### Requirements
-
-- Python 3.10+
-- CUDA 12.0+ with compatible GPU (16GB+ VRAM recommended)
-- Docker & Docker Compose (for containerized setup)
-
----
-
-## Quick Start
-
-### 1. Train an Instruction Model (SFT)
-
-```bash
-# Using Docker
-docker compose exec alpha-newton python src/entrypoints/train_sft.py \
-  --exp qwen3_600M_sft_mixed_optimized
-
-# Or locally
-python src/entrypoints/train_sft.py --exp qwen3_600M_sft_mixed_optimized
-```
-
-This trains Qwen3-0.6B on a mix of OpenHermes-2.5 (70%) and Glaive function-calling (30%) datasets.
-
-### 2. Align with Human Preferences (DPO)
-
-```bash
-docker compose exec alpha-newton python src/entrypoints/train_dpo.py \
-  --exp qwen3_600M_dpo_anthropic_hh
-```
-
-DPO (Direct Preference Optimization) fine-tunes the model on preference pairs from Anthropic HH-RLHF.
-
-### 3. Evaluate on Math Benchmarks (GSM8K, MATH)
-
-This project includes a lightweight evaluation entrypoint that runs ecosystem-standard benchmarks via **EleutherAI lm-evaluation-harness**.
-
-Install eval-only dependencies (kept separate from training deps):
-
-```bash
-pip install -r requirements/eval.txt
-```
-
-Run a math suite using the same `--exp` experiment naming pattern as training:
-
-```bash
-# Evaluate the checkpoint saved at training.output_dir
-python src/entrypoints/eval_math.py --exp qwen3_600M_rlvr_math --suite math_small
-
-# Full math suite (GSM8K + MATH)
-python src/entrypoints/eval_math.py --exp qwen3_600M_rlvr_math --suite math_full
-
-# Smoke test (limit samples)
-python src/entrypoints/eval_math.py --exp qwen3_600M_rlvr_math --suite math_small --limit 100
-```
-
-Suites live in `configs/eval/*.yaml`, and can be swapped by changing the task list. By default we pass `--apply_chat_template`, which wraps each benchmark prompt into an OpenAI-style messages list (user role) and uses your tokenizer chat template for formatting.
-
-### 3. Chat with Your Model
-
-```bash
-docker compose exec alpha-newton python src/entrypoints/chat.py \
-  --model outputs/qwen3_600M_dpo_anthropic_hh
-
-# Or with a specific checkpoint
-python src/entrypoints/chat.py \
-  --model outputs/qwen3_600M_sft_mixed_optimized \
-  --checkpoint checkpoint-5000
-
-# Create a public share link
-python src/entrypoints/chat.py --model outputs/your_model --share
-```
-
-Access the web UI at **http://localhost:7860**
-
----
-
-## Architecture
-
-Alpha-Newton uses a **registry-based architecture** that makes it easy to extend and customize:
-
-```
+```text
+configs/
+  base/                         shared RLVR and runtime settings
+  exp/EA_RLVR_ABLATIONS/       phase-specific experimental overrides
+scripts/posttraining/
+  create_held_out_eval.py      deterministic held-out set construction
 src/
-├── core/
-│   ├── config.py      # YAML config loading with variable interpolation
-│   └── registry.py    # Component registry for models, data, trainers
-├── builders/
-│   ├── model.py       # Model builders (HuggingFace, custom)
-│   ├── tokenizer.py   # Tokenizer builders
-│   ├── data.py        # Dataset builders (SFT, DPO, mixed)
-│   └── trainer.py     # Trainer builders (TRL SFT, DPO)
-└── entrypoints/
-    ├── train_sft.py   # SFT training script
-    ├── train_dpo.py   # DPO training script
-    └── chat.py        # Gradio chat interface
+  builders/                    model, tokenizer, dataset, and trainer assembly
+  core/                        config inheritance and component registry
+  entrypoints/train_rlvr.py    the single training entrypoint
+  rlvr/math_verifier.py        answer extraction and the three reward variants
+  rlvr/rl_callbacks.py         held-out evaluation and top-K checkpoint retention
+tests/                         config and reward behavior checks
 ```
 
-### How It Works
+The execution path is deliberately small:
 
-1. **Config Loading** — Merges `configs/base/common.yaml` with experiment-specific configs
-2. **Component Building** — Registry system instantiates models, tokenizers, datasets, and trainers
-3. **Training** — TRL-based trainers handle the training loop with WandB logging
-4. **Inference** — Gradio interface loads checkpoints for interactive testing
-
----
-
-## Configuration
-
-### Config Structure
-
-```yaml
-# configs/exp/my_experiment.yaml
-
-run:
-  name: "my_experiment"      # Used for output directory and WandB
-  mode: "sft"                # Training mode: sft, dpo
-
-model:
-  type: "hf_causal"          # Registry type
-  id: "Qwen/Qwen3-0.6B-Base" # HuggingFace model ID
-  dtype: "bfloat16"
-  gradient_checkpointing: true
-
-tokenizer:
-  type: "hf"
-  id: "Qwen/Qwen3-0.6B-Base"
-
-data:
-  type: "sft_mixed"          # Dataset type: sft, dpo, sft_mixed
-  datasets_config:
-    - path: "teknium/OpenHermes-2.5"
-      weight: 0.7
-    - path: "glaiveai/glaive-function-calling-v2"
-      weight: 0.3
-  max_seq_len: 2048
-  packing: true              # Pack sequences for efficiency
-
-training:
-  per_device_train_batch_size: 8
-  gradient_accumulation_steps: 4
-  learning_rate: 2.0e-5
-  max_steps: 10000
-  warmup_steps: 500
-  save_steps: 1000
-
-wandb:
-  project: "posttraining"
-  tags: ["qwen3", "sft", "mixed"]
+```text
+experiment YAML
+    -> merged research configuration
+    -> Qwen model + AllenAI RLVR-GSM dataset
+    -> TRL GRPOTrainer configured as GRPO or DAPO
+    -> verifiable reward function
+    -> held-out checkpoint ranking
 ```
 
-### Variable Interpolation
+## Reading the configurations
 
-Use `${section.key}` syntax for dynamic values:
+Configuration inheritance keeps the comparison surface visible:
 
-```yaml
-run:
-  name: "my_experiment"
+- `configs/base/common.yaml` defines model-loading, output, and tracking defaults.
+- `configs/base/rlvr.yaml` defines the common optimizer, generation, vLLM, and checkpoint-selection behavior.
+- `_study.yaml` fixes the starting model and training dataset.
+- `_phase.yaml` fixes the Phase 2 DAPO/K=32 design.
+- Each named experiment overrides only the variable under study.
 
-training:
-  output_dir: "outputs/${run.name}"  # Resolves to "outputs/my_experiment"
-
-wandb:
-  run_name: "${run.name}"
-```
-
-### Available Dataset Types
-
-| Type | Description | Required Fields |
-|------|-------------|-----------------|
-| `sft` | Single dataset SFT | `train_path`, `eval_path` |
-| `sft_mixed` | Multi-dataset with weights | `datasets_config` |
-| `dpo` | Preference pairs | `train_path` (chosen/rejected) |
-
-### Supported Dataset Formats
-
-The framework auto-detects and converts these formats:
-
-- **OpenAI Messages**: `{"messages": [{"role": "user", "content": "..."}]}`
-- **OpenHermes**: `{"conversations": [{"from": "human", "value": "..."}]}`
-- **Capybara**: `{"conversation": [{"input": "...", "output": "..."}]}`
-- **Glaive**: `{"system": "...", "chat": "USER: ... ASSISTANT: ..."}`
-
----
-
-## Training Pipeline
-
-### Recommended Workflow
-
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Base Model    │────▶│   SFT Training  │────▶│  DPO Alignment  │
-│  (Qwen, Llama)  │     │  (Instructions) │     │  (Preferences)  │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-                                                         │
-                                                         ▼
-                                                ┌─────────────────┐
-                                                │  Chat Interface │
-                                                │    (Gradio)     │
-                                                └─────────────────┘
-```
-
-### Example Experiments
-
-| Experiment | Description | Estimated Time |
-|------------|-------------|----------------|
-| `qwen3_600M_sft_mixed_optimized` | Mixed SFT (OpenHermes + Glaive) | ~3-4 hours |
-| `qwen3_600M_dpo_anthropic_hh` | DPO on Anthropic HH-RLHF | ~30-45 min |
-| `qwen3_600M_sft_tools` | Tool/function calling focus | ~2-3 hours |
-
----
-
-## Contributing
-
-We welcome contributions from the community! Here's how you can help:
-
-### Ways to Contribute
-
-- **Bug Reports** — Found a bug? Open an issue with reproduction steps
-- **Feature Requests** — Have an idea? We'd love to hear it
-- **Code Contributions** — Submit a PR for bug fixes or new features
-- **Documentation** — Help improve docs, tutorials, or examples
-- **New Datasets** — Add support for additional dataset formats
-- **New Training Methods** — Extend the training pipeline with additional algorithms
-
-### Development Setup
+For example, `p1_dapo_k16_noKL.yaml` changes the objective, group size, and KL coefficient without restating the rest of the training stack. A config name is passed as its path below `configs/exp`, without the `.yaml` suffix:
 
 ```bash
-# Fork and clone the repo
-git clone https://github.com/your-username/Alpha-Newton.git
-cd Alpha-Newton
-
-# Create a branch for your feature
-git checkout -b feature/my-awesome-feature
-
-# Install in development mode
-pip install -e .
-
-# Make your changes and test
-python test_pipeline.py
-
-# Submit a PR!
+python -m src.entrypoints.train_rlvr \
+  --exp EA_RLVR_ABLATIONS/p1_dapo_k16_noKL
 ```
 
-### Adding a New Component
+The starting checkpoint path in `_study.yaml` documents the checkpoint used in the research environment. It can be replaced with another local path or Hugging Face model identifier when reusing the code.
 
-The registry system makes it easy to add new components:
+## Checkpoint selection
 
-```python
-# src/builders/my_component.py
-from src.core.registry import register
+Training periodically evaluates a deterministic held-out set and keeps the top checkpoints by exact-answer accuracy. The callback writes `topk_eval_history.json`, which records every selection score and the best checkpoint. The held-out JSONL is generated locally rather than committed:
 
-@register("data", "my_custom_dataset")
-def build_my_dataset(tokenizer, **kwargs):
-    # Your dataset loading logic
-    return {"train": train_dataset, "eval": eval_dataset}
+```bash
+python scripts/posttraining/create_held_out_eval.py \
+  --output held_out/gsm_eval_v2.jsonl \
+  --n-samples 500
 ```
 
-Then use it in your config:
-
-```yaml
-data:
-  type: "my_custom_dataset"
-  # your custom parameters
-```
-
-### Code Style
-
-- Follow PEP 8 guidelines
-- Use type hints where appropriate
-- Add docstrings to public functions
-- Keep functions focused and modular
-
-### Pull Request Guidelines
-
-1. **Create an issue first** for significant changes
-2. **Write clear commit messages** describing what and why
-3. **Include tests** if adding new functionality
-4. **Update documentation** if changing behavior
-5. **Keep PRs focused** — one feature/fix per PR
-
----
-
-## License
-
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
-
----
-
-## Acknowledgments
-
-Built with these amazing libraries:
-
-- [Transformers](https://github.com/huggingface/transformers) — Model loading and inference
-- [TRL](https://github.com/huggingface/trl) — Training algorithms (SFT, DPO)
-- [Datasets](https://github.com/huggingface/datasets) — Efficient data loading
-- [WandB](https://wandb.ai) — Experiment tracking
-- [Gradio](https://gradio.app) — Web interface
-
+This repository stops at the research implementation. Result tables and conclusions should be added only after the final evaluation protocol is fixed.

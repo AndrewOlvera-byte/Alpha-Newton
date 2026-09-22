@@ -1,0 +1,19 @@
+run:
+  mode: rlvr
+
+model:
+  type: hf_causal
+  id: outputs/qwen_600M_sft_deepthought_math_optimal
+
+tokenizer:
+  type: hf
+  id: Qwen/Qwen3-0.6B-Base
+
+data:
+  train_path: allenai/RLVR-GSM
+  eval_path: null
+  name: null
+
+grpo:
+  beta: 0.03
+  reward_function: ppo_binary
